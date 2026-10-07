@@ -1,0 +1,39 @@
+## ESP32-S31-Korvo-1 流媒体音乐播放器 —— 组件依赖
+## 版本锁定：ESP-IDF 6.1 + LVGL 9.5 + esp_board_manager
+dependencies:
+  idf: ">=5.5"
+
+  # ---- UI ----（锁 9.5 线，拼音输入法按 9.5 验证；勿升 9.6）
+  lvgl/lvgl: "~9.5.0"
+
+  # ---- 板级支持 ----
+  # 官方 esp_board_manager 的 display_lvgl 示例用 esp_lvgl_adapter 做 LVGL 桥接
+  # （原生支持 RGB tear-avoid 与旋转），本指南原写的 esp_lvgl_port 无此能力，
+  # 按"官方优先"原则改用 esp_lvgl_adapter。
+  espressif/esp_board_manager: "^0.7.3"
+  espressif/esp_boards: "^0.6.1"
+  espressif/esp_lvgl_adapter: "^0.7.2"
+  espressif/esp_codec_dev: "^2.0.0-beta5"
+  espressif/esp_lcd_touch: "^1.2.1"
+  espressif/esp_lcd_touch_gt1151: "^1.1.1"
+  espressif/led_strip: "^3.0.0"
+
+  # ---- 网络 / JSON ----
+  espressif/cjson: "^1.7.19"
+
+  # ---- 音频管线 ----
+  # esp_audio_simple_player 是官方在 ESP-GMF 之上搭好的播放门面
+  # （依赖 gmf_audio + gmf_io），M2 本地/在线播放走它；M4 蓝牙再用
+  # gmf_core + esp_bt_audio 的 element 搭图。
+  # 注意：不要引入 gmf_loader，它会把 gmf_video + gmf_ai_audio 一起拖进来。
+  espressif/esp_audio_simple_player: "^1.1.0"
+
+  # ---- 蓝牙音频（A2DP Source：本机推流给耳机/音箱）----
+  # ESP-GMF 的蓝牙音频模块：经典蓝牙 A2DP/AVRCP + LE Audio。
+  # 它自己依赖 esp_audio_codec ~2.6 / gmf_core ~1.1 / gmf_io ~1.1，
+  # 与本工程已装的 2.6.2 / 1.1.0 / 1.1.0 完全一致，不会顶版本。
+  espressif/esp_bt_audio: "^1.1.0"
+
+  # ---- 自研拼音输入法（开发期用 override_path，改代码免重新拉依赖） ----
+  lvgl_pinyin_ime:
+    override_path: "../../lvgl_pinyin_ime"

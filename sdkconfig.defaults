@@ -1,0 +1,172 @@
+# ============================================================================
+# ESP32-S31-Korvo-1 流媒体音乐播放器  sdkconfig.defaults
+#
+# 注意：components/gen_bmgr_codes/board_manager.defaults 由 esp_board_manager
+#       生成，**优先级高于本文件**。凡芯片/开发板级配置（CPU 频率、PSRAM 模式、
+#       Codec 选型、Flash 参数）一律以 board_manager.defaults 为准，本文件只放
+#       项目自身的软件配置，不重复声明板级项。
+#
+# 参考：开发指南 9.1；与官方 esp_board_manager 示例冲突时以官方为准。
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# 音频管线（esp_audio_simple_player / ESP-GMF）
+#   本板 I2S 固定 48 kHz / 16 bit / 2ch TDM，所以重采样目标设 48000，
+#   并打开声道与位深转换，保证交给 ES8389 的 PCM 格式恒定。
+# ---------------------------------------------------------------------------
+CONFIG_ESP_AUDIO_SIMPLE_PLAYER_RESAMPLE_EN=y
+CONFIG_AUDIO_SIMPLE_PLAYER_RESAMPLE_DEST_RATE=48000
+CONFIG_ESP_AUDIO_SIMPLE_PLAYER_CH_CVT_EN=y
+CONFIG_AUDIO_SIMPLE_PLAYER_CH_CVT_DEST=2
+CONFIG_ESP_AUDIO_SIMPLE_PLAYER_BIT_CVT_EN=y
+CONFIG_AUDIO_SIMPLE_PLAYER_BIT_CVT_DEST_16BIT=y
+
+# ---------------------------------------------------------------------------
+# 射频共存：Wi-Fi 与经典蓝牙共用 2.4 GHz，必须开启
+# ---------------------------------------------------------------------------
+CONFIG_SW_COEXIST_ENABLE=y
+
+# ---------------------------------------------------------------------------
+# 经典蓝牙（片内 BR/EDR，A2DP Source + AVRCP Target）
+#
+# 本工程只用经典蓝牙（A2DP 源推流给耳机/音箱），**不要开 BLE**：
+#   控制器的工作模式由 CONFIG_BTDM_CTRL_MODE_* 这一组选择项决定，默认是
+#   BLE_ONLY。BLE_ONLY 下 BR/EDR 射频根本没起来，而
+#   bt_service_init() 调的是 esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT)，
+#   于是经典蓝牙不可用：esp_bluedroid_init() 在等 BR/EDR 控制器的 HCI 应答时
+#   卡住，bt_service 永远停在 BT_ST_UNINIT —— 设置页的蓝牙扫描点不动
+#   （"蓝牙不可用（初始化失败或未就绪）"）。
+#   官方 esp_bt_audio 示例 examples/bt_audio/sdkconfig.defaults.esp32s31.classic
+#   就是"只留经典蓝牙 + BTDM_CTRL_MODE_BR_EDR_ONLY"。
+#   注意：BTDM_CTRL_MODE_BR_EDR_ONLY=y 之后，Kconfig 里
+#   `config BT_BLE_ENABLED depends on BT_BLUEDROID_ENABLED && (!BTDM_CTRL_MODE_BR_EDR_ONLY)`
+#   会让 BLE 选项**直接消失**（自动为 n），所以这里不必再写 CONFIG_BT_BLE_ENABLED=n
+#   （写了对不可见符号赋值，confgen 会告警"undefined symbol"）。
+# ---------------------------------------------------------------------------
+CONFIG_BT_ENABLED=y
+CONFIG_BT_CLASSIC_ENABLED=y
+# 控制器只跑 BR/EDR（必须与 bt_service.cc 里的 ESP_BT_MODE_CLASSIC_BT 一致）
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
+
+# ---------------------------------------------------------------------------
+# LVGL 9.5
+# ---------------------------------------------------------------------------
+CONFIG_LV_COLOR_DEPTH_16=y
+# 深色主题：LVGL 默认是浅色主题，不打开的话派生控件会是浅底深字
+CONFIG_LV_THEME_DEFAULT_DARK=y
+# 拼音输入法字体要求：必须关闭（打开后 LVGL 按 12 字节遍历 glyph 描述符 → 全部空白）
+CONFIG_LV_FONT_FMT_TXT_LARGE=n
+
+# 屏幕刷新周期：LVGL 默认 33 ms（30 FPS）。跟手动画的观感基本由帧率决定，
+# 15 ms ≈ 66 FPS 是 esp_lvgl_adapter README 与乐鑫 LVGL 性能 FAQ 共同的推荐值。
+CONFIG_LV_DEF_REFR_PERIOD=15
+# 样式缓存：命中后省掉每次绘制时的样式链表查找，官方推荐的低风险提速项
+CONFIG_LV_OBJ_STYLE_CACHE=y
+
+# 性能显示器：屏幕右下角常驻 "xx FPS, xx% CPU"（LVGL 的 sysmon，画在 sys 层，
+# 不会被本工程的 top 层 UI 遮住）。
+# CPU 一栏是 LVGL 自身占用：本工程 LV_USE_OS = LV_OS_NONE，
+# lv_os_get_idle_percent() 由 lv_os_none.c 提供（即 lv_timer_get_idle()），数值真实；
+# **不要**改成 LV_OS_FREERTOS：那条实现靠 FreeRTOS 任务切换 trace 钩子累计空闲时间，
+# 本工程没挂那些钩子，idle 会恒为 0，CPU 就永远显示 100%。
+CONFIG_LV_USE_SYSMON=y
+CONFIG_LV_USE_PERF_MONITOR=y
+
+# 绘制单元数量：PPA 加速要求保持 1（见 esp_lvgl_adapter README「PPA/DMA2D 加速」），
+# 本工程 PPA 已开，因此**不要**为了多核并行改成 2。
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
+
+# ---------------------------------------------------------------------------
+# LVGL 内存分配（本地音乐列表崩溃的根因所在，别改回去）
+#
+# 默认是 LVGL 内置堆，上限就是 CONFIG_LV_MEM_SIZE_KILOBYTES = 64 KB。
+# 本地列表页 512 首 × 5 个控件 ≈ 2500 个对象，64 KB 必然不够；而一旦分配失败，
+# LVGL 会执行 LV_ASSERT_MALLOC → LV_ASSERT_HANDLER，**默认实现就是 `while(1)`**，
+# 直接把调用它的任务锁死（实测：看门狗反复报 "CPU 0: sd_scan"，
+# 寄存器停在 lv_obj_allocate_spec_attr）。
+#
+# 改成 C 库 malloc：内存取自 ESP-IDF 堆，内部 RAM 用尽时会自动落到 PSRAM
+# （CONFIG_SPIRAM_USE_MALLOC=y），并省掉 64 KB 常驻 .bss。
+# 这也是 esp_lvgl_adapter README「推荐的 SDKCONFIG 配置」中的一条。
+# ---------------------------------------------------------------------------
+CONFIG_LV_USE_CLIB_MALLOC=y
+# 分配失败只当"这个控件没建出来"，绝不死循环：设备上不能因为一次 OOM 就卡死
+CONFIG_LV_USE_ASSERT_MALLOC=n
+
+# UI 中文实际用 components/ui_font 里的位图字体 ui_font_sc16（GB2312 全集，
+# 见 AGENTS.md 第 8 节）。下面这个内置 CJK 字体只含 1338 个常用汉字，
+# 已经没有任何代码引用它，链接器会整块丢掉，不占 flash，因此保留默认值即可。
+CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK=y
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_40=y
+
+# ---------------------------------------------------------------------------
+# 拼音输入法（lvgl_pinyin_ime）
+#   词库放 dict 分区；用户词库放 usr 分区
+# ---------------------------------------------------------------------------
+CONFIG_LV_PINYIN_IME_DICT_SRC_PARTITION=y
+CONFIG_LV_PINYIN_IME_USER_PARTITION="usr"
+
+# ---------------------------------------------------------------------------
+# 文件系统：microSD 音乐库走 FATFS，长文件名必须开
+# ---------------------------------------------------------------------------
+# 长文件名：关了就只能看到 8.3 短名（XXXXXX~1.MP3），中文全丢 —— 必须开
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+# 文件名统一 UTF-8：readdir/fopen 收发的字符串编码。
+# 默认是 ANSI/OEM(936=GBK)，于是中文歌名的路径是 **GBK 字节**，
+# 直接丢给 UI（UTF-8 字体）和日志就是一片"��ѩ����"乱码。
+CONFIG_FATFS_API_ENCODING_UTF_8=y
+# CODEPAGE 只影响 8.3 短名怎么生成，主路径已经是 UTF-8 了；保留 936 让
+# 中文名能生成可读的短名别名
+CONFIG_FATFS_CODEPAGE_936=y
+
+# ---------------------------------------------------------------------------
+# 蓝牙音频（A2DP Source：本机推流给耳机/音箱）
+# ---------------------------------------------------------------------------
+# ESP-GMF 的 esp_bt_audio 要求打开 A2DP + 外部编码器（SBC 在应用层用
+# esp_audio_codec 编码，是官方推荐的新设计）；AVRCP 由 BT_A2DP_ENABLE 自动
+# select，这样耳机上的播放/暂停/上下曲也能收进来（AVRCP Target）。
+CONFIG_BT_A2DP_ENABLE=y
+CONFIG_BT_A2DP_USE_EXTERNAL_CODEC=y
+# 内部 RAM 只有约 300 KB（Wi-Fi + LVGL + GMF 之后很紧张），Bluedroid 的堆优先
+# 落到 16 MB PSRAM；官方 esp32s31 经典蓝牙示例同样打开这一项
+CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST=y
+
+# ---------------------------------------------------------------------------
+# 内存 / 任务
+# ---------------------------------------------------------------------------
+# 拼音输入法组件实测要求：app_main 栈 12288
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=12288
+# Wi-Fi/蓝牙事件都在 esp_event 的 sys_evt 任务里派发，默认栈只有 2304 字节。
+# 扫描结果 + 一条 ESP_LOGI 就能把它爆掉（实测 "Stack protection fault in task
+# sys_evt"）：现在扫描结果已经搬到 wifi_service 自己的工作线程，
+# 这里再把 sys_evt 抬到 4096 作为第二道保险，两层都不省。
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_FREERTOS_HZ=1000
+
+# ---------------------------------------------------------------------------
+# 分区表
+# ---------------------------------------------------------------------------
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---------------------------------------------------------------------------
+# Watchdog
+# ---------------------------------------------------------------------------
+CONFIG_ESP_TASK_WDT_EN=y
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=10
+
+# ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
+
+# ---------------------------------------------------------------------------
+# 崩溃日志持久化（核心转储存 flash 的 coredump 分区）
+# ---------------------------------------------------------------------------
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y

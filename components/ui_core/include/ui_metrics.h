@@ -1,0 +1,108 @@
+/*
+ * ui_metrics.h —— 横屏度量入口
+ *
+ * 纪律（开发指南 5.4）：**UI 代码里不准出现 800 / 480 字面量**，
+ * 一律通过 UI_W / UI_H 与百分比。本文件是唯一允许出现参考分辨率的地方。
+ *
+ * 旋转是编译期开关（rot0 = 横屏默认）。90°/270° 时 LVGL 报告的宽高互换，
+ * UI_W / UI_H 必须跟着走，所以下面所有派生尺寸都相对 UI_H / UI_W 计算而不是
+ * 写死像素，换方向后能自动重排。
+ */
+#pragma once
+
+#include "lvgl.h"
+
+#if defined(CONFIG_APP_DISPLAY_ROTATION_90) || defined(CONFIG_APP_DISPLAY_ROTATION_270)
+#define UI_W  (480)
+#define UI_H  (800)
+#define UI_IS_PORTRAIT (1)
+#else
+#define UI_W  (800)
+#define UI_H  (480)
+#define UI_IS_PORTRAIT (0)
+#endif
+
+/* 参考设计分辨率（仅本文件使用） */
+#define UI_REF_W (800)
+#define UI_REF_H (480)
+
+/* 横向 / 纵向百分比 */
+#define UI_PCT_X(p) ((p) * UI_W / 100)
+#define UI_PCT_Y(p) ((p) * UI_H / 100)
+
+/*
+ * 关键尺寸：以参考横屏 800x480 为基准，按 UI_H / UI_W 等比缩放，
+ * 保证旋转后比例关系不变。
+ */
+#define UI_PX_H(n) ((n) * UI_H / UI_REF_H)   /* 纵向按高度缩放 */
+#define UI_PX_W(n) ((n) * UI_W / UI_REF_W)   /* 横向按宽度缩放 */
+
+#define UI_STATUSBAR_H    UI_PX_H(32)    /* 状态栏高 */
+#define UI_EDGE_HOTZONE   UI_PX_W(24)    /* 边缘手势热区 */
+#define UI_MIN_TOUCH      UI_PX_H(44)    /* 最小可点区域 */
+#define UI_DRAWER_W       UI_PX_W(280)   /* 右侧抽屉宽 */
+#define UI_CC_PANEL_H     UI_PX_H(400)   /* 控制中心面板高 */
+#define UI_LIST_ROW_H     UI_PX_H(64)    /* 列表行高 */
+#define UI_LIST_COVER     UI_PX_H(48)    /* 列表封面 */
+#define UI_MINI_PLAYER_H  UI_PX_H(56)    /* 迷你播放条高（首页已按需求移除，保留给后续页面复用） */
+#define UI_HOME_ICON      UI_PX_H(96)    /* 首页图标 */
+#define UI_HOME_CELL_W    UI_PX_W(130)   /* 首页格宽 */
+#define UI_HOME_CELL_H    UI_PX_H(140)   /* 首页格高 */
+#define UI_PAGE_PAD       UI_PX_W(8)     /* 页面安全区（不放可点元素） */
+
+/* 主题色（深色） */
+#define UI_COLOR_BG          lv_color_hex(0x0B0B10)
+#define UI_COLOR_BG_ALT      lv_color_hex(0x121218)
+#define UI_COLOR_SURFACE     lv_color_hex(0x1B1B22)
+#define UI_COLOR_PILL        lv_color_hex(0x2A2A33)
+#define UI_COLOR_PILL_LIGHT  lv_color_hex(0xE6E6EA)
+#define UI_COLOR_FG          lv_color_hex(0xF2F2F6)
+#define UI_COLOR_FG_DIM      lv_color_hex(0x8C8C97)
+#define UI_COLOR_ACCENT      lv_color_hex(0xF5A623)
+#define UI_COLOR_ACCENT_ALT  lv_color_hex(0xE0863A)
+
+/* 首页图标配色（对应设计稿） */
+#define UI_COLOR_ICON_MUSIC   lv_color_hex(0xE8973A)
+#define UI_COLOR_ICON_ONLINE  lv_color_hex(0x3E9E86)
+#define UI_COLOR_ICON_LOCAL   lv_color_hex(0x5B6FB5)
+#define UI_COLOR_ICON_CALENDAR lv_color_hex(0xC0584B)
+#define UI_COLOR_ICON_BT      lv_color_hex(0x4A6FA5)
+#define UI_COLOR_ICON_SETTINGS lv_color_hex(0x6E6E78)
+
+/*
+ * 字体（M5 前先落一版能用的）：
+ *
+ * UI 文本用**自带的位图字体** ui_font_sc16（components/ui_font，由
+ * tools/font/gen_lvgl_font.py 生成）：16 px 梦源黑体，**GB2312 全集 + ASCII +
+ * LVGL 图标**。
+ *
+ * 为什么不用 LVGL 内置的 lv_font_source_han_sans_sc_16_cjk：
+ *   它只收 "1338 most common CJK radicals"，GB2312 里其余汉字一律渲染成
+ *   "缺字方框" —— 这是之前界面上成片方框的根因。
+ *
+ * 为什么 SMALL 也指向它：
+ *   UI_FONT_SMALL 被用在状态栏、列表提示、控制中心小药丸等**含中文**的标签上，
+ *   而 lv_font_montserrat_14 完全没有汉字，结果就是那些中文全变方框。
+ *   app 分区目前放得下一套 16 px 字库；等 M5 体积预算明确后再补 14 px 版本
+ *   （见开发指南 5.5 的"梦源黑体 + 文泉驿等宽"方案）。
+ *
+ * 数字仍走蒙塞拉特，等宽数字（文泉驿微米黑）在 M5 接入。
+ */
+LV_FONT_DECLARE(ui_font_sc16)
+
+#define UI_FONT_TEXT   (&ui_font_sc16)
+#define UI_FONT_TITLE  (&ui_font_sc16)
+#define UI_FONT_CLOCK  (&lv_font_montserrat_40)
+#define UI_FONT_NUM    (&lv_font_montserrat_20)
+#define UI_FONT_SMALL  (&ui_font_sc16)
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* 创建页面后自检：LVGL 报告的分辨率与 UI_W 不一致时打警告（旋转配置最易踩的坑）*/
+void ui_metrics_selfcheck(void);
+
+#ifdef __cplusplus
+}
+#endif

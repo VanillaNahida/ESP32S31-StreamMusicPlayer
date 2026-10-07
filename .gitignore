@@ -1,0 +1,6 @@
+managed_components/
+.vscode/
+build/
+sdkconfig
+venv/
+skills/
