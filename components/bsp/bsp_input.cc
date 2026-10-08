@@ -24,6 +24,8 @@
 #include "bsp_internal.h"
 
 #include <stdint.h>
+#include <string.h>
+#include <strings.h>
 #include "esp_log.h"
 #include "iot_button.h"
 #include "led_strip.h"
@@ -94,13 +96,47 @@ esp_err_t bsp_led_off(void)
 
 /* ---------------------------------------------------------------- ADC 按键 */
 
-/* 下标 = ADC 电压升序；映射依据见文件头（原理图为准） */
+/* 下标 = ADC 电压升序（驱动 dev_button_sub_adc_multi.c 就是按 voltage_range 升序建句柄的）。
+ * 这张表只在**认不出 YAML label** 时兜底，正常路径走 key_from_label()。 */
 static const bsp_key_t k_key_map[] = {
-    BSP_KEY_VOL_UP,    /* 380 mV  SW6 */
-    BSP_KEY_VOL_DOWN,  /* 820 mV  SW5 */
-    BSP_KEY_MODE,      /* 1340 mV SW4 */
-    BSP_KEY_SET,       /* 1870 mV SW3 */
+    BSP_KEY_VOL_UP,
+    BSP_KEY_VOL_DOWN,
+    BSP_KEY_MODE,
+    BSP_KEY_SET,
 };
+
+/*
+ * ★ 逻辑键**以板级 YAML 的 `button_labels` 为准**，不再"按下标猜"。
+ *
+ * 为什么改（2026-10，用户报"VOL_DOWN/VOL_UP 被当成 MODE/SET"）：
+ * 原来那张 k_key_map 的依据是文件头注释里那份 label 列表
+ * （["SET","MODE","VOLUME_DOWN","VOLUME_UP"]）—— 那是**旧版 esp_boards** 的写法。
+ * 现在 managed_components/espressif__esp_boards/esp32_s31_korvo_1/board_devices.yaml 是：
+ *     voltage_range: [380, 820, 1180, 1570, 1980, 2410]
+ *     button_labels: ["VOLUME_UP","VOLUME_DOWN","SET","PLAY","Mode","REC"]
+ * 前提变了，手写的下标表自然错位：下标 2 现在是 SET（代码却叫它 MODE）、
+ * 下标 3 是 PLAY（代码叫它 SET），4/5 还会被丢掉（表里只有 4 项）。
+ * 所以这里直接读 YAML 的 label 来认键；认不出的（PLAY/REC…）按下标兜底。
+ */
+static bsp_key_t key_from_label(const char *label, uint8_t idx)
+{
+    if (label) {
+        if (strcasecmp(label, "VOLUME_UP") == 0 || strcasecmp(label, "VOL_UP") == 0) {
+            return BSP_KEY_VOL_UP;
+        }
+        if (strcasecmp(label, "VOLUME_DOWN") == 0 || strcasecmp(label, "VOL_DOWN") == 0) {
+            return BSP_KEY_VOL_DOWN;
+        }
+        if (strcasecmp(label, "SET") == 0) {
+            return BSP_KEY_SET;
+        }
+        if (strcasecmp(label, "MODE") == 0) {
+            return BSP_KEY_MODE;
+        }
+    }
+    const size_t n = sizeof(k_key_map) / sizeof(k_key_map[0]);
+    return (idx < n) ? k_key_map[idx] : BSP_KEY_MAX;
+}
 
 static bsp_key_cb_t s_key_cb;
 static void        *s_key_user;
@@ -178,29 +214,50 @@ esp_err_t bsp_button_init(bsp_key_cb_t cb, void *user)
     s_key_user  = user;
 
     dev_button_handles_t *btns = (dev_button_handles_t *)handle;
+
+    /* 把 YAML 里的档位/名字打出来：这是"哪个物理键 = 哪个逻辑键"的唯一权威依据，
+     * 和丝印对不上时一眼就能看出是板级 YAML 的问题还是代码的问题 */
+    dev_button_config_t *bcfg = NULL;
+    void *cfg_raw = NULL;
+    if (esp_board_manager_get_device_config(ADC_BUTTON_DEV, &cfg_raw) == ESP_OK && cfg_raw) {
+        bcfg = (dev_button_config_t *)cfg_raw;
+    }
+
     size_t map_n = sizeof(k_key_map) / sizeof(k_key_map[0]);
-    for (uint8_t i = 0; i < btns->num_buttons && i < map_n; i++) {
+    for (uint8_t i = 0; i < btns->num_buttons; i++) {
+        const char  *label  = bcfg ? bcfg->sub_cfg.adc.multi.button_labels[i] : NULL;
+        const uint16_t v_mv = bcfg ? bcfg->sub_cfg.adc.multi.voltage_range[i] : 0;
+        const bsp_key_t key = key_from_label(label, i);
+        if (key >= BSP_KEY_MAX) {
+            ESP_LOGW(TAG, "btn %u (%u mV, label='%s') 没有对应功能，跳过", i, v_mv,
+                     label ? label : "?");
+            continue;
+        }
+        ESP_LOGI(TAG, "btn %u: %u mV label='%s' -> %s", i, v_mv, label ? label : "?",
+                 key_name(key));
+
         button_handle_t h = btns->button_handles[i];
         if (!h) {
             continue;
         }
         /* 覆盖 YAML 的 2000 ms 长按判定（见 KEY_LONG_MS 说明） */
         iot_button_set_param(h, BUTTON_LONG_PRESS_TIME_MS, (void *)(intptr_t)KEY_LONG_MS);
-        s_hold_cnt[i] = 0;
+        s_hold_cnt[key] = 0;
         /* 注册自己的回调而不是 esp_board_device_callback_register：
          * 后者只注册 YAML 里 events_cfg 打开的几档事件（不含 LONG_PRESS_HOLD），
          * 而"长按连续调整"正需要 HOLD。 */
         ret = iot_button_register_cb(h, BUTTON_PRESS_DOWN, NULL, key_event_cb,
-                                     (void *)(intptr_t)k_key_map[i]);
+                                     (void *)(intptr_t)key);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "register PRESS_DOWN for key %d failed: %s", i, esp_err_to_name(ret));
             return ret;
         }
         iot_button_register_cb(h, BUTTON_LONG_PRESS_HOLD, NULL, key_event_cb,
-                               (void *)(intptr_t)k_key_map[i]);
+                               (void *)(intptr_t)key);
         iot_button_register_cb(h, BUTTON_PRESS_UP, NULL, key_event_cb,
-                               (void *)(intptr_t)k_key_map[i]);
+                               (void *)(intptr_t)key);
     }
+    (void)map_n;
 
     s_key_ready = true;
     ESP_LOGI(TAG, "adc buttons ready (%u keys, long=%dms, hold_step=%d)",

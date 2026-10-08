@@ -1,7 +1,7 @@
 # ESP32-S31-Korvo-1 流媒体音乐播放器 分区表（16 MB Flash）
 # 详见 开发指南 9.2
 #   约束：app 分区起点必须 64 KB(0x10000) 对齐；data 分区 4 KB 对齐即可
-#   改动本表后需 idf.py fullclean 重编
+#   改动本表后需 idf.py fullclean 重编，并且**重烧分区表**（idf.py flash 会写）
 #
 # 调整历史：
 #   [2026-xx 在线音乐 + 拼音输入法] 拼音输入法 lvgl_pinyin_ime 的两套字体是**编进
@@ -10,13 +10,16 @@
 #     assets(SPIFFS) 从 1.25 MB 缩到 128 KB、usr 从 1 MB 缩到 384 KB，
 #     两个 app 槽提到 6.875 MB(0x6E0000)。dict 分区（1.5 MB）放拼音系统词库。
 #   [2026-10 日文汉字字体] UI 字体从"GB2312 一套"扩成"GB2312 + 日文汉字补充两套"
-#     （见 components/ui_font），app 涨了 ~280 KB，余量掉到 1%（~55 KB）——
-#     于是把**始终没用过**的 assets(SPIFFS, 128 KB) 整块删掉给 app：
-#     SPIFFS/mmap_assets 在本工程只有依赖、没有任何代码引用它（grep 过），
-#     ui_font 才是"字库资源"真正该待的地方。
-#     两个 app 槽各 +64 KB → 7.5 MB(0x6F0000)，余量回到 ~1.7%。
-#     如果以后还要腾地方，剩下能动的只有：末尾未分配的 64 KB、coredump(64 KB，
-#     删了就没有崩溃转储)、usr(384 KB，拼音用户词库 FAT)。
+#     （见 components/ui_font），app 涨了 ~280 KB；于是把**始终没用过**的
+#     assets(SPIFFS, 128 KB) 整块删掉给 app，两个 app 槽各 +64 KB → 7.5 MB(0x6F0000)。
+#   [2026-10 单 app 槽] ★ 砍掉 ota_1，改成**单个 14.94 MB 的 factory 槽**：
+#     本工程一直是 USB 烧录、没用 OTA（A/B 双槽白占 7.5 MB），而 app 余量只剩
+#     1%（~73 KB），WebP 解码等后续功能放不下。
+#     代价：失去 A/B OTA —— 要恢复的话，把最后一行换成
+#       ota_0, app, ota_0, 0x210000, 0x6F0000,
+#       ota_1, app, ota_1, 0x900000, 0x6F0000,
+#     即可（otadata 分区一直留着，不用动）。
+#     收益：app 槽 7.5 MB → 14.94 MB，余量 ~7.7 MB。
 #
 # Name,     Type, SubType, Offset,   Size,     Flags
 nvs,        data, nvs,     0x9000,   0x6000,
@@ -25,8 +28,7 @@ phy_init,   data, phy,     0x11000,  0x1000,
 coredump,   data, coredump,0x12000,  0x10000,
 dict,       data, 0x40,    0x22000,  0x180000,
 usr,        data, fat,     0x1A2000, 0x60000,
-# app 槽 7.5 MB × 2：经典蓝牙（Bluedroid/GAP/AVDTP/A2DP 一链进来就 ~5 MB）
-# + 拼音输入法字体（~2.4 MB）+ UI 位图字体（~1.2 MB）之后，6.875 MB 也不够了。
-# 16 MB 一共 = 0x210000 头部 + 0x6F0000 × 2，末尾还剩 64 KB 未分配。
-ota_0,      app,  ota_0,   0x210000, 0x6F0000,
-ota_1,      app,  ota_1,   0x900000, 0x6F0000,
+# 单 app 槽：0x1000000(16 MB) - 0x210000 = 0xDF0000 = 14.94 MB（末尾不再留空洞）
+# 经典蓝牙（Bluedroid/GAP/AVDTP/A2DP ~5 MB）+ 拼音字体(~2.4 MB) + UI 位图字体(~1.2 MB)
+# 之后 app 约 7.2 MB，这个槽留出 ~7.7 MB 给后续功能（WebP 解码等）。
+factory,    app,  factory, 0x210000, 0xDF0000,

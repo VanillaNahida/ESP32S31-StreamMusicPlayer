@@ -97,6 +97,22 @@ bool ui_drawer_is_open(void);
 
 void ui_toast(const char *text, uint32_t duration_ms);
 
+/* ------------------------------------------------------------------ 弹层动画
+ *
+ * 弹窗/菜单/Toast 这类"突然出现、突然消失"的东西统一走这两个函数做**渐入渐出**
+ * （淡入淡出 + 面板轻微上滑；160 ms 进 / 140 ms 出，ease_out）。各 app 自己搭的
+ * 浮层（例如 app_online 的长按菜单、添加/重命名浮层）建好后调 ui_popup_in()，
+ * 关闭时用 ui_popup_out() **代替** lv_obj_delete*()。
+ *
+ *   scrim —— 全屏遮罩（可传 NULL：没有遮罩的浮层）
+ *   panel —— 内容面板；上滑只作用于它，遮罩只淡入淡出
+ *
+ * ui_popup_out() 会在动画结束后自己删掉 scrim（没 scrim 就删 panel），
+ * 所以调用方**不要再删一次**，也不要在动画期间访问这些对象。
+ */
+void ui_popup_in(lv_obj_t *scrim, lv_obj_t *panel);
+void ui_popup_out(lv_obj_t *scrim, lv_obj_t *panel);
+
 /* ------------------------------------------------------------------ 音量悬浮条
  *
  * 从屏幕右边缘滑入的竖向音量条，停在**屏幕靠右中间**（见 ui_volume_panel.cc）。

@@ -42,7 +42,13 @@
 
 static const char *TAG = "app_music";
 
-#define LYRIC_VIEW_MAX_LINES 80
+/*
+ * 歌词列最多建多少个标签。
+ * ★ 从 80 提到 240（2026-10 用户报"歌词显示不全"）：网易云的 LRC 经常带翻译/罗马音
+ *   双语行，一首 4 分钟的歌轻松超过 80 行 —— 超出的部分以前**根本不建标签**，
+ *   所以后面整段歌词都看不到。240 个指针的数组只有 ~1 KB，可接受。
+ */
+#define LYRIC_VIEW_MAX_LINES 240
 #define TICK_MS              500   /* 进度/歌词刷新周期 */
 #define PROGRESS_SAVE_TICKS  10    /* 每 10 个 tick（5 秒）把播放进度记一次 */
 /* 续播最多等这么多个 tick（12 × 500 ms = 6 秒）还拿不到码率就放弃定位 */
@@ -1224,15 +1230,16 @@ static void player_on_delete(lv_event_t *e)
     /* 离开播放器页：没起播的在线结果直接丢弃（封面/歌词缓冲一并释放） */
     online_discard_ready();
 
-    /* 封面像素与描述符收回来（工作线程若还在跑，结果由下次 cover_reap / cover_show 收） */
-    if (s_cover_pixels) {
-        media_meta_cover_free(s_cover_pixels);
-        s_cover_pixels = NULL;
-    }
-    if (s_cover_dsc) {
-        free(s_cover_dsc);
-        s_cover_dsc = NULL;
-    }
+    /*
+     * ★ 解码好的封面**故意不释放**（2026-10 用户报"切页面回来封面就没了"）：
+     *   s_cover_pixels 是 PSRAM 里的 RGB565（240×240 ≈ 115 KB），s_cover_dsc 是
+     *   指向它的堆描述符 —— 两者都不属于 LVGL 对象，页面销毁后依然有效。
+     *   留着它，下次进播放器页直接 lv_image_set_src() 贴回去，不用重新下载/解码；
+     *   真换曲时 start_track_*() 会 cover_show(NULL,...) 把它释放掉（有界，不会累积）。
+     *   s_p_cover_img 归 LVGL，随页面销毁，这里只把指针清掉。
+     */
+    s_p_cover_box = NULL;
+    s_p_cover_img = NULL;
 }
 
 /* ------------------------------------------------------------------ 播放器页 */
@@ -1760,7 +1767,8 @@ static void lyric_rebuild(void)
         lv_obj_set_style_text_color(l, UI_COLOR_FG_DIM, LV_PART_MAIN);
         lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
         lv_obj_set_width(l, LV_PCT(100));
-        lv_label_set_long_mode(l, LV_LABEL_LONG_DOT);
+        /* ★ WRAP 而不是 DOT：歌词一句可能很长，DOT 会把它截成"…"（"显示不全"的另一半原因） */
+        lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
         lv_label_set_text(l, s_lrc.lines[i].text);
         s_p_lyric_labels[i] = l;
     }
@@ -2028,10 +2036,19 @@ static lv_obj_t *page_player(void)
     }
 
     /*
-     * 开机恢复的曲目也要有封面：start_track_at() 会给 s_cover_want 排队，
-     * 而"恢复"没有走起播流程，所以进页时补一次（tick_cb 会在 500 ms 内 kick）。
+     * 进播放器页时的封面：
+     *   1) 已经有解好的封面（PSRAM 里留着，见 player_on_delete 的说明）→ **直接贴回来**，
+     *      不重新下载、不重新解码。这就是"切页面回来封面还在"的关键；
+     *   2) 还没有（开机恢复的曲目：start_track_at 排了队但没走起播流程）→ 补排一次解码。
+     *
+     * 为什么不用记"这块封面属于哪一首"：换曲一定走 start_track_at()/start_track_online_at()
+     * 或 online_switch_ui_to()，它们都会 cover_show(NULL,…) 先把旧封面释放掉 ——
+     * 所以页面创建时还留着像素，就一定是当前这首的。
      */
-    if (s_index >= 0 && !s_cover_pixels && !s_cover_busy) {
+    if (s_cover_dsc && s_cover_pixels && s_p_cover_img) {
+        lv_image_set_src(s_p_cover_img, s_cover_dsc);
+        lv_obj_remove_flag(s_p_cover_img, LV_OBJ_FLAG_HIDDEN);
+    } else if (s_index >= 0 && !s_cover_busy) {
         s_cover_want = s_index;
     }
 
@@ -2281,6 +2298,51 @@ static void local_rebuild(void)
     local_render();
 }
 
+/*
+ * 进目录前的"加载态"：把列表换成转圈 + "载入中…"，并**立刻刷一帧**。
+ *
+ * ★ 为什么需要（用户 2026-10 反馈"点进去卡在当前页面，加载完才进去"）：
+ *   进目录走的是 local_rebuild() → storage_service_browse()，而它是**同步**读 SD
+ *   （在 LVGL 任务里），大目录要几百毫秒甚至更久。这期间如果屏上还是**上一个目录**
+ *   的内容，看起来就是"点了没反应/卡住"，然后新目录突然出现。
+ *   所以先把加载态铺上屏、lv_refr_now() 强制送一帧，再去做那次阻塞读。
+ *
+ * ⚠ 转圈是**静止**的：读卡期间 LVGL 任务被占住，spinner 的动画转不起来。
+ *   想让它真的转，得把目录读取挪到工作线程（见 AGENTS.md 里"下一步可做"那条）。
+ */
+static void local_show_loading(void)
+{
+    if (s_list_col) {
+        lv_obj_clean(s_list_col);
+        /* 一个转圈 + 一行字，居中显示（s_list_col 是纵向 flex，用容器包一下居中） */
+        lv_obj_t *box = lv_obj_create(s_list_col);
+        lv_obj_remove_style_all(box);
+        lv_obj_set_size(box, LV_PCT(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(box, UI_PX_H(24), LV_PART_MAIN);
+        lv_obj_set_style_pad_row(box, UI_PX_H(12), LV_PART_MAIN);
+        lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *sp = lv_spinner_create(box);
+        lv_obj_set_size(sp, UI_PX_H(48), UI_PX_H(48));
+        lv_obj_set_style_arc_width(sp, UI_PX_H(5), LV_PART_MAIN);
+        lv_obj_set_style_arc_width(sp, UI_PX_H(5), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(sp, UI_COLOR_PILL, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(sp, UI_COLOR_ACCENT, LV_PART_INDICATOR);
+        lv_obj_remove_flag(sp, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *t = lv_label_create(box);
+        lv_obj_set_style_text_font(t, UI_FONT_TEXT, LV_PART_MAIN);
+        lv_obj_set_style_text_color(t, UI_COLOR_FG_DIM, LV_PART_MAIN);
+        lv_label_set_text(t, "载入中…");
+    }
+    if (s_list_hint) {
+        lv_label_set_text_fmt(s_list_hint, "%s · 载入中…", s_cur_dir);
+    }
+}
+
 static void on_local_entry(lv_event_t *e)
 {
     const int sel = (int)(intptr_t)lv_event_get_user_data(e);
@@ -2295,6 +2357,8 @@ static void on_local_entry(lv_event_t *e)
             snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", LOCAL_ROOT);
         }
         s_page = 0;
+        local_show_loading();       /* 先把加载态铺上屏 */
+        lv_refr_now(NULL);          /* 强制送一帧：别让用户盯着旧目录发呆 */
         local_rebuild();
         return;
     }
@@ -2321,6 +2385,10 @@ static void on_local_entry(lv_event_t *e)
     if (en->is_dir) {
         snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", full);
         s_page = 0;
+        /* ★ 先把加载态铺上屏并强制刷一帧，再去做同步的 SD 目录读取：
+         * 否则读卡这几百毫秒里屏上还是**上一个目录**，看起来就是"卡住" */
+        local_show_loading();
+        lv_refr_now(NULL);
         local_rebuild();
         return;
     }

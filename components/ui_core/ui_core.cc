@@ -20,15 +20,117 @@ static bool s_screen_off;
 
 /* ------------------------------------------------------------------ Toast */
 
+/* ------------------------------------------------------------------ 弹层动画
+ *
+ * 统一的"渐入渐出"：遮罩只淡入淡出，面板额外做一点上滑（起点在下面 10 px），
+ * 时间 160 ms 进 / 140 ms 出，ease_out。数值刻意偏快 —— 这是交互反馈，不是过场，
+ * 太慢会显得"卡"（LVGL 是软渲染，每帧都在重绘浮层这块区域）。
+ *
+ * 用 lv_obj_set_style_opa 而不是 bg_opa：前者是**整个对象及其子树**的透明度，
+ * 一次调用就能把面板里的图标/文字一起淡出，不用逐个改子对象。
+ */
+#define POPUP_IN_MS    160
+#define POPUP_OUT_MS   140
+#define POPUP_SLIDE_PX UI_PX_H(10)
+
+/* 只改透明度（遮罩用：整屏滑动看起来会晃） */
+static void popup_opa_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)(v < 0 ? 0 : (v > 255 ? 255 : v)),
+                         LV_PART_MAIN);
+}
+
+/* 透明度 + 上滑（面板/Toast 用）：v 从 0→255 是"进入"，255→0 是"退出" */
+static void popup_opa_slide_cb(void *var, int32_t v)
+{
+    lv_obj_t *o = (lv_obj_t *)var;
+    if (v < 0) {
+        v = 0;
+    } else if (v > 255) {
+        v = 255;
+    }
+    lv_obj_set_style_opa(o, (lv_opa_t)v, LV_PART_MAIN);
+    /* 透明时下沉 POPUP_SLIDE_PX，不透明时归位（显式转 int：UI_PX_H 可能是浮点表达式） */
+    lv_obj_set_style_translate_y(o, (int32_t)((255 - v) * POPUP_SLIDE_PX / 255), LV_PART_MAIN);
+}
+
+static void popup_anim(lv_obj_t *obj, int32_t from, int32_t to, uint32_t ms, bool slide)
+{
+    if (!obj) {
+        return;
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, obj);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, slide ? popup_opa_slide_cb : popup_opa_cb);
+    lv_anim_start(&a);
+}
+
+void ui_popup_in(lv_obj_t *scrim, lv_obj_t *panel)
+{
+    if (scrim) {
+        popup_anim(scrim, LV_OPA_TRANSP, LV_OPA_COVER, POPUP_IN_MS, false);
+    }
+    popup_anim(panel, LV_OPA_TRANSP, LV_OPA_COVER, POPUP_IN_MS, true);
+}
+
+/* 淡出结束 → 删掉整块浮层（动画回调里删，所以用 async 版本） */
+static void popup_out_done_cb(lv_anim_t *a)
+{
+    lv_obj_t *o = (lv_obj_t *)a->var;
+    if (o) {
+        lv_obj_delete_async(o);
+    }
+}
+
+void ui_popup_out(lv_obj_t *scrim, lv_obj_t *panel)
+{
+    lv_obj_t *victim = scrim ? scrim : panel;      /* 删遮罩会连带删掉面板 */
+    if (!victim) {
+        return;
+    }
+    if (scrim) {
+        popup_anim(scrim, LV_OPA_COVER, LV_OPA_TRANSP, POPUP_OUT_MS, false);
+    }
+    if (panel) {
+        popup_anim(panel, LV_OPA_COVER, LV_OPA_TRANSP, POPUP_OUT_MS, true);
+    }
+
+    /* 用 victim 上的那条动画作为"收尾"：它跑完就删（透明度那条也差不多同时结束） */
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, victim);
+    lv_anim_set_values(&a, 0, 0);                  /* 不驱动任何属性，只当计时器 */
+    lv_anim_set_duration(&a, POPUP_OUT_MS);
+    lv_anim_set_exec_cb(&a, popup_opa_cb);
+    lv_anim_set_ready_cb(&a, popup_out_done_cb);
+    lv_anim_start(&a);
+}
+
+/* ------------------------------------------------------------------ Toast */
+
 static void toast_hide_cb(lv_timer_t *t)
 {
     (void)t;
+    s_toast_timer = NULL;
+    /* 淡出（不删对象：Toast 是常驻的，只是藏起来） */
     if (s_toast) {
-        lv_obj_add_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (s_toast_timer) {
-        lv_timer_delete(s_toast_timer);
-        s_toast_timer = NULL;
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, s_toast);
+        lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
+        lv_anim_set_duration(&a, POPUP_OUT_MS);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_set_exec_cb(&a, popup_opa_slide_cb);
+        lv_anim_set_ready_cb(&a, [](lv_anim_t *an) {
+            if (an->var) {
+                lv_obj_add_flag((lv_obj_t *)an->var, LV_OBJ_FLAG_HIDDEN);
+            }
+        });
+        lv_anim_start(&a);
     }
 }
 
@@ -44,6 +146,8 @@ void ui_toast(const char *text, uint32_t duration_ms)
     lv_label_set_text(s_toast_label, text);
     lv_obj_remove_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_toast);
+    /* 渐入：连着来几个 Toast 也不会"跳"出来 */
+    popup_anim(s_toast, LV_OPA_TRANSP, LV_OPA_COVER, POPUP_IN_MS, true);
 
     if (duration_ms == 0) {
         duration_ms = 1800;

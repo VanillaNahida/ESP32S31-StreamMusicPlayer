@@ -241,6 +241,14 @@ static lv_obj_t *s_srch_hint;    /* 列表上方小标题（历史搜索 / 搜�
 static lv_obj_t *s_srch_clear;   /* 右上角"清除"（只在显示历史时出现） */
 static lv_obj_t *s_srch_list;    /* 历史 / 结果 列表 */
 static bool      s_srch_has_res; /* 列表里是搜索结果(true) 还是历史(false) */
+/*
+ * ★ "请求已经发出去、结果还没回来"的中间态。
+ * 少了它就会出现用户报的那个怪现象（2026-10）：搜索请求刚发出去时，
+ * 为了让结果回来能就地替换，代码先把 s_srch_has_res 置真"占住结果状态"——
+ * 可这时列表里还没有任何数据，于是画出来的就是**"没有找到匹配的歌曲"**，
+ * 而实际上正在搜。现在这段区间由 s_srch_busy 表示，界面显示"正在搜索…"+转圈。
+ */
+static bool      s_srch_busy;
 
 /* 当前显示（= 交给 app_music 的）队列 */
 static online_song_t *s_songs;
@@ -451,7 +459,8 @@ static void pl_menu_close(void)
 {
     s_menu_pending = false;
     if (s_menu) {
-        lv_obj_delete_async(s_menu);   /* 可能在按钮回调里被调：异步删 */
+        /* 渐出（面板是遮罩的第一个子对象）：动画结束由 ui_popup_out 自己删 */
+        ui_popup_out(s_menu, lv_obj_get_child(s_menu, 0));
         s_menu = NULL;
     }
     s_menu_idx = -1;
@@ -488,7 +497,7 @@ static void pl_menu_btn(lv_event_t *e)
             ui_toast("Wi-Fi 未连接", 1500);
             return;
         }
-        ui_toast("正在更新歌单…", 1500);
+        ui_toast("正在更新歌单，请稍后…", 1500);
         work_submit(OREQ_ADD, id_copy);   /* ADD 对已存在的 ID 就是"重新抓取刷新" */
         return;
     }
@@ -599,6 +608,9 @@ static void pl_menu_build(int idx)
     lv_obj_add_event_cb(panel, pl_menu_panel_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_center(panel);
 
+    /* 渐入（淡入 + 上滑）——共用 ui_core 的弹层动画，见 ui_popup_in 的说明 */
+    ui_popup_in(s_menu, panel);
+
     const char *nm = online_playlist_name((size_t)idx);
     lv_obj_t *ttl = lv_label_create(panel);
     lv_obj_set_style_text_font(ttl, UI_FONT_SMALL, LV_PART_MAIN);
@@ -656,7 +668,30 @@ static void online_rebuild_page_pl(void)
             lv_obj_set_style_text_color(h, UI_COLOR_FG_DIM, LV_PART_MAIN);
             lv_label_set_text(h, "点一下上面的歌单重新载入");
         } else {
-            lv_obj_t *h = lv_label_create(s_pl_list);
+            /*
+             * 没数据 = 正在载入：**无限转圈** + 一行字
+             * （用户 2026-10 要求：所有"等东西"的地方都用转圈动画，别只给一行文字）。
+             * lv_spinner 默认就是无限循环（LV_SPINNER_TYPE_SPINNING_ARC），不用自己起 timer。
+             */
+            lv_obj_t *box = lv_obj_create(s_pl_list);
+            lv_obj_remove_style_all(box);
+            lv_obj_set_size(box, LV_PCT(100), LV_SIZE_CONTENT);
+            lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+            lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                                  LV_FLEX_ALIGN_CENTER);
+            lv_obj_set_style_pad_all(box, UI_PX_H(28), LV_PART_MAIN);
+            lv_obj_set_style_pad_row(box, UI_PX_H(12), LV_PART_MAIN);
+            lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+            lv_obj_t *sp = lv_spinner_create(box);
+            lv_obj_set_size(sp, UI_PX_H(48), UI_PX_H(48));
+            lv_obj_set_style_arc_width(sp, UI_PX_H(5), LV_PART_MAIN);
+            lv_obj_set_style_arc_width(sp, UI_PX_H(5), LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(sp, UI_COLOR_PILL, LV_PART_MAIN);
+            lv_obj_set_style_arc_color(sp, UI_COLOR_ACCENT, LV_PART_INDICATOR);
+            lv_obj_remove_flag(sp, LV_OBJ_FLAG_CLICKABLE);
+
+            lv_obj_t *h = lv_label_create(box);
             lv_obj_set_style_text_font(h, UI_FONT_TEXT, LV_PART_MAIN);
             lv_obj_set_style_text_color(h, UI_COLOR_FG_DIM, LV_PART_MAIN);
             lv_label_set_text(h, "载入中…");
@@ -728,7 +763,7 @@ static void srch_row_long_pressed(lv_event_t *e)
     }
     const int idx = (int)(intptr_t)lv_event_get_user_data(e);
     if (online_history_remove((size_t)idx) == ESP_OK) {
-        ui_toast("已删除这条记录", 1200);
+        ui_toast("已删除这条搜索记录", 1200);
         online_rebuild_page_srch();
     }
 }
@@ -756,11 +791,14 @@ static void online_rebuild_page_srch(void)
 
     const char *txt = s_srch_ta ? lv_textarea_get_text(s_srch_ta) : "";
     const bool empty = (!txt || !txt[0]);
-    const bool show_hist = !s_srch_has_res && empty && !ime_open();
+    const bool show_hist = !s_srch_has_res && !s_srch_busy && empty && !ime_open();
 
     if (s_srch_hint) {
         lv_label_set_text(s_srch_hint,
-                          s_srch_has_res ? "搜索结果" : (show_hist ? "历史搜索" : "输入后按键盘上的 √ 搜索"));
+                          s_srch_busy ? "正在搜索"
+                                      : (s_srch_has_res ? "搜索结果"
+                                                        : (show_hist ? "历史搜索"
+                                                                     : "输入后按键盘上的对勾搜索")));
     }
     if (s_srch_clear) {
         /* "清除"只在显示历史时出现（需求：右上角"清除"清除搜索记录） */
@@ -769,6 +807,34 @@ static void online_rebuild_page_srch(void)
         } else {
             lv_obj_add_flag(s_srch_clear, LV_OBJ_FLAG_HIDDEN);
         }
+    }
+
+    /* 正在搜索：转圈 + 文案。这一段 LVGL 任务没被占住（请求在工作线程），
+     * 所以转圈是真的在转。 */
+    if (s_srch_busy) {
+        lv_obj_t *box = lv_obj_create(s_srch_list);
+        lv_obj_remove_style_all(box);
+        lv_obj_set_size(box, LV_PCT(100), LV_SIZE_CONTENT);
+        lv_obj_set_flex_flow(box, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_all(box, UI_PX_H(24), LV_PART_MAIN);
+        lv_obj_set_style_pad_row(box, UI_PX_H(12), LV_PART_MAIN);
+        lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *sp = lv_spinner_create(box);
+        lv_obj_set_size(sp, UI_PX_H(44), UI_PX_H(44));
+        lv_obj_set_style_arc_width(sp, UI_PX_H(5), LV_PART_MAIN);
+        lv_obj_set_style_arc_width(sp, UI_PX_H(5), LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(sp, UI_COLOR_PILL, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(sp, UI_COLOR_ACCENT, LV_PART_INDICATOR);
+        lv_obj_remove_flag(sp, LV_OBJ_FLAG_CLICKABLE);
+
+        lv_obj_t *t = lv_label_create(box);
+        lv_obj_set_style_text_font(t, UI_FONT_TEXT, LV_PART_MAIN);
+        lv_obj_set_style_text_color(t, UI_COLOR_FG_DIM, LV_PART_MAIN);
+        lv_label_set_text_fmt(t, "正在搜索「%.40s」…", txt);
+        return;
     }
 
     if (s_srch_has_res) {
@@ -790,7 +856,7 @@ static void online_rebuild_page_srch(void)
         lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(h, LV_PCT(100));
         lv_label_set_text(h, online_has_network()
-                                ? "输入歌名或歌手，按键盘上的 √（或回车）开始搜索"
+                                ? "输入歌名或歌手，按键盘上的对勾（或回车）开始搜索"
                                 : "Wi-Fi 未连接：进「设置」连上网络再搜索");
         return;
     }
@@ -822,20 +888,30 @@ static void srch_do_search(const char *kw)
         return;
     }
     online_history_add(kw);          /* 记历史（服务侧去重 + 提到最前） */
-    s_srch_has_res = true;           /* 结果没回来之前先占住"结果"这个状态 */
+    s_srch_busy    = true;           /* 先进入"正在搜索"态（见 s_srch_busy 的说明） */
+    s_srch_has_res = false;          /* 结果没回来之前不算"有结果"，避免误报"没找到" */
     ime_hide();
     online_rebuild_page_srch();
     work_submit(OREQ_SEARCH, kw);
 }
 
+/*
+ * 输入框事件。
+ *
+ * ★ **绝不能在 LV_EVENT_DEFOCUSED 里收键盘**（2026-10 用户报"点一下键盘它自己就收了"）：
+ *   点键盘上的按键时，焦点会从输入框转到那个按键对象上（按键也是可聚焦的 widget），
+ *   输入框随即收到 DEFOCUSED —— 早期版本在这个分支里 ime_hide()，
+ *   于是"按第一个键，键盘就没了"。
+ *   现在收键盘只有三个入口：
+ *     1) 输入框为空时按对勾/回车（见 srch_ime_ready）；
+ *     2) 点列表/空白区（见 srch_hide_ime_clicked）；
+ *     3) 离开本页、或切回"我的歌单"页（online_on_delete / page_show）。
+ */
 static void srch_ta_event(lv_event_t *e)
 {
     const lv_event_code_t code = lv_event_get_code(e);
     if (code == LV_EVENT_FOCUSED) {
         ime_show_for(s_srch_ta);
-        online_rebuild_page_srch();
-    } else if (code == LV_EVENT_DEFOCUSED || code == LV_EVENT_CANCEL) {
-        ime_hide();
         online_rebuild_page_srch();
     } else if (code == LV_EVENT_VALUE_CHANGED) {
         /* 改了输入内容：旧的搜索结果就不算数了 */
@@ -844,7 +920,21 @@ static void srch_ta_event(lv_event_t *e)
     }
 }
 
-/* 输入法上的 √ / 回车（组件在"没有未上屏拼音"时发这个事件） */
+/*
+ * 点列表/空白处 → 收起键盘。顺手重画一次：这样"输入框为空 + 键盘已收起"
+ * 三个条件齐了，历史记录会自己回来（见 online_rebuild_page_srch 的规则）。
+ * 只挂在列表上（它是输入框的**兄弟**节点）：点输入框本身不会走到这里。
+ */
+static void srch_hide_ime_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (ime_open()) {
+        ime_hide();
+        online_rebuild_page_srch();
+    }
+}
+
+/* 输入法上的对勾 / 回车（组件在"没有未上屏拼音"时发这个事件） */
 static void srch_ime_ready(lv_event_t *e)
 {
     (void)e;
@@ -852,7 +942,7 @@ static void srch_ime_ready(lv_event_t *e)
     if (txt && txt[0]) {
         srch_do_search(txt);
     } else {
-        ime_hide();                  /* 输入框是空的：√ 就是"收起键盘" */
+        ime_hide();                  /* 输入框是空的：对勾 就是"收起键盘" */
         online_rebuild_page_srch();
     }
 }
@@ -884,6 +974,10 @@ static void page_show(int which, bool animate)
     s_page = which ? 1 : 0;
     tab_style(s_tab_pl, s_page == 0);
     tab_style(s_tab_srch, s_page == 1);
+    /* 切回"我的歌单"就把键盘收了：别让它继续盖在歌单页上 */
+    if (s_page != 1) {
+        ime_hide();
+    }
 
     /* 页宽 = 宿主的宽；万一还没 layout（宽 0）就用屏幕宽兜底，别让两页叠一起 */
     int32_t w = lv_obj_get_width(s_host);
@@ -924,7 +1018,9 @@ static void modal_close(void)
         lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
     }
     if (s_modal) {
-        lv_obj_delete_async(s_modal);   /* 异步删：本函数可能在键盘事件回调里被调 */
+        /* 渐出（面板是遮罩的第一个子对象）：动画结束由 ui_popup_out 自己删。
+         * 本函数可能在键盘事件回调里被调，所以这里只"开始淡出"，不阻塞。 */
+        ui_popup_out(s_modal, lv_obj_get_child(s_modal, 0));
         s_modal = NULL;
     }
     s_modal_ta = NULL;
@@ -943,7 +1039,7 @@ static void modal_submit(lv_event_t *e)
     if (s_modal_kind == MODAL_RENAME) {
         if (s_rename_idx >= 0) {
             online_playlist_rename((size_t)s_rename_idx, txt ? txt : "");
-            ui_toast("已重命名", 1200);
+            ui_toast("重命名成功", 1200);
             online_rebuild_page_pl();
         }
         s_rename_idx = -1;
@@ -952,7 +1048,7 @@ static void modal_submit(lv_event_t *e)
     }
 
     if (!txt || !txt[0]) {
-        ui_toast("先输入内容", 1200);
+        ui_toast("请输入内容", 1200);
         return;
     }
     if (!online_has_network()) {
@@ -982,7 +1078,7 @@ static void modal_on_delete(lv_event_t *e)
 }
 
 /*
- * 拼音键盘上的 √ / 回车 → 组件在"没有未上屏拼音"时发 ready 事件。
+ * 拼音键盘上的对勾 / 回车 → 组件在"没有未上屏拼音"时发 ready 事件。
  * 语义按当前上下文分派：
  *   - 重命名浮层开着 → 等于"确定"（提交重命名）
  *   - 否则（搜索页）  → 输入框非空就开始搜索，空则收起键盘
@@ -1053,9 +1149,9 @@ static void modal_build_keyboards(lv_obj_t *ta, bool search)
             s_ime = lv_pinyin_ime_create(s_ime_box);
             if (!s_ime) {
                 ESP_LOGW(TAG, "pinyin ime create failed (dict 分区没烧？)");
-                ui_toast("拼音输入法不可用（dict 分区未烧写），可先用英文搜索", 2500);
+                ui_toast("拼音输入法不可用。", 2500);
             } else {
-                /* √ / 回车（无未上屏拼音时触发）→ 搜索或提交重命名 */
+                /*对勾 / 回车（无未上屏拼音时触发）→ 搜索或提交重命名 */
                 lv_obj_add_event_cb(s_ime, ime_ready_cb, lv_pinyin_ime_event_ready(), NULL);
             }
         }
@@ -1126,6 +1222,8 @@ static void modal_open(int kind)
     lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_align(panel, LV_ALIGN_TOP_MID, 0, UI_PX_H(8));
+    /* 渐入（淡入 + 上滑）：和长按菜单、Toast 用同一套动效 */
+    ui_popup_in(scrim, panel);
 
     lv_obj_t *title = lv_label_create(panel);
     lv_obj_set_style_text_font(title, UI_FONT_TITLE, LV_PART_MAIN);
@@ -1239,8 +1337,10 @@ static void on_result(void)
         online_rebuild_page_pl();
         break;
     case OREQ_SEARCH:
+        s_srch_busy = false;         /* 结果到了（或失败了）：退出"正在搜索"态 */
         if (err == ESP_OK && songs) {
             online_install(songs, count, "", OWNER_SRCH);
+            s_srch_has_res = true;
             ui_toast("搜索完成", 1200);
         } else {
             free(songs);
@@ -1426,7 +1526,7 @@ static lv_obj_t *page_online(void)
     lv_obj_set_style_text_color(s_srch_ta, UI_COLOR_FG, LV_PART_MAIN);
     lv_textarea_set_one_line(s_srch_ta, true);
     lv_textarea_set_max_length(s_srch_ta, 60);
-    lv_textarea_set_placeholder_text(s_srch_ta, "输入歌名或歌手，按键盘 √ 搜索");
+    lv_textarea_set_placeholder_text(s_srch_ta, "输入歌名或歌手，按键盘对勾 搜索");
     lv_obj_add_event_cb(s_srch_ta, srch_ta_event, LV_EVENT_ALL, NULL);
 
     /* 列表小标题（左）+ "清除"（右，只在显示历史时出现） */
@@ -1464,6 +1564,9 @@ static lv_obj_t *page_online(void)
     lv_obj_set_style_bg_opa(s_srch_list, LV_OPA_60, LV_PART_SCROLLBAR);
     lv_obj_set_style_width(s_srch_list, UI_PX_W(6), LV_PART_SCROLLBAR);
     lv_obj_set_style_radius(s_srch_list, UI_PX_H(3), LV_PART_SCROLLBAR);
+    /* 点列表/空白处收键盘（"点别处收起键盘"的手感；输入框自己是列表的兄弟，不受影响） */
+    lv_obj_add_flag(s_srch_list, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_srch_list, srch_hide_ime_clicked, LV_EVENT_CLICKED, NULL);
 
     /*
      * ★ 首次定位必须在**整屏跑过一次 layout 之后**：页宽取自 lv_obj_get_width(s_host)，

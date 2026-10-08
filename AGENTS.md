@@ -117,7 +117,7 @@ BEFORE_RESET / AFTER_RESET / **MONITOR_BAUD** / NO_STUB，整个 IDF 树里也�
 | 音频 Codec | **ES8389**，I2C0 SDA=0/SCL=1（地址 0x20）；I2S 端口0，bclk=3 / ws=4 / dout=5 / din=6，**MCLK=-1（无 MCLK）**；**DAC/ADC 都是 TDM 格式**，48 kHz 16 bit |
 | 功放 | **`PA_CTRL` = GPIO7，高电平使能**（板级 `active_level: 1`）；左右共用一个使能脚 |
 | microSD | **4-bit SDMMC slot0**：clk=24 / cmd=25 / d0=20 / d1=21 / d2=22 / d3=23；`SD_CTRL`=GPIO39 **低电平使能**（`active_level: 0`）；挂载点 `/sdcard` |
-| 按键 | `adc_button_group`，**GPIO42 / ADC1 ch0**，4 键（电压档 SET=380mV, MODE=820mV, VOLUME_DOWN=1340mV, VOLUME_UP=1870mV）→ **实际是 SET / MODE / VOL- / VOL+，不是指南写的 PLAY/SET/VOL-/VOL+** |
+| 按键 | `adc_button_group`，**GPIO42 / ADC1 ch0**。**以板级 YAML 为准**（`managed_components/espressif__esp_boards/esp32_s31_korvo_1/board_devices.yaml`）：`button_num: 6`、`max_voltage: 3000`、`voltage_range: [380, 820, 1180, 1570, 1980, 2410]`、`button_labels: ["VOLUME_UP","VOLUME_DOWN","SET","PLAY","Mode","REC"]` —— 即 **380 mV = VOLUME_UP、820 = VOLUME_DOWN、1180 = SET、1570 = PLAY、1980 = Mode、2410 = REC**。驱动按电压**升序**建句柄、窗口取相邻档位中点（`dev_button_sub_adc_multi.c`）。⚠ 旧文档里"SET=380/MODE=820/VOL-=1340/VOL+=1870"那套是错的，别再用（见 §14.10） |
 | RGB LED | WS2812，**GPIO37**，RMT |
 | Boot 键 | GPIO61（低有效） |
 | 供电 | USB 5 V 常供，**无电池、无电量计、无软关机**；状态栏禁止画电池 |
@@ -468,7 +468,7 @@ tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
 | 4 | 图标换 `assets/icons/netease.png` | ✅ 已完成（见第 13 节） |
 | 5 | 左右可滑动布局 + 歌单长按重命名/更新/删除 + 点按进歌曲列表 | ✅ 已完成 |
 | 6 | 搜索页：输入框 + 历史搜索（10 条，长按删单条、右上"清除"） | ✅ 已完成 |
-| 7 | √/回车 触发搜索→显示结果；输入框空且关输入法才回到历史 | ✅ 已完成 |
+| 7 | 对勾/回车 触发搜索→显示结果；输入框空且关输入法才回到历史 | ✅ 已完成 |
 
 ### 14.1 两页滑动布局怎么搭的（`app_online.cc`）
 
@@ -504,7 +504,7 @@ tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
 2. 否则**输入框为空**且**输入法已收起**（`ime_open()` 看键盘对象的 HIDDEN 位）→ 画**历史**；
 3. 其它（正在输入）→ 只画一行提示，别把历史塞在键盘上面。
 
-- 触发搜索：拼音键盘的 √/回车 → 组件在"没有未上屏拼音"时发
+- 触发搜索：拼音键盘的 对勾/回车 → 组件在"没有未上屏拼音"时发
   `lv_pinyin_ime_event_ready()`（见 `lv_pinyin_ime.c` 的 `IME_KEY_CONFIRM` 分支），
   `ime_ready_cb()` 收到后：输入框非空 → `srch_do_search()`；空 → 收起键盘（回到历史）。
   重命名浮层开着时，同一个事件改成"提交重命名"。
