@@ -70,12 +70,44 @@ static esp_gmf_io_handle_t s_stream_io;
  * 蓝牙这条路**必须**返回 data_size：返回短了 GMF 会当成写失败/结束，
  * 宁可丢掉一帧也不能让解码管线停。
  */
+/*
+ * 16-bit PCM 就地音量缩放（够用就好，不用浮点：S31 是 RISC-V，整数乘除更快）。
+ * 带削波保护 —— 超过 ±32767 不夹的话会"炸音"（回绕成反相尖峰）。
+ */
+static void pcm16_scale(int16_t *p, int n, int vol)
+{
+    for (int i = 0; i < n; i++) {
+        int32_t v = ((int32_t)p[i] * vol) / 100;
+        if (v > 32767) {
+            v = 32767;
+        } else if (v < -32768) {
+            v = -32768;
+        }
+        p[i] = (int16_t)v;
+    }
+}
+
 static int out_write_cb(uint8_t *data, int data_size, void *ctx)
 {
     /* 有 PCM 真的送到 codec 了 —— 这就是"缓冲结束、开始出声"的信号，
      * UI 用它把"缓冲中 xx%"换回歌词（见 audio_service_output_active） */
     s_out_flowing = true;
     if (s_out == AUDIO_OUT_BLUETOOTH) {
+        /*
+         * ★ 蓝牙的音量必须在这里做**软件缩放**（2026-10 修"蓝牙设备音量调不动"）：
+         *   扬声器路的音量作用在 ES8389（bsp_audio_set_volume），而蓝牙路是
+         *   out_write_cb → bt_service_write_pcm → A2DP 编码 → 耳机，
+         *   **整条链上没人看 s_volume** —— 所以以前按音量键对蓝牙完全没反应
+         *   （界面数字在变、耳机音量不动）。这里是唯一同时覆盖两条通路的点。
+         */
+        const int vol = (s_volume < 0) ? 0 : (s_volume > 100 ? 100 : s_volume);
+        if (vol <= 0) {
+            return data_size;          /* 静音：不往 A2DP 推数据，但照旧返回全长 */
+        }
+        if (vol < 100) {
+            /* 16 bit 样本数 = 字节数/2（单声道/立体声交错都一样）；100% 时走原路，零开销 */
+            pcm16_scale((int16_t *)(void *)data, data_size / 2, vol);
+        }
         (void)bt_service_write_pcm(data, (size_t)data_size);
         return data_size;
     }

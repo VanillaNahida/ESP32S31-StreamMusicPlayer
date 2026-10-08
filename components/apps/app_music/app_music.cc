@@ -566,15 +566,29 @@ static int32_t seek_pointer_permille(void)
 }
 
 /* 按下即跟手：拖动中只更新进度条与"已播"时间，**松手才真定位**
- * （GMF 的 seek 要暂停/恢复管线，边拖边定位会一顿一顿） */
+ * （GMF 的 seek 要暂停/恢复管线，边拖边定位会一顿一顿）
+ *
+ * ★ 时长未知（s_dur_ms == 0）时**也允许进入拖动**（2026-10 修"进度条完全不可用"）：
+ *   原来这里 `|| s_dur_ms == 0` 直接 return —— 于是 s_seeking 一直是 false，
+ *   拇指不跟手，而且 on_seek_release() 在 `if (!s_seeking) return;` 就退出，
+ *   **下面那句"时长未知，暂时无法拖动定位"的提示永远执行不到**。
+ *   表现就是"按下去毫无反应、也没有任何解释"。
+ *   现在：照样进拖动（拇指跟手，让用户看到控件是活的），松手时由 on_seek_release
+ *   给出原因。视觉归位由 tick / 松手分支负责。
+ */
 static void on_seek_press(lv_event_t *e)
 {
     (void)e;
-    if (s_index < 0 || s_dur_ms == 0 || !s_p_seek) {
+    if (s_index < 0 || !s_p_seek) {
         return;
     }
     s_seeking = true;
-    int32_t permille = seek_pointer_permille();
+    const int32_t permille = seek_pointer_permille();
+    if (s_dur_ms == 0) {
+        /* 时长未知：没法换算时间，但拇指照样跟手（纯视觉反馈） */
+        lv_bar_set_value(s_p_seek, permille, LV_ANIM_OFF);
+        return;
+    }
     lv_bar_set_value(s_p_seek, permille, LV_ANIM_OFF);
     if (s_p_cur) {
         char buf[16];
@@ -681,7 +695,21 @@ static const char *out_icon_of(audio_out_t o)
 static const char *out_name_of(audio_out_t o)
 {
     switch (o) {
-    case AUDIO_OUT_BLUETOOTH: return "蓝牙音频设备";
+    case AUDIO_OUT_BLUETOOTH: {
+        /*
+         * 需求：这里显示"蓝牙音频设备 <设备名> 已连接"，而不是干巴巴一个类别名。
+         * 名字来自 bt_service_peer_name()（A2DP 连上时写进去的对端名）。
+         * 用 static 缓冲返回：调用方都在 LVGL 任务里、拿到就立刻拷进 label，单线程安全。
+         * 没连上（或还没拿到名字）时退回原来的类别名。
+         */
+        static char bt_desc[BT_NAME_MAX + 32];
+        const char *nm = bt_service_peer_name();
+        if (nm && nm[0]) {
+            snprintf(bt_desc, sizeof(bt_desc), "蓝牙音频设备 %s 已连接", nm);
+            return bt_desc;
+        }
+        return "蓝牙音频设备";
+    }
     case AUDIO_OUT_NONE:      return "静音";
     default:                  return "板载扬声器";
     }
@@ -1080,9 +1108,17 @@ static void tick_cb(lv_timer_t *t)
         s_fail_streak = 0;
     }
 
-    if (audio_service_is_playing()) {
-        /* 限制：simple_player 无位置 API，用墙钟累计。
-         * s_resume_ms > 0 期间先不累计：这时音源还在 0 附近走，等下面
+    /*
+     * ★ 墙钟只在**真的出声之后**才累加（2026-10 修"歌词与歌曲不同步"）：
+     *   simple_player 没有位置 API，进度只能靠墙钟累加；而在线歌从 run() 到
+     *   真正出声之间还有 1~3 秒的缓冲 —— 以前这段时间也被算进 s_elapsed_ms，
+     *   于是歌词**整体提前**（缓冲越久偏得越多）。
+     *   这里加一道 audio_service_output_active()（PCM 真的写到 codec/蓝牙那一刻
+     *   才为真，见 audio_service.h），起播前不计时，误差就消失了。
+     *   顺带把暂停/卡顿期间也排除了（同样的道理）。
+     */
+    if (audio_service_is_playing() && audio_service_output_active()) {
+        /* s_resume_ms > 0 期间先不累计：这时音源还在 0 附近走，等下面
          * 定位完成后再把 s_elapsed_ms 对齐到续播位置，否则显示会来回跳。 */
         if (s_resume_ms == 0) {
             s_elapsed_ms += TICK_MS;

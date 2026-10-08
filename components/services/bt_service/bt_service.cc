@@ -630,7 +630,17 @@ static void bt_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void
             (esp_bt_audio_event_device_discovered_t *)event_data;
         bt_dev_t *e = dev_find(d->addr, true);
         if (e) {
-            snprintf(e->name, sizeof(e->name), "%s", (d->name[0] ? d->name : ""));
+            /*
+             * ★ 名字"只增不减"（2026-10 修"扫描时设备名有时变成 MAC 地址"）：
+             *   一次查询会对**同一台设备上报多包**，而名字（EIR / 异步
+             *   read_remote_name 的结果）往往**不在第一包里**。
+             *   原来是每包都无条件重写 e->name，后面只要再来一包不带名字的，
+             *   就会把已经拿到的好名字**覆盖成 MAC**（看起来"名字一会儿有一会儿没有"）。
+             *   现在：有名字才写；仍然没名字（从没见过）才退回地址显示。
+             */
+            if (d->name[0]) {
+                snprintf(e->name, sizeof(e->name), "%s", d->name);
+            }
             e->rssi     = (int8_t)d->rssi;
             e->is_audio = (((d->disc_data.classic.cod & ESP_BT_COD_MAJOR_DEV_BIT_MASK)
                             >> ESP_BT_COD_MAJOR_DEV_BIT_OFFSET) == ESP_BT_COD_MAJOR_DEV_AV);
@@ -641,6 +651,7 @@ static void bt_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void
                 }
             }
             if (e->name[0] == '\0') {
+                /* 从没见过名字的设备：退回地址显示（等后面的包带来真名） */
                 bt_service_addr_str(e->bda, e->name, sizeof(e->name));
             }
         }
