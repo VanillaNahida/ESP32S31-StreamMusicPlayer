@@ -38,9 +38,10 @@ static const char *TAG = "wifi_svc";
 /* SNTP 服务器：国内优先用阿里；失败也只影响 https 与时钟显示 */
 #define SNTP_SERVER "ntp.aliyun.com"
 
-/* 连接失败/掉线后的自动重试：最多 5 次，每次隔 4 秒 */
+/* 连接失败/掉线后的自动重试：快速 5 次（每 4 秒），之后转 60 秒一次的慢重试 */
 #define WIFI_RETRY_MAX        5
 #define WIFI_RETRY_DELAY_MS   4000
+#define WIFI_RETRY_SLOW_MS    60000
 /* 开机首次连接的延时：等 PHY/扫描就绪，见 wifi_service_init() 里的注释 */
 #define WIFI_FIRST_CONNECT_MS 1500
 
@@ -65,6 +66,8 @@ static bool                 s_settings_loaded;   /* 是否已经从 NVS 读过�
 static volatile bool        s_registered;   /* 事件处理器是否已注册 */
 static bool                 s_sntp_started;
 static int                  s_retry_left;   /* 还能自动重试几次 */
+static volatile bool        s_retry_slow;   /* true = 快速额度用完，转慢速重试 */
+static volatile int         s_last_reason;  /* 最近一次断开/失败的原因码（UI 显示用） */
 static esp_timer_handle_t   s_retry_timer;
 static volatile bool        s_retry_pending; /* 重试定时器已装载（未触发） */
 
@@ -252,6 +255,56 @@ static void wifi_evt_task(void *arg)
  */
 
 /*
+ * 断开原因码 → 人话。
+ *
+ * 需求背景："配网时连不上"只打一句"密码错/找不到？"根本没法定位：密码错是
+ * 15/202/204，AP 不在范围是 201，被自己人掐掉是 8。这里把最常见的几个翻出来。
+ */
+static const char *wifi_reason_str(int reason)
+{
+    switch (reason) {
+    case WIFI_REASON_UNSPECIFIED:                     return "未指定";
+    case WIFI_REASON_AUTH_EXPIRE:                     return "认证过期";
+    case WIFI_REASON_AUTH_LEAVE:                      return "被 AP 解除认证";
+    case WIFI_REASON_ASSOC_TOOMANY:                   return "AP 关联数已满";
+    case WIFI_REASON_ASSOC_LEAVE:                     return "本方主动离开（不是失败）";
+    case WIFI_REASON_ASSOC_NOT_AUTHED:                return "关联时未认证";
+    case WIFI_REASON_MIC_FAILURE:                     return "MIC 校验失败：密码错";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:          return "四次握手超时：密码错";
+    case WIFI_REASON_802_1X_AUTH_FAILED:              return "802.1X 认证失败（企业级网络？）";
+    case WIFI_REASON_CIPHER_SUITE_REJECTED:           return "加密套件被拒";
+    case WIFI_REASON_BEACON_TIMEOUT:                  return "AP 信标丢失（信号差）";
+    case WIFI_REASON_NO_AP_FOUND:                     return "没找到这个 AP（信号弱/在 5G 频段？）";
+    case WIFI_REASON_AUTH_FAIL:                       return "认证失败：密码错";
+    case WIFI_REASON_ASSOC_FAIL:                      return "关联失败";
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:               return "握手超时：密码错";
+    case WIFI_REASON_CONNECTION_FAIL:                 return "连接失败";
+    case WIFI_REASON_AP_TSF_RESET:                    return "AP 重启了";
+    case WIFI_REASON_ROAMING:                         return "漫游到别的 AP";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+        return "没有加密方式兼容的 AP（该 AP 只用 WPA3/企业级？）";
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "AP 不满足 authmode 阈值（加密方式对不上）";
+    case WIFI_REASON_NO_AP_FOUND_IN_RSSI_THRESHOLD:   return "信号强度低于阈值";
+    default:                                          return "见 esp_wifi_types.h";
+    }
+}
+
+/* 内部连接实现（不碰重试额度），见 wifi_service_connect 的注释 */
+static esp_err_t wifi_connect_raw(const char *ssid, const char *pass, bool save);
+
+/*
+ * 把重试额度补满并退出慢速模式。
+ * 只有两种情况该调：**连上了**，或者**用户主动发起连接**（手动点一下不代表
+ * 自动重试也该重新数）。自动重试自己绝不能调 —— 那正是原来无限重连的根因。
+ */
+static void wifi_retry_budget_refill(void)
+{
+    s_retry_left = WIFI_RETRY_MAX;
+    s_retry_slow = false;
+}
+
+/*
  * 连接失败/掉线后的自动重试（需求："wifi 连接失败后没有重试机制"）。
  * 用一次性 esp_timer 延时触发，最多 WIFI_RETRY_MAX 次；连上就补满。
  * 不用 vTaskDelay 阻塞：事件回调跑在 sys_evt 任务里，不能堵。
@@ -260,7 +313,10 @@ static void wifi_retry_cb(void *arg)
 {
     (void)arg;
     s_retry_pending = false;
-    if (!s_enabled || !s_ready || s_retry_left <= 0) {
+    if (!s_enabled || !s_ready) {
+        return;
+    }
+    if (!s_retry_slow && s_retry_left <= 0) {
         return;
     }
     /*
@@ -272,17 +328,30 @@ static void wifi_retry_cb(void *arg)
     if (s_state == WIFI_ST_CONNECTED) {
         return;
     }
-    if (!s_conn_ssid[0] || !store_find(s_conn_ssid)) {
+    const wifi_cred_t *c = store_find(s_conn_ssid);
+    if (!c) {
         return;                 /* 没存过密码，重试也没意义 */
     }
-    s_retry_left--;
-    ESP_LOGI(TAG, "connect '%s' (try, %d retry left)", s_conn_ssid, s_retry_left);
-    wifi_service_connect_saved(s_conn_ssid);
+    if (s_retry_slow) {
+        ESP_LOGI(TAG, "slow retry '%s'", s_conn_ssid);
+    } else {
+        s_retry_left--;
+        ESP_LOGI(TAG, "connect '%s' (try, %d retry left)", s_conn_ssid, s_retry_left);
+    }
+    /*
+     * ★ 必须走 wifi_connect_raw：以前这里调 wifi_service_connect_saved()，
+     *   而那个函数会把 s_retry_left 重新补满 —— 于是每重试一次额度就回到 5，
+     *   日志里永远是 "4 retry left"，WIFI_RETRY_MAX 完全失效、无限重连。
+     */
+    wifi_connect_raw(c->ssid, c->pass, false);
 }
 
 static void wifi_retry_arm_ms(uint32_t ms)
 {
-    if (!s_enabled || !s_init_done || s_retry_left <= 0) {
+    if (!s_enabled || !s_init_done) {
+        return;
+    }
+    if (!s_retry_slow && s_retry_left <= 0) {
         return;
     }
     if (!s_retry_timer) {
@@ -299,9 +368,25 @@ static void wifi_retry_arm_ms(uint32_t ms)
     esp_timer_start_once(s_retry_timer, (uint64_t)ms * 1000ULL);
 }
 
+/*
+ * 掉线/失败后排下一次重试。
+ *
+ * 两级节奏：前 WIFI_RETRY_MAX 次 4 秒一次（快速恢复），用完之后**不放弃**，
+ * 转成 1 分钟一次的慢重试。
+ *   - 为什么不能无限快重试：密码错/企业级网络时就是每 4 秒一轮"连接→失败"，
+ *     日志被刷满、射频一直忙（以前的实现就是这样：额度被 wifi_service_connect()
+ *     反复补满，永远停在 "4 retry left"）。
+ *   - 为什么也不能用完就彻底停：AP 重启、走出信号盲区都是临时的，停了就再也
+ *     回不来，只能等用户去关开一次开关。
+ */
 static void wifi_retry_arm(void)
 {
-    wifi_retry_arm_ms(WIFI_RETRY_DELAY_MS);
+    if (!s_retry_slow && s_retry_left <= 0) {
+        s_retry_slow = true;
+        ESP_LOGW(TAG, "quick retries exhausted, retry '%s' every %d s from now on",
+                 s_conn_ssid, (int)(WIFI_RETRY_SLOW_MS / 1000));
+    }
+    wifi_retry_arm_ms(s_retry_slow ? WIFI_RETRY_SLOW_MS : WIFI_RETRY_DELAY_MS);
 }
 
 static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -319,18 +404,41 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
         s_state = WIFI_ST_CONNECTED;
         ESP_LOGI(TAG, "connected to '%s'", s_conn_ssid);
         break;
-    case WIFI_EVENT_STA_DISCONNECTED:
+    case WIFI_EVENT_STA_DISCONNECTED: {
+        const wifi_event_sta_disconnected_t *d = (const wifi_event_sta_disconnected_t *)data;
+        const int reason = d ? d->reason : -1;
         s_ip[0] = '\0';
         s_rssi  = 0;
+        /*
+         * ★ ASSOC_LEAVE = "本方要求离开"，是我们自己调 esp_wifi_disconnect() 的产物，
+         *   **不是**连接失败。以前不分原因一律当失败，于是：
+         *     切网络/重试时先 disconnect 再 connect
+         *     → 那个 ASSOC_LEAVE 事件几毫秒后才被 sys_evt 派发
+         *     → 把刚发起的连接当场判成 FAILED 并排下一次重试
+         *     → 4 秒后重复，新连接永远活不过那几毫秒。
+         *   日志特征就是 "connecting to 'X' (save=0)" 之后 6 ms 就
+         *   "connect 'X' failed (密码错/找不到？)" —— 正常的认证/握手失败
+         *   至少要几十到几百毫秒，不可能 6 ms。
+         */
+        if (reason == WIFI_REASON_ASSOC_LEAVE) {
+            ESP_LOGI(TAG, "left '%s' on request, reason %d (%s)",
+                     s_conn_ssid, reason, wifi_reason_str(reason));
+            break;
+        }
         if (s_state == WIFI_ST_CONNECTING) {
             s_state = WIFI_ST_FAILED;
-            ESP_LOGW(TAG, "connect '%s' failed (密码错/找不到？)", s_conn_ssid);
+            s_last_reason = reason;
+            ESP_LOGW(TAG, "connect '%s' failed: reason %d (%s)",
+                     s_conn_ssid, reason, wifi_reason_str(reason));
         } else {
             s_state = WIFI_ST_IDLE;
-            ESP_LOGW(TAG, "disconnected");
+            s_last_reason = reason;
+            ESP_LOGW(TAG, "disconnected from '%s': reason %d (%s)",
+                     s_conn_ssid, reason, wifi_reason_str(reason));
         }
         wifi_retry_arm();      /* 失败/掉线都自动重试（上限见 WIFI_RETRY_MAX） */
         break;
+    }
     default:
         break;
     }
@@ -350,7 +458,8 @@ static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
         s_rssi = s_ap_info.rssi;
     }
     s_state = WIFI_ST_CONNECTED;
-    s_retry_left = WIFI_RETRY_MAX;    /* 连上了就把重试额度补满 */
+    s_last_reason = 0;                /* 连上了：清掉上次的失败原因 */
+    wifi_retry_budget_refill();       /* 连上了就把重试额度补满、退出慢速模式 */
     ESP_LOGI(TAG, "got ip %s", s_ip);
 
     /*
@@ -452,8 +561,9 @@ esp_err_t wifi_service_init(void)
      * 开机反而更快连上（wifi_retry_cb 走的是同一套"用已保存密码重连"）。 */
     if (s_store.count > 0) {
         const wifi_cred_t *c = &s_store.list[s_store.count - 1];
+        s_conn_ssid[0] = '\0';
         snprintf(s_conn_ssid, sizeof(s_conn_ssid), "%s", c->ssid);
-        s_retry_left = WIFI_RETRY_MAX;
+        wifi_retry_budget_refill();
         s_state = WIFI_ST_CONNECTING;
         wifi_retry_arm_ms(WIFI_FIRST_CONNECT_MS);
     }
@@ -575,18 +685,52 @@ esp_err_t wifi_service_scan_start(void)
     return ESP_OK;
 }
 
-esp_err_t wifi_service_connect(const char *ssid, const char *pass, bool save)
+/*
+ * 真正下发配置并连接。
+ *
+ * **不碰 s_retry_left** —— 自动重试必须走这条，否则每重试一次额度就被补满
+ * （见 wifi_retry_cb 里的说明）。对外那两个入口负责"用户主动连 → 补满额度"。
+ */
+static esp_err_t wifi_connect_raw(const char *ssid, const char *pass, bool save)
 {
     if (!s_ready || !ssid || !ssid[0]) {
         return ESP_ERR_INVALID_ARG;
     }
-    s_retry_left = WIFI_RETRY_MAX;    /* 手动连一次 → 自动重试额度重新补满 */
     wifi_config_t wc = {};
     snprintf((char *)wc.sta.ssid, sizeof(wc.sta.ssid), "%s", ssid);
     if (pass) {
         snprintf((char *)wc.sta.password, sizeof(wc.sta.password), "%s", pass);
     }
-    wc.sta.threshold.authmode = WIFI_AUTH_OPEN;   /* 加密/开放都接受 */
+
+    /*
+     * threshold.authmode：以前一律填 WIFI_AUTH_OPEN（注释写"加密/开放都接受"），
+     * 但只要给了密码，IDF 就会先打
+     *   "Password length matches WPA2 standards, authmode threshold changes from OPEN to WPA2"
+     * 再从内部改掉它。这句警告正好夹在 "connecting to" 和 "connect failed" 中间，
+     * 非常容易被当成失败原因。按实际加密方式填就干净了：
+     *   扫描结果里有这个 AP → 用它报的 authmode（WPA2 / WPA3 / 开放都对得上）；
+     *   没有（开机自动连、重试）→ 有密码按 WPA2_PSK，没密码按开放。
+     */
+    uint8_t auth = 0;
+    bool from_scan = false;
+    for (size_t i = 0; i < s_ap_count; i++) {
+        if (strcmp(s_ap[i].ssid, ssid) == 0) {
+            auth = s_ap[i].authmode;
+            from_scan = true;
+            break;
+        }
+    }
+    if (!from_scan) {
+        auth = (pass && pass[0]) ? (uint8_t)WIFI_AUTH_WPA2_PSK : (uint8_t)WIFI_AUTH_OPEN;
+    }
+    /* 给了密码但（扫描说）是开放/WEP：按 WPA2 试 —— 有些 AP 在扫描结果里把加密
+     * 报成开放，IDF 内部也是这么兜的，这里显式写出来免得又冒出那句阈值警告 */
+    if (pass && pass[0] && auth < (uint8_t)WIFI_AUTH_WPA_PSK) {
+        auth = (uint8_t)WIFI_AUTH_WPA2_PSK;
+    }
+    wc.sta.threshold.authmode = (wifi_auth_mode_t)auth;
+
+    const wifi_state_t prev = s_state;
 
     esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wc);
     if (ret != ESP_OK) {
@@ -597,8 +741,20 @@ esp_err_t wifi_service_connect(const char *ssid, const char *pass, bool save)
     s_ip[0] = '\0';
     s_state = WIFI_ST_CONNECTING;
 
-    esp_wifi_disconnect();
+    /*
+     * 只有"确实还挂着或正在连"才需要先断开。以前是无条件 disconnect + connect：
+     * disconnect 会让驱动取消正在进行的连接并投递一个 ASSOC_LEAVE 事件，紧接着
+     * connect 刚发起就被那个事件判成失败（on_wifi_evt 里现在会忽略它），
+     * 于是连接永远活不过几毫秒。空闲时直接 connect 即可。
+     */
+    if (prev == WIFI_ST_CONNECTED || prev == WIFI_ST_CONNECTING) {
+        esp_wifi_disconnect();
+    }
+
     ret = esp_wifi_connect();
+    if (ret == ESP_ERR_WIFI_CONN) {
+        ret = ESP_OK;          /* 已经有一次连接在进行中：等它的结果就行 */
+    }
     if (ret != ESP_OK) {
         s_state = WIFI_ST_FAILED;
         return ret;
@@ -607,8 +763,15 @@ esp_err_t wifi_service_connect(const char *ssid, const char *pass, bool save)
         store_put(ssid, pass);
         refresh_ap_saved_flag();
     }
-    ESP_LOGI(TAG, "connecting to '%s' (save=%d)", ssid, (int)save);
+    ESP_LOGI(TAG, "connecting to '%s' (auth=%d%s save=%d)", ssid, (int)auth,
+             from_scan ? " from-scan" : "", (int)save);
     return ESP_OK;
+}
+
+esp_err_t wifi_service_connect(const char *ssid, const char *pass, bool save)
+{
+    wifi_retry_budget_refill();       /* 用户主动连一次 → 自动重试额度重新补满 */
+    return wifi_connect_raw(ssid, pass, save);
 }
 
 esp_err_t wifi_service_connect_saved(const char *ssid)
@@ -617,7 +780,8 @@ esp_err_t wifi_service_connect_saved(const char *ssid)
     if (!c) {
         return ESP_ERR_NOT_FOUND;
     }
-    return wifi_service_connect(c->ssid, c->pass, false);
+    wifi_retry_budget_refill();       /* 同上：用户点了"用已保存的密码连" */
+    return wifi_connect_raw(c->ssid, c->pass, false);
 }
 
 esp_err_t wifi_service_disconnect(void)
@@ -648,6 +812,11 @@ esp_err_t wifi_service_forget(const char *ssid)
 const char *wifi_service_conn_ssid(void) { return s_conn_ssid; }
 const char *wifi_service_ip(void)        { return s_ip; }
 int         wifi_service_rssi(void)      { return s_rssi; }
+
+const char *wifi_service_last_reason_str(void)
+{
+    return (s_last_reason != 0) ? wifi_reason_str(s_last_reason) : "";
+}
 
 size_t wifi_service_saved_count(void)    { return s_store.count; }
 

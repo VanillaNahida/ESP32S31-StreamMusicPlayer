@@ -3,4 +3,4 @@ managed_components/
 build/
 sdkconfig
 venv/
-skills/
+.skills/

@@ -18,6 +18,7 @@
 #include <strings.h>
 
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "bsp.h"
@@ -26,10 +27,59 @@ static const char *TAG = "storage";
 
 #define MUSIC_ROOT      "/sdcard"
 #define MUSIC_ROOT_ALT  "/sdcard"
+#define TRACK_MAX       8192
 #define SCAN_YIELD_EVERY 32
-#define TRACK_MAX       512
+
+
+/* 安全上限：正常不再靠它截断（按目录内实际文件数动态扩容），
+ * 只在极端情况（目录里几万首）兜住内存 */
+#define TRACK_MAX       8192
 
 static track_t *s_tracks;
+/*
+ * 曲目表按"目录内实际文件数"动态扩容（需求：扫描不全 → 不要固定的 512 条上限）。
+ *   - 先给 64 条；满了就翻倍（realloc），优先放 PSRAM（表大了不占内部 RAM）；
+ *   - 真到 TRACK_MAX 或内存不足才放弃，并打日志（不再静默丢歌）。
+ * storage_service_track() 返回的是表内指针，扩容会让它失效 —— 调用方都只在
+ * 扫描/换目录的间隙取指针并用完即走（UI 每帧重取），所以这里不做额外保护。
+ */
+static size_t   s_cap;
+
+static bool tracks_reserve(size_t need)
+{
+    if (need <= s_cap) {
+        return true;
+    }
+    size_t cap = (s_cap > 0) ? s_cap : 64;
+    while (cap < need) {
+        cap *= 2;
+    }
+    if (cap > TRACK_MAX) {
+        cap = TRACK_MAX;
+    }
+    track_t *p = (track_t *)heap_caps_realloc(s_tracks, cap * sizeof(track_t),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        p = (track_t *)realloc(s_tracks, cap * sizeof(track_t));   /* 退回内部 RAM */
+    }
+    if (!p) {
+        ESP_LOGE(TAG, "track table grow to %u failed (%u used)", (unsigned)cap, (unsigned)s_cap);
+        return false;
+    }
+    s_tracks = p;
+    s_cap    = cap;
+    ESP_LOGI(TAG, "track table -> %u entries", (unsigned)cap);
+    return true;
+}
+
+static bool tracks_grow(void)
+{
+    if (s_cap >= TRACK_MAX) {
+        ESP_LOGW(TAG, "track count hit the %u safety cap, remaining files skipped", (unsigned)TRACK_MAX);
+        return false;
+    }
+    return tracks_reserve(s_cap + 1);
+}
 static size_t   s_count;
 static bool     s_ready;
 
@@ -114,7 +164,7 @@ static void split_title_artist(const char *stem, char *title, size_t tsz,
 
 static void add_track(const char *full_path, const char *name, uint32_t size)
 {
-    if (s_count >= TRACK_MAX) {
+    if (s_count >= s_cap && !tracks_grow()) {
         return;
     }
     track_t *t = &s_tracks[s_count];
@@ -188,7 +238,7 @@ esp_err_t storage_service_init(void)
     if (s_ready) {
         return ESP_OK;
     }
-    s_tracks = (track_t *)calloc(TRACK_MAX, sizeof(track_t));
+    tracks_reserve(64);          /* 初始 64 条，之后按实际文件数翻倍扩容 */
     if (!s_tracks) {
         return ESP_ERR_NO_MEM;
     }
@@ -276,9 +326,10 @@ int storage_service_browse(const char *dir, fs_entry_t *out, int max)
         return -1;
     }
 
-    int n = 0;
+    int n = 0;                          /* 已写入 out 的条数 */
+    int total = 0;                      /* 通过筛选的条数（可能 > max） */
     struct dirent *ent;
-    while ((ent = readdir(d)) != NULL && n < max) {
+    while ((ent = readdir(d)) != NULL) {
         if (ent->d_name[0] == '.') {
             continue;                    /* 隐藏项，含 "." / ".." */
         }
@@ -290,6 +341,10 @@ int storage_service_browse(const char *dir, fs_entry_t *out, int max)
         struct stat st;
         if (stat(full, &st) != 0) {
             continue;
+        }
+        total++;
+        if (n >= max) {
+            continue;                    /* 缓冲装不下：只计数，调用方扩容后会重调 */
         }
         fs_entry_t *e = &out[n];
         memset(e, 0, sizeof(*e));
@@ -304,7 +359,22 @@ int storage_service_browse(const char *dir, fs_entry_t *out, int max)
     if (n > 1) {
         qsort(out, (size_t)n, sizeof(fs_entry_t), cmp_entry);
     }
-    return n;
+    if (total > n) {
+        ESP_LOGW(TAG, "browse '%s': %d entries but buffer holds %d — caller grows and retries",
+                 dir, total, n);
+    }
+    return total;
+}
+
+/* 排序用的临时条目（名字 + 大小），只在 load_dir 里用 */
+typedef struct {
+    char     name[STORAGE_NAME_MAX];
+    uint32_t size;
+} dir_item_t;
+
+static int cmp_dir_item(const void *a, const void *b)
+{
+    return strcasecmp(((const dir_item_t *)a)->name, ((const dir_item_t *)b)->name);
 }
 
 int storage_service_load_dir(const char *dir)
@@ -323,59 +393,76 @@ int storage_service_load_dir(const char *dir)
         return -1;
     }
 
-    /* 先收名字再排序，保证队列顺序和浏览页一致 */
-    char (*names)[STORAGE_NAME_MAX] =
-        (char (*)[STORAGE_NAME_MAX])malloc((size_t)STORAGE_BROWSE_MAX * STORAGE_NAME_MAX);
-    uint32_t *sizes = (uint32_t *)malloc((size_t)STORAGE_BROWSE_MAX * sizeof(uint32_t));
-    int n = 0;
-    if (names && sizes) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL && n < STORAGE_BROWSE_MAX) {
-            if (ent->d_name[0] == '.' || !storage_service_is_audio(ent->d_name)) {
-                continue;
-            }
-            char full[STORAGE_PATH_MAX];
-            int len = snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
-            if (len <= 0 || len >= (int)sizeof(full)) {
-                continue;
-            }
-            struct stat st;
-            if (stat(full, &st) != 0 || S_ISDIR(st.st_mode)) {
-                continue;
-            }
-            utf8_copy(names[n], STORAGE_NAME_MAX, ent->d_name);
-            sizes[n] = (uint32_t)st.st_size;
-            n++;
+    /*
+     * 先收名字再排序，保证队列顺序和浏览页一致。
+     *
+     * 这里原来是两个写死 STORAGE_BROWSE_MAX(=64) 的数组：一个目录超过 64 首时，
+     * 队列只剩 readdir 顺序的前 64 首（**不是**字母序前 64），表现为"歌列表/上下曲
+     * 不全" —— 就是本次修的 bug。改成按实际文件数翻倍扩容，优先放 PSRAM，
+     * 只有极端情况（单目录 > TRACK_MAX 首）才截断并打日志。
+     */
+    dir_item_t *items = NULL;
+    size_t cap = 0;
+    size_t n   = 0;
+    bool   hit_cap = false;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.' || !storage_service_is_audio(ent->d_name)) {
+            continue;
         }
+        char full[STORAGE_PATH_MAX];
+        int len = snprintf(full, sizeof(full), "%s/%s", dir, ent->d_name);
+        if (len <= 0 || len >= (int)sizeof(full)) {
+            continue;
+        }
+        struct stat st;
+        if (stat(full, &st) != 0 || S_ISDIR(st.st_mode)) {
+            continue;
+        }
+        if (n == cap) {
+            if (cap >= TRACK_MAX) {
+                hit_cap = true;
+                break;
+            }
+            size_t ncap = cap ? cap * 2 : 64;
+            if (ncap > TRACK_MAX) {
+                ncap = TRACK_MAX;
+            }
+            dir_item_t *p = (dir_item_t *)heap_caps_realloc(
+                items, ncap * sizeof(dir_item_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!p) {
+                p = (dir_item_t *)realloc(items, ncap * sizeof(dir_item_t));
+            }
+            if (!p) {
+                ESP_LOGE(TAG, "load_dir: grow to %u items failed", (unsigned)ncap);
+                break;
+            }
+            items = p;
+            cap   = ncap;
+        }
+        utf8_copy(items[n].name, STORAGE_NAME_MAX, ent->d_name);
+        items[n].size = (uint32_t)st.st_size;
+        n++;
     }
     closedir(d);
 
-    /* 条目数 ≤64，冒泡排序够用（还省栈） */
-    if (names && sizes) {
-        for (int i = 0; i < n; i++) {
-            for (int j = i + 1; j < n; j++) {
-                if (strcasecmp(names[j], names[i]) < 0) {
-                    char tmp[STORAGE_NAME_MAX];
-                    memcpy(tmp, names[i], STORAGE_NAME_MAX);
-                    memcpy(names[i], names[j], STORAGE_NAME_MAX);
-                    memcpy(names[j], tmp, STORAGE_NAME_MAX);
-                    uint32_t ts = sizes[i];
-                    sizes[i] = sizes[j];
-                    sizes[j] = ts;
-                }
-            }
-        }
-        for (int i = 0; i < n; i++) {
-            char full[STORAGE_PATH_MAX];
-            int len = snprintf(full, sizeof(full), "%s/%s", dir, names[i]);
-            if (len > 0 && len < (int)sizeof(full)) {
-                add_track(full, names[i], sizes[i]);
-            }
+    if (n > 1) {
+        qsort(items, n, sizeof(dir_item_t), cmp_dir_item);
+    }
+    for (size_t i = 0; i < n; i++) {
+        char full[STORAGE_PATH_MAX];
+        int len = snprintf(full, sizeof(full), "%s/%s", dir, items[i].name);
+        if (len > 0 && len < (int)sizeof(full)) {
+            add_track(full, items[i].name, items[i].size);
         }
     }
-    free(names);
-    free(sizes);
+    free(items);
 
+    if (hit_cap) {
+        ESP_LOGW(TAG, "load_dir '%s': hit the %u-track safety cap, rest skipped",
+                 dir, (unsigned)TRACK_MAX);
+    }
     ESP_LOGI(TAG, "queue from dir '%s': %u track(s)", dir, (unsigned)s_count);
     return (int)s_count;
 }

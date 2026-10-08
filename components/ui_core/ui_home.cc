@@ -55,7 +55,7 @@ static lv_obj_t *page_settings(void) { return placeholder_page(ui_app_find("sett
 
 static const app_desc_t k_apps[] = {
     { "music",     "音乐",     LV_SYMBOL_AUDIO,     0xE8973A, page_music,    NULL, NULL, 10, 0 },
-    { "online",    "在线音乐", LV_SYMBOL_WIFI,      0x3E9E86, page_online,   NULL, NULL, 20, 0 },
+    { "online",    "网易云音乐", LV_SYMBOL_WIFI,      0x3E9E86, page_online,   NULL, NULL, 20, 0 },
     { "local",     "本地音乐", LV_SYMBOL_SD_CARD,   0x5B6FB5, page_local,    NULL, NULL, 30, 0 },
     { "calendar",  "日历",     LV_SYMBOL_LIST,      0xC0584B, page_calendar, NULL, NULL, 40, 0 },
     { "bluetooth", "蓝牙",     LV_SYMBOL_BLUETOOTH, 0x4A6FA5, page_bt,       NULL, NULL, 50, 0 },
@@ -86,6 +86,7 @@ static void on_app_clicked(lv_event_t *e)
     }
     /* ui_router_push 会**拷贝**描述符本身，所以这里传栈上临时量是安全的 */
     page_desc_t page = { app->id, app->create, app->on_enter, app->on_exit };
+    page.no_back = (app->flags & APP_FLAG_NO_BACK) != 0;   /* 自带返回钮的页不叠全局键 */
     ui_router_push(&page);
 }
 
@@ -196,11 +197,21 @@ lv_obj_t *ui_home_create(void)
         lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_remove_flag(icon, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t *sym = lv_label_create(icon);
-        lv_obj_set_style_text_font(sym, UI_FONT_CLOCK, LV_PART_MAIN);
-        lv_obj_set_style_text_color(sym, lv_color_hex(0x14141A), LV_PART_MAIN);
-        lv_label_set_text(sym, app->symbol);
-        lv_obj_center(sym);
+        if (app->img) {
+            /* 位图图标（如网易云的 logo）：铺满图标块。
+             * 图像由 gen_icon.py 按 UI_HOME_ICON 尺寸烘好，这里不做缩放 ——
+             * 运行期缩放是每帧都要重算的，图标这种固定尺寸没理由付那个代价。 */
+            lv_obj_t *im = lv_image_create(icon);
+            lv_image_set_src(im, app->img);
+            lv_obj_center(im);
+            lv_obj_remove_flag(im, LV_OBJ_FLAG_CLICKABLE);
+        } else {
+            lv_obj_t *sym = lv_label_create(icon);
+            lv_obj_set_style_text_font(sym, UI_FONT_CLOCK, LV_PART_MAIN);
+            lv_obj_set_style_text_color(sym, lv_color_hex(0x14141A), LV_PART_MAIN);
+            lv_label_set_text(sym, app->symbol);
+            lv_obj_center(sym);
+        }
 
         /* 名称 */
         lv_obj_t *name = lv_label_create(cell);

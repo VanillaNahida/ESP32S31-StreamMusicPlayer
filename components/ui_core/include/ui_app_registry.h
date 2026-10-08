@@ -17,6 +17,7 @@ extern "C" {
 /* APP 标志 */
 #define APP_FLAG_HIDDEN      (1u << 0)   /* 不在桌面网格显示（仅内部可达） */
 #define APP_FLAG_FULLSCREEN  (1u << 1)   /* 进入后隐藏迷你播放条 */
+#define APP_FLAG_NO_BACK     (1u << 2)   /* 页面自带返回钮：路由不叠全局返回键 */
 
 typedef struct app_desc {
     const char      *id;          /* 唯一 id，用于路由 */
@@ -28,6 +29,18 @@ typedef struct app_desc {
     void            (*on_exit)(void);
     uint8_t          order;       /* 排序，越小越靠前 */
     uint8_t          flags;
+    /*
+     * 位图图标（可选）：非 NULL 时桌面就用它代替 symbol 文字。
+     *
+     * 放在**结构体最后**是刻意的 —— 已有的那些位置初始化
+     * （`{ "music", "音乐", LV_SYMBOL_AUDIO, 0xE8973A, ..., 10, 0 }`）少写这一个成员
+     * 会被零初始化成 NULL，于是不用去动每一处描述符，只有真正要用位图的那个
+     * 才在末尾补上 `&netease_logo`。
+     *
+     * 图像由 tools/icons/gen_icon.py 从 assets/icons 下的 PNG 烘成 C 数组
+     * （ARGB8888，已解码；本工程没开 LVGL 的 PNG 解码器），声明见 ui_icons.h。
+     */
+    const lv_image_dsc_t *img;
 } app_desc_t;
 
 /* 注册一个 APP 描述符（在 ui_core_init 之前调用；内部只存指针） */

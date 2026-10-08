@@ -10,6 +10,15 @@
  *   - meting 的 API/歌词/封面都支持 **http**，走明文省掉 TLS 与时间同步依赖；
  *   - 音频是 302 到 https CDN，必须 TLS 校验（证书包已开），
  *     所以下载音频前要确认系统时间已经同步（SNTP 在 WiFi 拿到 IP 后启动）。
+ *
+ * 封面 / 歌词缓存策略（2026-10 改：从 SD 卡搬到 PSRAM）：
+ *   之前封面下到 /sdcard/online/cover/、歌词下到 /sdcard/online/audio/<id>.lrc，
+ *   切歌时要写/读这些文件 —— SD 卡一忙（日志里一排 sdmmc_req 0x107 超时）切歌
+ *   就阻塞，封面还常常下成 0 字节。现在封面字节与歌词文本**只留在 PSRAM**：
+ *     - 下载一次，之后同一首歌命中内存缓存（LRU，封面上限 4 MB / 8 首）；
+ *     - 播放端拿到的是一份 malloc 的拷贝（online_song_cover_data/lyrics_data），
+ *       没有跨线程共享的内存所有权问题；
+ *     - SD 上历史遗留的 cover/ 目录与 *.lrc 文件在 init 时清掉（不再 mkdir）。
  */
 #include "online_service.h"
 
@@ -38,6 +47,7 @@ static const char *TAG = "online";
 
 #define ONLINE_ROOT        "/sdcard/online"
 #define ONLINE_AUDIO_DIR   ONLINE_ROOT "/audio"
+/* 历史遗留（不再写入，只在 init 时清理）： */
 #define ONLINE_COVER_DIR   ONLINE_ROOT "/cover"
 #define ONLINE_LRC_DIR     ONLINE_ROOT "/lrc"
 #define ONLINE_PL_FMT      ONLINE_ROOT "/pl_%s.bin"
@@ -45,6 +55,11 @@ static const char *TAG = "online";
 #define NVS_NS             "online"
 #define NVS_KEY_CNT        "n"
 #define NVS_KEY_ID_FMT     "id%d"      /* id0..id7 */
+/* 歌单显示名（用户可重命名；空 = 还没起过名，UI 就显示 ID 或抓到的歌单名） */
+#define NVS_KEY_NAME_FMT   "nm%d"      /* nm0..nm7 */
+/* 搜索历史（最多 ONLINE_HISTORY_MAX 条，新的在最前，按关键词去重） */
+#define NVS_KEY_SH_CNT     "shn"
+#define NVS_KEY_SH_FMT     "sh%d"      /* sh0..sh9 */
 
 #define API_BASE           "http://meting.xcnahida.cn/api"
 /* 搜索接口在另一个路径上，而且关键词放在 id= 里：
@@ -55,10 +70,41 @@ static const char *TAG = "online";
 #define HTTP_BUF           2048
 /* 单个 JSON 响应上限（歌单 1000 首 ≈ 300 KB），别让一个坏响应吃光内存 */
 #define JSON_MAX_LEN       (1024u * 1024u)
+/* 封面字节上限。解码端 media_meta 的 MEDIA_META_COVER_FILE_MAX 必须 ≥ 这个值，
+ * 否则会出现"下下来了却解不了"。两个都放在 4 MB：
+ * 封面正常只有 100~300 KB，但**平台的原图可能大得离谱**（实测某首网易云封面
+ * 原图 7.6 MB），所以下面还挂了 ?param= 让服务端先缩图，这个上限只当兜底。 */
+#define COVER_MAX_BYTES    (4u * 1024u * 1024u)
+
+/*
+ * 封面请求的"服务端缩图"参数：网易云 CDN 认 ?param=WxH（也接受 y 分隔）。
+ *
+ * ★ 为什么必须加（2026-10 修"部分歌曲封面不显示"）：
+ *   实测 https://p2.music.126.net/.../109951169045313754.jpg
+ *     - 后缀是 .jpg、Content-Type 也写 image/jpg，**下来的却是 PNG**
+ *       （文件头 89 50 4E 47 0D 0A 1A 0A）；
+ *     - 而且原图 **7,951,295 字节（7.6 MB）** —— 远超下载上限，封面永远出不来。
+ *   加上 ?param=300y300 之后只有 ~100 KB（同样是 PNG），秒下。
+ * 界面上的封面框是 240 px、解码目标 COVER_MAX_DIM 也是 240，300 已经够用。
+ *
+ * ⚠ 两个尺寸**都必须给**，少一个参数会被 CDN 静默忽略、原样返回 7.6 MB 原图
+ *   （实测 2026-10 同一条链接）：
+ *     ?param=200x200  → 100,539 B  ✓（x / y 分隔符都认）
+ *     ?param=200y200  → 100,539 B  ✓
+ *     ?param=200      → 7,951,295 B ✗ ← 只有一维 = 没生效，别"简化"成这个写法
+ */
+#define ONLINE_COVER_PARAM  300
+
 /* 音频上限（防止下到无穷无尽的流）：250 MB */
 #define AUDIO_MAX_BYTES    (250u * 1024u * 1024u)
 /* 音频缓存最多留多少个文件，超了删最旧的 */
 #define AUDIO_CACHE_MAX    48
+
+/* ---- PSRAM 封面/歌词缓存（不落 SD，见文件头说明） ---- */
+#define COVER_CACHE_MAX       8
+#define COVER_CACHE_BYTES_MAX (4u * 1024u * 1024u)
+#define LRC_CACHE_MAX         8
+#define LRC_CACHE_BYTES_MAX   (256u * 1024u)
 
 #define ONLINE_PL_MAGIC    0x4F504C31u   /* 'OPL1' */
 #define ONLINE_PL_VERSION  1u
@@ -83,9 +129,100 @@ typedef struct {
 
 static bool  s_ready;
 static char  s_ids[ONLINE_MAX_PLAYLISTS][ONLINE_ID_MAX];
+/* 显示名（可与 ID 一一对应；空串表示"没起过名"，UI 自己决定显示 ID 还是标题） */
+static char  s_names[ONLINE_MAX_PLAYLISTS][ONLINE_NAME_MAX];
 static size_t s_id_count;
 /* 最近一次失败的可读原因（给 UI 的 Toast 用） */
 static char  s_last_err[64];
+
+/* ---------------------------------------------------------------- PSRAM 缓存
+ *
+ * 封面/歌词下载一次后整段留在 PSRAM，切歌不再碰 SD（见文件头）。
+ * 缓存条目归本模块所有；对外 API 返回的是**调用方新 malloc 的拷贝**，
+ * 所以这里怎么淘汰都不会踩到播放端正在用的内存。
+ */
+typedef struct {
+    uint32_t id;
+    uint8_t *data;
+    size_t   len;
+    uint32_t last_ms;      /* 最近使用（esp_timer 墙钟，淘汰用） */
+} mem_cache_t;
+
+static mem_cache_t s_cover_cache[COVER_CACHE_MAX];
+static size_t      s_cover_cache_bytes;
+static mem_cache_t s_lrc_cache[LRC_CACHE_MAX];
+static size_t      s_lrc_cache_bytes;
+
+static void mem_cache_free_slot(mem_cache_t *e)
+{
+    if (e->data) {
+        free(e->data);
+    }
+    e->id      = 0;
+    e->data    = NULL;
+    e->len     = 0;
+    e->last_ms = 0;
+}
+
+static mem_cache_t *mem_cache_find(mem_cache_t *tab, size_t n, uint32_t id)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (tab[i].id == id && tab[i].data) {
+            tab[i].last_ms = (uint32_t)esp_timer_get_time() / 1000u;
+            return &tab[i];
+        }
+    }
+    return NULL;
+}
+
+/* 找一个空槽；没有就淘汰最旧的一个（LRU） */
+static mem_cache_t *mem_cache_slot(mem_cache_t *tab, size_t n, size_t *bytes)
+{
+    size_t oldest = n;
+    uint32_t oldest_ms = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        if (!tab[i].data) {
+            return &tab[i];
+        }
+        if (tab[i].last_ms < oldest_ms) {
+            oldest_ms = tab[i].last_ms;
+            oldest    = i;
+        }
+    }
+    if (oldest < n) {
+        *bytes -= tab[oldest].len;
+        mem_cache_free_slot(&tab[oldest]);
+        return &tab[oldest];
+    }
+    return NULL;
+}
+
+/* 放进缓存（data 为调用方所有的新缓冲，插入后归缓存管） */
+static void mem_cache_put(mem_cache_t *tab, size_t n, size_t *bytes, size_t cap_bytes,
+                          uint32_t id, uint8_t *data, size_t len)
+{
+    if (!data || len == 0) {
+        free(data);
+        return;
+    }
+    mem_cache_t *e = mem_cache_slot(tab, n, bytes);
+    if (!e) {
+        free(data);
+        return;
+    }
+    e->id      = id;
+    e->data    = data;
+    e->len     = len;
+    e->last_ms = (uint32_t)esp_timer_get_time() / 1000u;
+    *bytes += len;
+    /* 总量超限：从最旧开始扔，直到装得下 */
+    while (*bytes > cap_bytes) {
+        mem_cache_t *old = mem_cache_slot(tab, n, bytes);
+        if (!old || old == e) {
+            break;
+        }
+    }
+}
 
 /* ---------------------------------------------------------------- 小工具 */
 
@@ -151,11 +288,65 @@ static esp_err_t mkdir_if_needed(const char *path)
 typedef struct {
     char  *buf;
     size_t len;
-    size_t cap;
+    size_t cap;              /* 当前**已分配**的容量（按需增长，不是上限） */
+    size_t limit;            /* 单次响应的硬上限（超过就让上层报错） */
+    bool   overflow;         /* 因为超限/没内存中止过：给上层一句能看懂的话 */
     char   location[512];    /* 301/302 的 Location：响应头只能从事件里拿
                               * （esp_http_client_get_header() 取的是**请求**头，
                               *   实测在 perform() 之后取 Location 一直是空的） */
 } http_sink_t;
+
+/* 下载缓冲的起步容量：LRC 只有几十字节，不该为了它占几 MB */
+#define HTTP_SINK_MIN   (16 * 1024)
+
+/*
+ * 把接收缓冲扩到至少 need 字节（按需增长）。返回 false = 超上限或没内存。
+ *
+ * ★ 两条纪律（2026-10 修"封面 ESP_ERR_NO_MEM"）：
+ *   1) **显式从 PSRAM 分配**（heap_caps_malloc + MALLOC_CAP_SPIRAM）：
+ *      封面/歌单这类缓冲动辄几百 KB 到几 MB，内部 RAM 根本放不下；
+ *   2) **不要一上来就 malloc(上限)**。原来的写法是 `malloc(max_len)`，
+ *      封面那条路 max_len = 4 MB —— 实测直接 ESP_ERR_NO_MEM（日志里
+ *      "cover ... download failed (ESP_ERR_NO_MEM, 0 bytes)"），因为 PSRAM 里
+ *      已经躺着 4 MB 流式环形缓冲 + framebuffer + 封面缓存，再要一块 **4 MB 连续**
+ *      空间太难，而且 200 KB 的封面白白占 4 MB。
+ *      现在从 16 KB 起步、翻倍增长：300y300 的封面（~200 KB）只占 256 KB。
+ */
+static bool sink_reserve(http_sink_t *s, size_t need)
+{
+    if (need <= s->cap) {
+        return true;
+    }
+    if (need > s->limit) {
+        s->overflow = true;
+        return false;
+    }
+    size_t cap = s->cap ? s->cap : HTTP_SINK_MIN;
+    while (cap < need) {
+        cap *= 2;
+        if (cap > s->limit) {
+            cap = s->limit;
+            break;
+        }
+    }
+    char *nb = (char *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!nb) {
+        /* PSRAM 没起来时兜底走内部 RAM（块大时通常也拿不到，尽力而为） */
+        nb = (char *)malloc(cap);
+    }
+    if (!nb) {
+        s->overflow = true;
+        return false;
+    }
+    if (s->buf) {
+        memcpy(nb, s->buf, s->len);
+        free(s->buf);
+    }
+    s->buf = nb;
+    s->cap = cap;
+    s->buf[s->len] = '\0';
+    return true;
+}
 
 static esp_err_t http_evt(esp_http_client_event_t *e)
 {
@@ -171,9 +362,9 @@ static esp_err_t http_evt(esp_http_client_event_t *e)
         }
         return ESP_OK;
     }
-    if (e->event_id == HTTP_EVENT_ON_DATA && s->buf) {
-        if (s->len + (size_t)e->data_len >= s->cap) {
-            return ESP_FAIL;              /* 超上限：让上层收尾报错 */
+    if (e->event_id == HTTP_EVENT_ON_DATA && e->data_len > 0) {
+        if (!sink_reserve(s, s->len + (size_t)e->data_len + 1)) {
+            return ESP_FAIL;              /* 超上限/没内存：让上层收尾报错 */
         }
         memcpy(s->buf + s->len, e->data, (size_t)e->data_len);
         s->len += (size_t)e->data_len;
@@ -183,7 +374,9 @@ static esp_err_t http_evt(esp_http_client_event_t *e)
 }
 
 /*
- * GET 一段文本（JSON / LRC）。成功时 *out 为 malloc 的字符串（NUL 结尾）。
+ * GET 一段数据（JSON / LRC / 封面字节都走这里）。成功时 *out 为 malloc 的缓冲
+ * （对文本是 NUL 结尾的字符串；对二进制则按 out_len 给长度，不保证 NUL 语义）。
+ * max_len 是这一跳的单次响应上限（防止坏响应吃光内存）。
  *
  * ★ 重定向自己处理，不用 esp_http_client 的自动跳转：
  *   这个实例把 http://meting.xcnahida.cn/api?... 302 到 https 同一路径，
@@ -192,9 +385,9 @@ static esp_err_t http_evt(esp_http_client_event_t *e)
  *   我们改成 disable_auto_redirect + 自己读 Location 再发一次，
  *   顺便把每一跳打进日志，方便定位。
  */
-static esp_err_t http_get_text(const char *url, char **out, size_t *out_len)
+static esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max_len)
 {
-    if (!url || !out) {
+    if (!url || !out || max_len == 0) {
         return ESP_ERR_INVALID_ARG;
     }
     *out = NULL;
@@ -208,12 +401,8 @@ static esp_err_t http_get_text(const char *url, char **out, size_t *out_len)
 
     for (int hop = 0; hop < 4; hop++) {
         http_sink_t sink = {};
-        sink.cap = JSON_MAX_LEN;
-        sink.buf = (char *)malloc(sink.cap);
-        if (!sink.buf) {
-            return ESP_ERR_NO_MEM;
-        }
-        sink.buf[0] = '\0';
+        sink.limit = max_len;          /* 上限只当门限：缓冲按需增长（见 sink_reserve） */
+        /* sink.buf 先不分配 —— 第一段数据到了再按需从 PSRAM 建 */
 
         esp_http_client_config_t cfg = {};
         cfg.url                   = cur;
@@ -269,8 +458,16 @@ static esp_err_t http_get_text(const char *url, char **out, size_t *out_len)
         }
 
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "GET failed (%s): %s", esp_err_to_name(ret), cur);
-            snprintf(s_last_err, sizeof(s_last_err), "网络错误 %s", esp_err_to_name(ret));
+            /* 超上限/没内存时 sink_reserve 会置 overflow，给一句能看懂的话 */
+            if (sink.overflow) {
+                ESP_LOGW(TAG, "GET too large (limit %u KB, got %u bytes): %s",
+                         (unsigned)(max_len / 1024), (unsigned)sink.len, cur);
+                snprintf(s_last_err, sizeof(s_last_err), "响应过大或内存不足(%u KB)",
+                         (unsigned)(sink.len / 1024));
+            } else {
+                ESP_LOGW(TAG, "GET failed (%s): %s", esp_err_to_name(ret), cur);
+                snprintf(s_last_err, sizeof(s_last_err), "网络错误 %s", esp_err_to_name(ret));
+            }
             free(sink.buf);
             return ret;
         }
@@ -453,6 +650,12 @@ static void nvs_load_ids(void)
             snprintf(key, sizeof(key), NVS_KEY_ID_FMT, i);
             size_t len = sizeof(s_ids[i]);
             if (nvs_get_str(h, key, s_ids[i], &len) == ESP_OK && s_ids[i][0]) {
+                /* 名字是可选的：没有就是空串（UI 退回显示 ID） */
+                size_t nlen = sizeof(s_names[s_id_count]);
+                snprintf(key, sizeof(key), NVS_KEY_NAME_FMT, i);
+                if (nvs_get_str(h, key, s_names[s_id_count], &nlen) != ESP_OK) {
+                    s_names[s_id_count][0] = '\0';
+                }
                 s_id_count++;
             }
         }
@@ -472,6 +675,13 @@ static void nvs_save_ids(void)
         snprintf(key, sizeof(key), NVS_KEY_ID_FMT, (int)i);
         if (i < s_id_count) {
             nvs_set_str(h, key, s_ids[i]);
+        } else {
+            nvs_erase_key(h, key);
+        }
+        /* 名字（空串就直接删键，别留垃圾） */
+        snprintf(key, sizeof(key), NVS_KEY_NAME_FMT, (int)i);
+        if (i < s_id_count && s_names[i][0]) {
+            nvs_set_str(h, key, s_names[i]);
         } else {
             nvs_erase_key(h, key);
         }
@@ -664,7 +874,7 @@ esp_err_t online_playlist_add(const char *id)
     snprintf(url, sizeof(url), API_BASE "?server=netease&type=playlist&id=%s", id);
 
     char *json = NULL;
-    esp_err_t ret = http_get_text(url, &json, NULL);
+    esp_err_t ret = http_get_text(url, &json, NULL, JSON_MAX_LEN);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -705,8 +915,10 @@ esp_err_t online_playlist_remove(const char *id)
     if (idx >= 0) {
         for (size_t i = (size_t)idx + 1; i < s_id_count; i++) {
             str_copy(s_ids[i - 1], sizeof(s_ids[0]), s_ids[i]);
+            str_copy(s_names[i - 1], sizeof(s_names[0]), s_names[i]);   /* 名字跟着挪 */
         }
         s_id_count--;
+        s_names[s_id_count][0] = '\0';
         nvs_save_ids();
     }
     char path[128];
@@ -824,7 +1036,7 @@ esp_err_t online_search(const char *keyword, online_song_t **out, size_t *count,
         char url[320];
         snprintf(url, sizeof(url), API_SEARCH_BASE "?server=netease&type=search&id=%s", enc);
         char *json = NULL;
-        if (http_get_text(url, &json, NULL) == ESP_OK) {
+        if (http_get_text(url, &json, NULL, JSON_MAX_LEN) == ESP_OK) {
             online_song_t *arr = NULL;
             size_t n = 0;
             const esp_err_t ret = parse_songs(json, &arr, &n);
@@ -983,72 +1195,206 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
 
     audio_cache_trim();
 
-    /* 封面与歌词：失败不影响播放 */
-    char aux[192];
-    if (online_song_cover(song, aux, sizeof(aux)) != ESP_OK) {
+    /* 封面与歌词：进 PSRAM 缓存（失败不影响播放） */
+    uint8_t *j = NULL;
+    size_t   jl = 0;
+    if (online_song_cover_data(song, &j, &jl) != ESP_OK) {
         ESP_LOGD(TAG, "no cover for %u", (unsigned)song->id);
     }
-    if (online_song_lyrics(song, aux, sizeof(aux)) != ESP_OK) {
+    free(j);
+    char *l = NULL;
+    if (online_song_lyrics_data(song, &l, NULL) != ESP_OK) {
         ESP_LOGD(TAG, "no lyrics for %u", (unsigned)song->id);
     }
+    free(l);
     return ESP_OK;
 }
 
-esp_err_t online_song_cover(const online_song_t *song, char *jpg_path, size_t cap)
+/*
+ * 封面字节（PSRAM 缓存，不落 SD）。
+ * 命中缓存直接拷贝给调用方；没命中就下（封面 URL 是 http://p*.music.126.net，
+ * 直接 http_get_text 即可），进缓存 + 拷贝。
+ * *out 是调用方所有的新缓冲，用 free() 释放。
+ */
+/*
+ * 封面格式：**只认文件头魔数**，绝不看 URL 后缀或 Content-Type。
+ *
+ * ★ 平台这两个都会撒谎（2026-10 实测网易云）：
+ *     URL 后缀 .jpg、Content-Type: image/jpg，实际字节是 PNG。
+ *   解码端 media_meta 的 image_to_rgb565() 同样是按魔数分派的（PNG 走 libpng、
+ *   其余按 JPEG 走 esp_new_jpeg），所以这里判定一致，不会出现"按后缀选了错的解码器"。
+ *
+ * 返回可打印的格式名；不认识的（WebP / GIF / HTML 错误页…）返回 NULL 并给出名字。
+ */
+static const char *cover_format(const uint8_t *d, size_t n, const char **why)
 {
-    if (!song || !jpg_path || song->id == 0) {
+    if (n >= 3 && d[0] == 0xFF && d[1] == 0xD8 && d[2] == 0xFF) {
+        return "JPEG";
+    }
+    if (n >= 8 && d[0] == 0x89 && d[1] == 'P' && d[2] == 'N' && d[3] == 'G' &&
+        d[4] == 0x0D && d[5] == 0x0A && d[6] == 0x1A && d[7] == 0x0A) {
+        return "PNG";
+    }
+    if (n >= 12 && memcmp(d, "RIFF", 4) == 0 && memcmp(d + 8, "WEBP", 4) == 0) {
+        *why = "WebP（本工程没有 WebP 解码器）";
+    } else if (n >= 4 && d[0] == 'G' && d[1] == 'I' && d[2] == 'F') {
+        *why = "GIF";
+    } else if (n >= 5 && memcmp(d, "<?xml", 5) == 0) {
+        *why = "XML（多半是错误响应）";
+    } else if (n >= 5 && (memcmp(d, "<!DOC", 5) == 0 || memcmp(d, "<html", 5) == 0)) {
+        *why = "HTML（多半是错误页）";
+    } else {
+        *why = "未知格式";
+    }
+    return NULL;
+}
+
+esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_t *out_len)
+{
+    if (!song || !out || song->id == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    snprintf(jpg_path, cap, ONLINE_COVER_DIR "/%u.jpg", (unsigned)song->id);
-    if (file_ok(jpg_path, 1024)) {
+    *out = NULL;
+    if (out_len) {
+        *out_len = 0;
+    }
+
+    mem_cache_t *hit = mem_cache_find(s_cover_cache, COVER_CACHE_MAX, song->id);
+    if (hit) {
+        uint8_t *copy = (uint8_t *)psram_alloc(hit->len);
+        if (!copy) {
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(copy, hit->data, hit->len);
+        *out = copy;
+        if (out_len) {
+            *out_len = hit->len;
+        }
         return ESP_OK;
     }
+
     if (!song->cover_url[0] || !online_has_network()) {
         return ESP_ERR_NOT_FOUND;
     }
-    /* 封面 URL 在歌单 JSON 里是 http://p*.music.126.net/...  直接下 */
-    uint8_t sniff[16];
-    esp_err_t ret = http_download(song->cover_url, jpg_path, 1024, sniff);
-    if (ret != ESP_OK) {
-        unlink(jpg_path);
-        return ret;
+
+    /*
+     * 拼上服务端缩图参数。**只在原 URL 没有查询串时加** ——
+     * 万一是带签名的 URL，多一个参数会让签名失效（网易云封面链接没有查询串，
+     * 这条路是安全的；检测到已有 '?' 就原样用）。
+     */
+    char url[ONLINE_URL_MAX + 32];
+    snprintf(url, sizeof(url), "%s", song->cover_url);
+    if (!strchr(url, '?')) {
+        const size_t n = strlen(url);
+        if (n + 24 < sizeof(url)) {
+            snprintf(url + n, sizeof(url) - n, "?param=%dy%d",
+                     ONLINE_COVER_PARAM, ONLINE_COVER_PARAM);
+        }
     }
+
+    char *raw = NULL;
+    size_t len = 0;
+    esp_err_t ret = http_get_text(url, &raw, &len, COVER_MAX_BYTES);
+    if (ret != ESP_OK || len < 64) {
+        /* 超上限时给一句能看懂的话（下载器只会回一个笼统的错误码） */
+        if (len >= COVER_MAX_BYTES) {
+            snprintf(s_last_err, sizeof(s_last_err), "封面太大(>%u MB)",
+                     (unsigned)(COVER_MAX_BYTES / (1024u * 1024u)));
+            ESP_LOGW(TAG, "cover %u too large (>%u bytes): %s",
+                     (unsigned)song->id, (unsigned)COVER_MAX_BYTES, url);
+        } else {
+            ESP_LOGW(TAG, "cover %u download failed (%s, %u bytes): %s",
+                     (unsigned)song->id, esp_err_to_name(ret), (unsigned)len, url);
+        }
+        free(raw);
+        return (ret == ESP_OK) ? ESP_ERR_NOT_FOUND : ret;
+    }
+
+    /* ★ 按魔数认格式（不信后缀、不信 Content-Type），顺便把结果打进日志，
+     * 以后"封面下到了却没显示"一眼就能看出是不是格式/解码的问题。 */
+    const char *why = NULL;
+    const char *fmt = cover_format((const uint8_t *)raw, len, &why);
+    if (!fmt) {
+        ESP_LOGW(TAG, "cover %u: unsupported %s (magic %02x %02x %02x %02x, %u bytes, url=%s)",
+                 (unsigned)song->id, why ? why : "format",
+                 (unsigned char)raw[0], (unsigned char)raw[1],
+                 (unsigned char)raw[2], (unsigned char)raw[3], (unsigned)len, url);
+        /* 中文全角括号一个 3 字节，GCC 证不出 64 字节缓冲放得下（-Werror=format-truncation），
+         * 按契约显式限长：前缀 7 字 ≈ 21 字节 + 20 + NUL，稳在 64 内 */
+        snprintf(s_last_err, sizeof(s_last_err), "封面格式不支持：%.20s",
+                 why ? why : "未知");
+        free(raw);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    ESP_LOGI(TAG, "cover %u: %s, %u bytes", (unsigned)song->id, fmt, (unsigned)len);
+
+    mem_cache_put(s_cover_cache, COVER_CACHE_MAX, &s_cover_cache_bytes,
+                  COVER_CACHE_BYTES_MAX, song->id, (uint8_t *)raw, len);
+    uint8_t *copy = (uint8_t *)psram_alloc(len);
+    if (!copy) {
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(copy, raw, len);
+    *out = copy;
+    if (out_len) {
+        *out_len = len;
+    }
+    ESP_LOGI(TAG, "cover cached in PSRAM: %u (%u bytes)", (unsigned)song->id, (unsigned)len);
     return ESP_OK;
 }
 
-esp_err_t online_song_lyrics(const online_song_t *song, char *lrc_path, size_t cap)
+/*
+ * 歌词文本（PSRAM 缓存，不落 SD）。命中缓存直接拷贝；没命中就下（纯文本 LRC，
+ * UTF-8 原样），进缓存 + 拷贝。*out 用 free() 释放。
+ */
+esp_err_t online_song_lyrics_data(const online_song_t *song, char **out, size_t *out_len)
 {
-    if (!song || !lrc_path || song->id == 0) {
+    if (!song || !out || song->id == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    /*
-     * 歌词与音频**同目录同主名**（<id>.lrc 紧挨着 <id>.mp3）：
-     * 这样 app_music 播放时不需要任何在线专用分支 ——
-     * media_meta_lyrics_load(audio_path) 的第一档"同目录同名 .lrc"直接命中。
-     */
-    snprintf(lrc_path, cap, ONLINE_AUDIO_DIR "/%u.lrc", (unsigned)song->id);
-    if (file_ok(lrc_path, 8)) {
+    *out = NULL;
+    if (out_len) {
+        *out_len = 0;
+    }
+
+    mem_cache_t *hit = mem_cache_find(s_lrc_cache, LRC_CACHE_MAX, song->id);
+    if (hit) {
+        char *copy = (char *)psram_alloc(hit->len + 1);
+        if (!copy) {
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(copy, hit->data, hit->len);
+        copy[hit->len] = '\0';
+        *out = copy;
+        if (out_len) {
+            *out_len = hit->len;
+        }
         return ESP_OK;
     }
+
     if (!song->lrc_url[0] || !online_has_network()) {
         return ESP_ERR_NOT_FOUND;
     }
     char *text = NULL;
     size_t len = 0;
-    esp_err_t ret = http_get_text(song->lrc_url, &text, &len);
+    esp_err_t ret = http_get_text(song->lrc_url, &text, &len, LRC_CACHE_BYTES_MAX);
     if (ret != ESP_OK || len < 8) {
         free(text);
         return (ret == ESP_OK) ? ESP_ERR_NOT_FOUND : ret;
     }
-    FILE *f = fopen(lrc_path, "wb");
-    if (!f) {
-        free(text);
-        return ESP_FAIL;
+    mem_cache_put(s_lrc_cache, LRC_CACHE_MAX, &s_lrc_cache_bytes,
+                  LRC_CACHE_BYTES_MAX, song->id, (uint8_t *)text, len);
+    char *copy = (char *)psram_alloc(len + 1);
+    if (!copy) {
+        return ESP_ERR_NO_MEM;
     }
-    fwrite(text, 1, len, f);
-    fclose(f);
-    free(text);
-    ESP_LOGI(TAG, "lyrics cached: %s (%u bytes)", lrc_path, (unsigned)len);
+    memcpy(copy, text, len);
+    copy[len] = '\0';
+    *out = copy;
+    if (out_len) {
+        *out_len = len;
+    }
+    ESP_LOGI(TAG, "lyrics cached in PSRAM: %u (%u bytes)", (unsigned)song->id, (unsigned)len);
     return ESP_OK;
 }
 
@@ -1058,6 +1404,128 @@ esp_err_t online_song_lyrics(const online_song_t *song, char *lrc_path, size_t c
  * 内部用 esp_http_client 的自动跳转（实测会丢查询串 → 服务器回 400）；
  * 先把最终 URL 算出来，播放时就只剩一次直连 GET。
  */
+/* MP3 帧头 → 码率(bps)，解析失败返回 0。表格照 ISO/IEC 11172-3 Layer III。 */
+static int mp3_bitrate_bps(const uint8_t *p, size_t n)
+{
+    static const int v1l3[16] = {0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0};
+    static const int v2l3[16] = {0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0};
+    for (size_t i = 0; i + 4 <= n; i++) {
+        if (p[i] != 0xFF || (p[i + 1] & 0xE0) != 0xE0) {
+            continue;
+        }
+        const int ver = (p[i + 1] >> 3) & 0x03;    /* 3=MPEG1, 2=MPEG2, 0=MPEG2.5 */
+        const int layer = (p[i + 1] >> 1) & 0x03;  /* 1 = Layer III */
+        const int br_idx = (p[i + 2] >> 4) & 0x0F;
+        if (layer != 1 || br_idx == 0 || br_idx == 15) {
+            continue;
+        }
+        const int kbps = (ver == 3) ? v1l3[br_idx] : v2l3[br_idx];
+        if (kbps > 0) {
+            return kbps * 1000;
+        }
+    }
+    return 0;
+}
+
+/*
+ * 流地址 + 时长估算：解析 302 拿到最终地址，并顺手读一段前缀拿 MP3 码率，
+ * 配合响应里的 Content-Length 估出总时长（在线流式播放拿不到 duration_ms，
+ * GMF 的 music info 一直是 "0 bps, 0 ms"，所以列表/播放器页以前只显示 --:--）。
+ * 只多读 4 KB，代价可以忽略。
+ */
+esp_err_t online_song_stream_info(const online_song_t *song, char *out, size_t cap,
+                                  int64_t *out_bytes, uint32_t *out_dur_ms)
+{
+    if (out_bytes) {
+        *out_bytes = 0;
+    }
+    if (out_dur_ms) {
+        *out_dur_ms = 0;
+    }
+    if (!song || !out || cap == 0 || !song->audio_url[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+    if (!online_has_network()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char cur[512];
+    snprintf(cur, sizeof(cur), "%s", song->audio_url);
+    s_last_err[0] = '\0';
+
+    for (int hop = 0; hop < 4; hop++) {
+        http_sink_t probe = {};
+        esp_http_client_config_t cfg = {};
+        cfg.url                   = cur;
+        cfg.timeout_ms            = HTTP_TIMEOUT_MS;
+        cfg.crt_bundle_attach     = esp_crt_bundle_attach;
+        cfg.disable_auto_redirect = true;
+        cfg.keep_alive_enable     = false;
+        cfg.event_handler         = http_evt;
+        cfg.user_data             = &probe;
+
+        esp_http_client_handle_t cli = esp_http_client_init(&cfg);
+        if (!cli) {
+            return ESP_FAIL;
+        }
+        esp_err_t ret = esp_http_client_open(cli, 0);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "stream probe open failed: %s (%s)", esp_err_to_name(ret), cur);
+            snprintf(s_last_err, sizeof(s_last_err), "网络错误 %s", esp_err_to_name(ret));
+            esp_http_client_cleanup(cli);
+            return ret;
+        }
+        const int64_t total = esp_http_client_fetch_headers(cli);
+        const int status = esp_http_client_get_status_code(cli);
+
+        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+            char loc[512] = {0};
+            snprintf(loc, sizeof(loc), "%s", probe.location);
+            esp_http_client_cleanup(cli);
+            if (!loc[0]) {
+                snprintf(s_last_err, sizeof(s_last_err), "重定向缺少 Location");
+                return ESP_ERR_INVALID_RESPONSE;
+            }
+            snprintf(cur, sizeof(cur), "%s", loc);
+            continue;
+        }
+        if (status != 200) {
+            esp_http_client_cleanup(cli);
+            snprintf(s_last_err, sizeof(s_last_err), "服务器返回 HTTP %d（版权受限？）", status);
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        /* 读 4 KB 前缀：只为了拿 MP3 码率，读完就断开 */
+        uint8_t *head = (uint8_t *)malloc(4096);
+        int got = 0;
+        if (head) {
+            got = esp_http_client_read(cli, (char *)head, 4096);
+            if (got < 0) {
+                got = 0;
+            }
+            if (out_dur_ms && total > 0 && got > 0) {
+                const int br = mp3_bitrate_bps(head, (size_t)got);
+                if (br > 0) {
+                    *out_dur_ms = (uint32_t)((uint64_t)total * 8ULL * 1000ULL / (uint64_t)br);
+                    ESP_LOGI(TAG, "stream duration est: %lld B @ %d bps -> %u ms",
+                             (long long)total, br, (unsigned)*out_dur_ms);
+                }
+            }
+            free(head);
+        }
+        esp_http_client_cleanup(cli);
+
+        if (out_bytes) {
+            *out_bytes = total;
+        }
+        snprintf(out, cap, "%s", cur);
+        return ESP_OK;
+    }
+    snprintf(s_last_err, sizeof(s_last_err), "重定向次数过多");
+    return ESP_ERR_INVALID_RESPONSE;
+}
+
 esp_err_t online_song_stream_url(const online_song_t *song, char *out, size_t cap)
 {
     if (!song || !out || cap == 0 || !song->audio_url[0]) {
@@ -1120,30 +1588,43 @@ esp_err_t online_song_stream_url(const online_song_t *song, char *out, size_t ca
 }
 
 /*
- * 流式播放前的轻量准备：**只**抓封面与歌词（几十~几百 KB），不碰音频 ——
- * 音频由播放器边下边播。
+ * 流式播放前的轻量准备：**只**抓封面与歌词（几十~几百 KB，进 PSRAM 缓存），
+ * 不碰音频 —— 音频由播放器边下边播。拷贝随手释放：播放端会再各取一份。
  */
 esp_err_t online_song_prepare_stream(const online_song_t *song)
 {
     if (!song || song->id == 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    char aux[192];
-    const esp_err_t c = online_song_cover(song, aux, sizeof(aux));
-    const esp_err_t l = online_song_lyrics(song, aux, sizeof(aux));
+    uint8_t *j = NULL;
+    char *l = NULL;
+    const esp_err_t c = online_song_cover_data(song, &j, NULL);
+    const esp_err_t lr = online_song_lyrics_data(song, &l, NULL);
+    free(j);
+    free(l);
     ESP_LOGI(TAG, "stream meta for '%s': cover=%s lyrics=%s",
-             song->title, esp_err_to_name(c), esp_err_to_name(l));
+             song->title, esp_err_to_name(c), esp_err_to_name(lr));
     return ESP_OK;
+}
+
+/* 清掉 PSRAM 里的封面/歌词缓存 */
+static void psram_cache_clear(void)
+{
+    for (size_t i = 0; i < COVER_CACHE_MAX; i++) {
+        mem_cache_free_slot(&s_cover_cache[i]);
+    }
+    s_cover_cache_bytes = 0;
+    for (size_t i = 0; i < LRC_CACHE_MAX; i++) {
+        mem_cache_free_slot(&s_lrc_cache[i]);
+    }
+    s_lrc_cache_bytes = 0;
 }
 
 esp_err_t online_cache_clear(void)
 {
-    const char *dirs[] = { ONLINE_AUDIO_DIR, ONLINE_COVER_DIR };
-    for (size_t k = 0; k < sizeof(dirs) / sizeof(dirs[0]); k++) {
-        DIR *d = opendir(dirs[k]);
-        if (!d) {
-            continue;
-        }
+    /* SD 上的音频缓存（封面/歌词早已不进 SD） */
+    DIR *d = opendir(ONLINE_AUDIO_DIR);
+    if (d) {
         struct dirent *ent;
         while ((ent = readdir(d)) != NULL) {
             if (ent->d_name[0] == '.') {
@@ -1151,11 +1632,13 @@ esp_err_t online_cache_clear(void)
             }
             /* 目录名 + '/' + FATFS 最长 255 字节文件名：给够空间，别让编译器担心截断 */
             char path[320];
-            snprintf(path, sizeof(path), "%s/%s", dirs[k], ent->d_name);
+            snprintf(path, sizeof(path), "%s/%s", ONLINE_AUDIO_DIR, ent->d_name);
             unlink(path);
         }
         closedir(d);
     }
+    /* PSRAM 里的封面/歌词缓存 */
+    psram_cache_clear();
     return ESP_OK;
 }
 
@@ -1164,7 +1647,32 @@ bool online_has_network(void)
     return wifi_service_has_ip();
 }
 
+/*
+ * 删掉一个目录里的全部内容，并尝试 rmdir（用于清理历史遗留的 cover/、lrc/ 目录）。
+ */
+static void wipe_dir(const char *dir)
+{
+    DIR *d = opendir(dir);
+    if (!d) {
+        return;
+    }
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') {
+            continue;
+        }
+        char path[320];
+        snprintf(path, sizeof(path), "%s/%s", dir, ent->d_name);
+        unlink(path);
+    }
+    closedir(d);
+    rmdir(dir);
+}
+
 /* ---------------------------------------------------------------- init */
+
+/* 前向声明：定义在文件后半（搜索历史那一节），init 里要先用到 */
+static void nvs_load_history(void);
 
 esp_err_t online_service_init(void)
 {
@@ -1173,9 +1681,30 @@ esp_err_t online_service_init(void)
     }
     mkdir_if_needed(ONLINE_ROOT);
     mkdir_if_needed(ONLINE_AUDIO_DIR);
-    mkdir_if_needed(ONLINE_COVER_DIR);
-    mkdir_if_needed(ONLINE_LRC_DIR);
+    /* 封面/歌词不再落 SD：把旧固件写下来的 cover/ 目录与 *.lrc 清掉，
+     * 免得它们继续占用 SD 空间、也避免下次切歌再读到旧文件。 */
+    wipe_dir(ONLINE_COVER_DIR);
+    wipe_dir(ONLINE_LRC_DIR);
+    {
+        DIR *d = opendir(ONLINE_AUDIO_DIR);
+        if (d) {
+            struct dirent *ent;
+            while ((ent = readdir(d)) != NULL) {
+                if (ent->d_name[0] == '.') {
+                    continue;
+                }
+                const char *dot = strrchr(ent->d_name, '.');
+                if (dot && strcasecmp(dot, ".lrc") == 0) {
+                    char path[320];
+                    snprintf(path, sizeof(path), "%s/%s", ONLINE_AUDIO_DIR, ent->d_name);
+                    unlink(path);
+                }
+            }
+            closedir(d);
+        }
+    }
     nvs_load_ids();
+    nvs_load_history();
     s_ready = true;
     ESP_LOGI(TAG, "online service ready: %u playlist id(s)", (unsigned)s_id_count);
     return ESP_OK;
@@ -1194,4 +1723,146 @@ const char *online_last_error(void)
 const char *online_playlist_id(size_t idx)
 {
     return (idx < s_id_count) ? s_ids[idx] : NULL;
+}
+
+const char *online_playlist_name(size_t idx)
+{
+    if (idx >= s_id_count) {
+        return NULL;
+    }
+    /* 没起过名就空串 —— 让 UI 自己决定退回显示 ID 还是别的，服务不做展示决策 */
+    return s_names[idx];
+}
+
+esp_err_t online_playlist_rename(size_t idx, const char *name)
+{
+    if (idx >= s_id_count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* name == NULL 或空串 = 清掉自定义名（退回显示 ID） */
+    str_copy(s_names[idx], sizeof(s_names[0]), name ? name : "");
+    nvs_save_ids();
+    ESP_LOGI(TAG, "playlist '%s' renamed to '%s'", s_ids[idx], s_names[idx]);
+    return ESP_OK;
+}
+
+/* ---------------------------------------------------------------- 搜索历史 */
+
+static char   s_hist[ONLINE_HISTORY_MAX][ONLINE_KW_MAX];
+static size_t s_hist_n;
+
+static void nvs_load_history(void)
+{
+    s_hist_n = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    uint8_t n = 0;
+    if (nvs_get_u8(h, NVS_KEY_SH_CNT, &n) == ESP_OK) {
+        if (n > ONLINE_HISTORY_MAX) {
+            n = ONLINE_HISTORY_MAX;
+        }
+        for (uint8_t i = 0; i < n; i++) {
+            char key[12];
+            snprintf(key, sizeof(key), NVS_KEY_SH_FMT, i);
+            size_t len = sizeof(s_hist[s_hist_n]);
+            if (nvs_get_str(h, key, s_hist[s_hist_n], &len) == ESP_OK && s_hist[s_hist_n][0]) {
+                s_hist_n++;
+            }
+        }
+    }
+    nvs_close(h);
+}
+
+static void nvs_save_history(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    nvs_set_u8(h, NVS_KEY_SH_CNT, (uint8_t)s_hist_n);
+    for (size_t i = 0; i < ONLINE_HISTORY_MAX; i++) {
+        char key[12];
+        snprintf(key, sizeof(key), NVS_KEY_SH_FMT, (int)i);
+        if (i < s_hist_n) {
+            nvs_set_str(h, key, s_hist[i]);
+        } else {
+            nvs_erase_key(h, key);
+        }
+    }
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+/* 把第 idx 条挪到最前（其余后移），用于"再次搜同一个词"和"删单条" */
+static void hist_move_to_front(size_t idx)
+{
+    if (idx == 0 || idx >= s_hist_n) {
+        return;
+    }
+    char tmp[ONLINE_KW_MAX];
+    str_copy(tmp, sizeof(tmp), s_hist[idx]);
+    for (size_t i = idx; i > 0; i--) {
+        str_copy(s_hist[i], sizeof(s_hist[0]), s_hist[i - 1]);
+    }
+    str_copy(s_hist[0], sizeof(s_hist[0]), tmp);
+}
+
+size_t online_history_count(void)
+{
+    return s_hist_n;
+}
+
+const char *online_history_at(size_t idx)
+{
+    return (idx < s_hist_n) ? s_hist[idx] : NULL;
+}
+
+esp_err_t online_history_add(const char *kw)
+{
+    if (!kw || !kw[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    /* 已有同一个词：提到最前，不新增（这是搜索历史的常规行为） */
+    for (size_t i = 0; i < s_hist_n; i++) {
+        if (strcmp(s_hist[i], kw) == 0) {
+            hist_move_to_front(i);
+            nvs_save_history();
+            return ESP_OK;
+        }
+    }
+    const size_t n = (s_hist_n < ONLINE_HISTORY_MAX) ? (s_hist_n + 1) : ONLINE_HISTORY_MAX;
+    for (size_t i = n - 1; i > 0; i--) {
+        str_copy(s_hist[i], sizeof(s_hist[0]), s_hist[i - 1]);
+    }
+    str_copy(s_hist[0], sizeof(s_hist[0]), kw);
+    s_hist_n = n;
+    nvs_save_history();
+    return ESP_OK;
+}
+
+esp_err_t online_history_remove(size_t idx)
+{
+    if (idx >= s_hist_n) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    for (size_t i = idx + 1; i < s_hist_n; i++) {
+        str_copy(s_hist[i - 1], sizeof(s_hist[0]), s_hist[i]);
+    }
+    s_hist_n--;
+    s_hist[s_hist_n][0] = '\0';
+    nvs_save_history();
+    return ESP_OK;
+}
+
+esp_err_t online_history_clear(void)
+{
+    s_hist_n = 0;
+    for (size_t i = 0; i < ONLINE_HISTORY_MAX; i++) {
+        s_hist[i][0] = '\0';
+    }
+    nvs_save_history();
+    ESP_LOGI(TAG, "search history cleared");
+    return ESP_OK;
 }

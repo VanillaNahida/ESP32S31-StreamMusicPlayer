@@ -84,6 +84,17 @@ const char  *wifi_service_conn_ssid(void);   /* 已连接/正在连的 SSID，�
 const char  *wifi_service_ip(void);          /* 已连接时的点分 IP；否则空串 */
 int          wifi_service_rssi(void);        /* 已连接时的信号强度，0 表示未知 */
 
+/*
+ * 最近一次连接失败/掉线的原因（中文短句，例如"四次握手超时：密码错"、
+ * "没找到这个 AP（信号弱/在 5G 频段？）"、"AP 不满足 authmode 阈值"）。
+ * 没失败过时返回空串。
+ *
+ * 用途：设置页在 WIFI_ST_FAILED 时直接把原因显示出来 —— 原来只有一句
+ * "密码错误或找不到 AP"，用户和我们都分不清到底是密码错、信号问题，
+ * 还是那个 AP 用了本机不支持的加密方式（WPA3/企业级）。
+ */
+const char  *wifi_service_last_reason_str(void);
+
 size_t       wifi_service_saved_count(void);
 const char  *wifi_service_saved_ssid(size_t idx);
 

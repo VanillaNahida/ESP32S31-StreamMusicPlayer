@@ -73,13 +73,14 @@ int media_meta_lrc_index_at(const lrc_t *lrc, uint32_t pos_ms);
 /*
  * 一次调用拿到"能直接喂给 LVGL"的封面位图：
  *   取内嵌专辑图（MP3 = ID3v2 的 APIC/PIC 帧，FLAC = PICTURE 元数据块）
- *   → 用 esp_new_jpeg 解成 **RGB565 little-endian**
+ *   → 按文件魔数分派：JPEG 用 esp_new_jpeg，PNG 用官方 libpng 组件
+ *   → 解成 **RGB565 little-endian**
  *   → 按 1/2^n 降到长边不超过 max_dim（省内存，也省 LVGL 每帧的缩放量）。
  *
  * 成功时 *pixels 由本模块分配（16 字节对齐），调用方用完必须调
  * media_meta_cover_free()。失败码：
  *   ESP_ERR_NOT_FOUND     文件里没有封面（或容器不支持）
- *   ESP_ERR_NOT_SUPPORTED 封面是 PNG / 不认识（本版只解 JPEG）
+ *   ESP_ERR_NOT_SUPPORTED 封面编码不认识（既不是 JPEG 也不是 PNG）
  *   ESP_ERR_NO_MEM / ESP_FAIL  OOM / 解码失败
  *
  * ⚠ 这是**同步阻塞**调用（读文件 + 软解 JPEG，几十~几百 ms），必须在
@@ -92,14 +93,27 @@ esp_err_t media_meta_cover_rgb565(const char *audio_path, int max_dim,
 void media_meta_cover_free(uint8_t *pixels);
 
 /*
- * 独立 JPEG 文件 → RGB565（在线歌曲封面走这条路：Meting 给的 pic 是一张单独的
- * .jpg，不在音频文件里）。输出格式与 media_meta_cover_rgb565() 完全一致，
- * 同样用 media_meta_cover_free() 释放。
+ * 独立封面图文件 → RGB565（在线歌曲封面走这条路：Meting 给的 pic 是一张单独的
+ * 文件，不在音频文件里）。**JPEG 和 PNG 都支持**，内部按文件魔数分派，
+ * 缓存文件的扩展名（.jpg）只当提示、不作依据。
+ * 输出格式与 media_meta_cover_rgb565() 完全一致，同样用 media_meta_cover_free() 释放。
  *
- * 失败码：ESP_ERR_NOT_FOUND 打不开；ESP_ERR_INVALID_SIZE 非 JPEG 或超过 2 MB；
- *        ESP_FAIL 解码失败。
+ * 失败码：ESP_ERR_NOT_FOUND 打不开；ESP_ERR_INVALID_SIZE 超过 2 MB；
+ *        ESP_ERR_NOT_SUPPORTED 既不是 JPEG 也不是 PNG；ESP_FAIL 解码失败。
  */
-esp_err_t media_meta_jpeg_file_rgb565(const char *jpg_path, int max_dim,
+esp_err_t media_meta_image_file_rgb565(const char *img_path, int max_dim,
+                                       uint8_t **pixels, int *out_w, int *out_h);
+
+/*
+ * **内存缓冲**里的封面图 → RGB565（在线歌曲封面缓存已经搬到 PSRAM，
+ * 不需要再写 / 读 SD 卡）。与 file 版本同一套解码器（按魔数分派 JPEG/PNG），
+ * 输出格式与释放方式完全一致。
+ *
+ * ⚠ data 在调用期间必须保持有效（本函数只读不持有）。
+ * 失败码：ESP_ERR_INVALID_ARG / ESP_ERR_INVALID_SIZE（len 超 2 MB 或过短）/
+ *        ESP_ERR_NOT_SUPPORTED / ESP_FAIL / ESP_ERR_NO_MEM。
+ */
+esp_err_t media_meta_image_mem_rgb565(const uint8_t *data, size_t len, int max_dim,
                                       uint8_t **pixels, int *out_w, int *out_h);
 
 /*

@@ -22,6 +22,12 @@ typedef struct page_desc {
     lv_obj_t  *(*create)(void);   /* 返回一个 lv_obj_create(NULL) 建出的 screen */
     void       (*on_enter)(void);
     void       (*on_exit)(void);
+    /*
+     * no_back = true：该页**自带**返回钮（或本身就是二级页外壳的一部分），
+     * 不要自动叠全局返回键 —— 见 ui_back_button_update() 与 ui_router.cc。
+     * 设置页（make_page_shell 自带返回钮）必须置位，否则会出两个返回键。
+     */
+    bool no_back;
 } page_desc_t;
 
 /* 全局 UI 初始化：top layer（状态栏/控制中心/手势/Toast）+ 首页 */
@@ -35,6 +41,38 @@ esp_err_t ui_router_pop(void);
 esp_err_t ui_router_reset_to_home(void);
 /* 当前栈深（首页为 1） */
 int ui_router_depth(void);
+
+/* ------------------------------------------------------------------ 页面返回键 */
+
+/*
+ * 全局返回键（推荐用法）：ui_core_init 时在 lv_layer_top 叠一个圆钮，
+ * 点击等价于 ui_router_pop()。ui_router_push/pop 之后会自动刷新它的
+ * 显示状态：**栈深 > 1 且当前页 desc.no_back == false 时显示**，否则隐藏。
+ * 所以：
+ *   - 首页（栈深 1）不显示；
+ *   - 普通二级页（播放器 / 在线音乐 / 占位页…）自动就有返回键，页面里
+ *     不用再画，标题只需让到 UI_HEADER_TEXT_X 给按钮留位；
+ *   - 自带返回钮的页面（设置页 make_page_shell）把 page_desc_t.no_back
+ *     置 true 即可。
+ * 该键建在 lv_layer_top 上、z 序低于控制中心/抽屉/Toast/遮罩：
+ * 模态遮罩打开时它会一并被盖住（点不到，符合预期），关闭后自动恢复。
+ */
+
+/*
+ * 手动返回键（仅给自带返回钮的页面用，如设置页 make_page_shell）：
+ * 点击等价于 ui_router_pop()。
+ *
+ * @param parent 页头元素：标题所在的那个容器，也可以直接是 screen
+ * @param align  按钮的对齐方式，与该页标题保持一致
+ *               （标题在容器里用 LV_ALIGN_LEFT_MID；标题直接挂 screen 用 LV_ALIGN_TOP_LEFT）
+ * @return 按钮对象，不需要时忽略返回值
+ *
+ * ⚠ 屏幕最左 UI_EDGE_HOTZONE(24 px) 是返回手势热区，它 z 序高于页面，
+ *   所以按钮不能贴 x=0（左半截会被热区吃掉、点不动）。helper 已经把按钮放在
+ *   UI_BACK_BTN_X 处，调用方只需把标题右移到 UI_HEADER_TEXT_X。
+ * ⚠ 用自动全局返回键的页面**不要再调这个**，否则会出两个返回键。
+ */
+lv_obj_t *ui_back_button_create(lv_obj_t *parent, lv_align_t align);
 
 /* ------------------------------------------------------------------ 状态栏 */
 

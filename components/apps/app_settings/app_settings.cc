@@ -104,6 +104,13 @@ static lv_obj_t *make_page_shell(lv_obj_t *scr, const char *title,
     lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(head, UI_PX_W(10), LV_PART_MAIN);
     lv_obj_remove_flag(head, LV_OBJ_FLAG_SCROLLABLE);
+    /*
+     * ★ 让开左边缘手势热区（UI_EDGE_HOTZONE，挂在 lv_layer_top 上、z 序高于页面）：
+     * head 是 flex 行、返回键是第一个子对象，不加这个内边距就会落在屏幕 pad
+     * （UI_PAGE_PAD = 8 px）处 —— 左半截压在热区里，按了没反应。
+     * 宽度仍是 100%，加的是内边距，不会溢出。
+     */
+    lv_obj_set_style_pad_left(head, UI_BACK_BTN_X, LV_PART_MAIN);
 
     lv_obj_t *b = lv_button_create(head);
     lv_obj_set_size(b, UI_PX_H(34), UI_PX_H(34));
@@ -275,7 +282,15 @@ static void on_radio_switch(lv_event_t *e)
     lv_obj_t *sw = lv_event_get_target_obj(e);
     const bool want_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
     s_radio_busy = which;
-    if (xTaskCreate(radio_toggle_task, "radio_sw", 8192, (void *)(intptr_t)which, 3, NULL) != pdPASS) {
+    /*
+     * ★ 必须**钉在 BTC 核**上跑（和 main 里的 radio_init_task 一样）：
+     * esp_bt_audio 的 A2DP source 注册会和 BTC 任务里的 deinit 路径抢一个静态标志
+     * （btc_av.c: g_a2dp_on_deinit），不同核/不同优先级下会撞成
+     *   ESP_ERROR_CHECK failed: ESP_ERR_INVALID_STATE ... a2dp_src_register_sbc_sep(seid)
+     * 然后 abort（用户实测的这次崩溃就是"关掉再打开蓝牙"触发的）。
+     */
+    if (xTaskCreatePinnedToCore(radio_toggle_task, "radio_sw", 8192, (void *)(intptr_t)which, 3,
+                                NULL, CONFIG_BT_BLUEDROID_PINNED_TO_CORE) != pdPASS) {
         s_radio_busy = 0;
         ui_toast("任务创建失败", 1500);
         return;
@@ -334,6 +349,27 @@ static lv_obj_t *make_switch_row(lv_obj_t *parent, const char *sym, uint32_t acc
     return row;
 }
 
+/*
+ * 文本没变就别写 label。
+ *
+ * 设置页的摘要行 / Wi-Fi 状态行都是 500 ms 一次的常驻定时器在刷，而内容绝大多数
+ * 时候是不变的；lv_label_set_text() 每次都 free+malloc 新串并整块 lv_obj_invalidate()，
+ * 无条件重写会让界面和堆持续抖动。
+ *
+ * 直接读 label 当前文本做比较，不维护额外缓存（缓存会和别处的直接写入不同步）。
+ */
+static void label_set_if_changed(lv_obj_t *label, const char *text)
+{
+    if (!label || !text) {
+        return;
+    }
+    const char *cur = lv_label_get_text(label);
+    if (cur && strcmp(cur, text) == 0) {
+        return;
+    }
+    lv_label_set_text(label, text);
+}
+
 static void settings_tick(lv_timer_t *t)
 {
     (void)t;
@@ -359,7 +395,7 @@ static void settings_tick(lv_timer_t *t)
     }
 
     if (!wifi_service_is_enabled()) {
-        lv_label_set_text(s_sum[SET_WIFI], "已关闭");
+        label_set_if_changed(s_sum[SET_WIFI], "已关闭");
     } else switch (wifi_service_state()) {
     case WIFI_ST_CONNECTED:
         snprintf(buf, sizeof(buf), "已连接 %s", wifi_service_conn_ssid());
@@ -380,7 +416,7 @@ static void settings_tick(lv_timer_t *t)
         snprintf(buf, sizeof(buf), "未连接");
         break;
     }
-    lv_label_set_text(s_sum[SET_WIFI], buf);
+    label_set_if_changed(s_sum[SET_WIFI], buf);
 
     if (bt_service_state() == BT_ST_FAILED) {
         snprintf(buf, sizeof(buf), "不可用");
@@ -391,22 +427,24 @@ static void settings_tick(lv_timer_t *t)
     } else {
         snprintf(buf, sizeof(buf), "未配对");
     }
-    lv_label_set_text(s_sum[SET_BT], buf);
+    label_set_if_changed(s_sum[SET_BT], buf);
 
     snprintf(buf, sizeof(buf), "%s · %d%%",
              audio_service_get_output() == AUDIO_OUT_NONE ? "静音" : "扬声器",
              audio_service_get_volume());
-    lv_label_set_text(s_sum[SET_OUT], buf);
+    label_set_if_changed(s_sum[SET_OUT], buf);
 
-    lv_label_set_text(s_sum[SET_DISPLAY], bsp_backlight_get() >= 0 ? "无软件背光" : "—");
-    lv_label_set_text(s_sum[SET_STORAGE], bsp_sdcard_is_mounted() ? "SD 已挂载" : "无 SD 卡");
-    lv_label_set_text(s_sum[SET_ABOUT], esp_app_get_description()->version);
+    label_set_if_changed(s_sum[SET_DISPLAY], bsp_backlight_get() >= 0 ? "无软件背光" : "—");
+    label_set_if_changed(s_sum[SET_STORAGE], bsp_sdcard_is_mounted() ? "SD 已挂载" : "无 SD 卡");
+    label_set_if_changed(s_sum[SET_ABOUT], esp_app_get_description()->version);
 }
 
 static void on_setting_row(lv_event_t *e)
 {
     const int id = (int)(intptr_t)lv_event_get_user_data(e);
     page_desc_t p = {};
+    /* 二级页外壳 make_page_shell 自带返回钮：no_back 置位，避免全局返回键重复 */
+    p.no_back = true;
     switch (id) {
     case SET_WIFI:
         p.id = "set_wifi";
@@ -508,6 +546,17 @@ static void on_wifi_forget(lv_event_t *e)
 
 static lv_obj_t *s_pw_overlay;
 static lv_obj_t *s_pw_ta;
+/*
+ * 浮层要连的 SSID 自带一份。
+ *
+ * ★ 不能沿用列表行里那个 ssid_copy：wifi_tick 每 500 ms 跑一次，只要 AP 数量/
+ *   连接状态/已保存数量有变就 wifi_rebuild_list() → lv_obj_clean() 把整列删掉，
+ *   行上挂的 ssid_copy 会在 LV_EVENT_DELETE 里被 free。而 on_pw_ready 是通过
+ *   键盘的 event user_data 拿到那个指针的 —— 用户正在输密码时列表一刷新，
+ *   这个指针就成了悬垂指针，按"确认"等于拿已释放内存当 SSID 去连（轻则连错、
+ *   重则崩）。自己存一份，生命周期与浮层一致。
+ */
+static char      s_pw_ssid[WIFI_SSID_MAX];
 
 static void pw_close(void)
 {
@@ -559,9 +608,12 @@ static void on_pw_cancel(lv_event_t *e)
 
 static void wifi_open_pw(const char *ssid)
 {
-    if (s_pw_overlay) {
+    if (s_pw_overlay || !ssid || !ssid[0]) {
         return;
     }
+    /* 自己存一份 SSID（原因见 s_pw_ssid 的注释）：后面 tip 与 READY 回调都用它 */
+    snprintf(s_pw_ssid, sizeof(s_pw_ssid), "%s", ssid);
+
     lv_obj_t *scr = lv_screen_active();
     s_pw_overlay = lv_obj_create(scr);
     lv_obj_remove_style_all(s_pw_overlay);
@@ -576,7 +628,7 @@ static void wifi_open_pw(const char *ssid)
     lv_obj_t *tip = lv_label_create(s_pw_overlay);
     lv_obj_set_style_text_font(tip, UI_FONT_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_color(tip, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text_fmt(tip, "输入 %s 的密码", ssid);
+    lv_label_set_text_fmt(tip, "输入 %s 的密码", s_pw_ssid);
     lv_obj_align(tip, LV_ALIGN_TOP_MID, 0, UI_PX_H(8));
 
     s_pw_ta = lv_textarea_create(s_pw_overlay);
@@ -591,8 +643,8 @@ static void wifi_open_pw(const char *ssid)
     lv_obj_set_size(kb, LV_PCT(100), UI_PCT_Y(52));
     lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_keyboard_set_textarea(kb, s_pw_ta);
-    /* 键盘自带的 OK / 关闭键对应 READY / CANCEL 事件 */
-    lv_obj_add_event_cb(kb, on_pw_ready, LV_EVENT_READY, (void *)ssid);
+    /* 键盘自带的 OK / 关闭键对应 READY / CANCEL 事件（传的是浮层自己那份 SSID） */
+    lv_obj_add_event_cb(kb, on_pw_ready, LV_EVENT_READY, s_pw_ssid);
     lv_obj_add_event_cb(kb, on_pw_cancel, LV_EVENT_CANCEL, NULL);
 }
 
@@ -700,13 +752,23 @@ static void wifi_tick(lv_timer_t *t)
         snprintf(buf, sizeof(buf), "已连接 %s · %s · %d dBm",
                  wifi_service_conn_ssid(), wifi_service_ip(), wifi_service_rssi());
         break;
-    case WIFI_ST_FAILED:     snprintf(buf, sizeof(buf), "连接失败（密码错误或找不到 AP）"); break;
+    case WIFI_ST_FAILED: {
+        /* 把服务里记下的真实原因码翻出来显示（密码错 / 没找到 AP / 加密方式不匹配…），
+         * 原来只有一个笼统的"密码错误或找不到 AP"，用户没法判断该干什么 */
+        const char *why = wifi_service_last_reason_str();
+        if (why && why[0]) {
+            snprintf(buf, sizeof(buf), "连接失败：%s", why);
+        } else {
+            snprintf(buf, sizeof(buf), "连接失败（密码错误或找不到 AP）");
+        }
+        break;
+    }
     default:
         snprintf(buf, sizeof(buf), "未连接 · 已保存 %u 个网络",
                  (unsigned)wifi_service_saved_count());
         break;
     }
-    lv_label_set_text(s_wifi_status, buf);
+    label_set_if_changed(s_wifi_status, buf);
 
     const int sig = (int)wifi_service_ap_count() * 32 + (int)st +
                     (wifi_service_is_scanning() ? 1000 : 0) +
@@ -920,7 +982,7 @@ static void bt_tick(lv_timer_t *t)
                  (unsigned)bt_service_bonded_count(),
                  (unsigned)bt_service_dev_count());
     }
-    lv_label_set_text(s_bt_status, buf);
+    label_set_if_changed(s_bt_status, buf);
 
     const int sig = (int)bt_service_dev_count() * 64 + (int)bt_service_bonded_count() * 4 +
                     (int)bt_service_state() * 100000 +
@@ -1107,7 +1169,8 @@ void app_settings_register_apps(void)
 {
     static const app_desc_t settings = {
         "settings", "设置", LV_SYMBOL_SETTINGS, 0x6E6E78,
-        page_settings, on_settings_enter, on_settings_exit, 60, 0
+        page_settings, on_settings_enter, on_settings_exit, 60,
+        APP_FLAG_NO_BACK      /* make_page_shell 自带返回钮，路由不再叠全局键 */
     };
     ui_app_register(&settings);
     ESP_LOGI(TAG, "settings app registered");

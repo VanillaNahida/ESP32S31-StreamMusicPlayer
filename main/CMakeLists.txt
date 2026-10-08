@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.cc" "ime_dict_stub.c"
+    SRCS "cxx_heap.cc" "main.cc" "ime_dict_stub.c"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash

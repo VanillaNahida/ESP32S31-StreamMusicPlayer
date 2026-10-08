@@ -153,7 +153,11 @@ static void back_settle_apply(bool commit)
     s_back_under = NULL;
 
     if (commit) {
-        ui_router_pop();
+        /*
+         * 用"立即退栈"：手指已经 1:1 把顶层页滑出屏幕了，再放一次屏幕切换
+         * 动画会先把位置复位、重滑一遍（见 ui_router.cc 的 router_pop）。
+         */
+        ui_router_pop_immediate();
     }
     ESP_LOGD(TAG, "back settle (%s)", commit ? "commit" : "cancel");
 }

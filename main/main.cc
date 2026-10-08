@@ -34,6 +34,16 @@
 extern "C" const uint8_t _binary_dict_pinyin_dat_start[1];
 __attribute__((used)) static const uint8_t *const s_ime_dict_stub_ref = _binary_dict_pinyin_dat_start;
 
+/*
+ * 同理，让链接器把 cxx_heap.cc.obj 从 libmain.a 里拉出来：
+ * libgooglepinyin 用 C++ 的 new，而 libstdc++ 那份 operator new 在分配失败时
+ * 抛 std::bad_alloc，在 -fno-exceptions 的 ESP-IDF 上等于直接 abort() 重启。
+ * cxx_heap.cc 提供不抛异常（返回 NULL）的版本，但它在 libmain.a 里，
+ * 而 libgooglepinyin 排在 libmain.a 之后引用它 —— 不主动引用就永远拉不出来。
+ */
+extern "C" void cxx_heap_anchor(void);
+__attribute__((used)) static void (*const s_cxx_heap_anchor)(void) = &cxx_heap_anchor;
+
 static const char *TAG = "app_main";
 
 /* ------------------------------------------------------------------ */

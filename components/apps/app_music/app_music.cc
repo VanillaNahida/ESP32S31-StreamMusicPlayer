@@ -23,6 +23,7 @@
 #include <strings.h>
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_heap_caps.h"   /* 目录条目缓冲优先放 PSRAM（heap_caps_realloc） */
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -76,7 +77,16 @@ static int       s_resume_wait;     /* 等码率来定位续播位置的 tick �
  * 上一首/下一首在当前目录里轮转）。于是"正在播的曲子"和"队列的第 s_index 个"
  * 会分家 —— 拿队列去记进度，记下来的就是另一首歌。进度记忆必须以这条路径为准。
  */
-static char      s_track_path[STORAGE_PATH_MAX];
+/*
+ * 这两条缓冲的长度上限必须能互相装下，别各自拍脑袋定：
+ *   本地路径  ≤ STORAGE_PATH_MAX (512)
+ *   在线流地址 ≤ 560（CDN 签名 URL 很长，见 s_on_stream / audio_service 的 uri[600]）
+ * s_track_path 既喂给 audio_service_play_uri()，也是进度记忆在 NVS 里的键 ——
+ * 一旦被 snprintf 截断，签名 URL 会直接 403、本地路径则指向不存在的文件。
+ * （-Os 下 GCC 的 -Werror=format-truncation 正好抓到了 512 < 560 这一处。）
+ */
+#define TRACK_PATH_MAX  600
+static char      s_track_path[TRACK_PATH_MAX];
 
 /* 播放器页控件 */
 static lv_obj_t *s_p_title;
@@ -86,9 +96,8 @@ static lv_obj_t *s_p_seek_hit;      /* 进度条抓取区：自己算比例，�
 static lv_obj_t *s_p_cur;
 static lv_obj_t *s_p_tot;
 static lv_obj_t *s_p_btn;
-static lv_obj_t *s_p_cover_box;     /* 左栏封面容器（整块可点） */
+static lv_obj_t *s_p_cover_box;     /* 左栏封面容器 */
 static lv_obj_t *s_p_cover_img;     /* 真封面（没解出来时隐藏） */
-static lv_obj_t *s_p_cover_hint;    /* 封面下沿的提示条 */
 static lv_obj_t *s_p_lyric_box;     /* 右栏歌词区（封面右侧） */
 static lv_obj_t *s_p_lyric_hint;    /* 未展开时的提示 */
 static lv_obj_t *s_p_lyric_col;
@@ -106,8 +115,10 @@ static lv_timer_t *s_tick;
 
 typedef struct {
     int  idx;
-    bool from_jpg;                  /* true = path 是独立封面图（在线歌曲） */
-    char path[STORAGE_PATH_MAX];
+    bool from_mem;                  /* true = data/len 是内存里的图片字节（在线歌曲） */
+    uint8_t *data;                  /* from_mem 时有效：本请求**独占**，用完 free */
+    size_t   len;
+    char path[STORAGE_PATH_MAX];    /* from_mem=false：本地歌曲音频路径 */
 } cover_req_t;
 
 static lv_image_dsc_t *s_cover_dsc;     /* 堆上的描述符，指向 s_cover_pixels（RGB565） */
@@ -119,8 +130,6 @@ static uint8_t *s_cover_out;
 static int      s_cover_out_w;
 static int      s_cover_out_h;
 static volatile int s_cover_out_idx = -1;
-/* 在线歌曲的封面是缓存目录里的一张独立 jpg，非空时优先用它解码 */
-static char      s_cover_jpg[192];
 
 /* ------------------------------------------------------------- 在线曲目队列
  *
@@ -141,8 +150,25 @@ static bool    s_on_mode;                    /* 当前队列是否来自在线�
 /* 要播放的地址：流式是 https 地址，下载兜底是本地缓存路径
  * （audio_service_play_uri() 两种都认） */
 static char    s_on_stream[560];
-static char    s_on_lrc[192];                /* 缓存的歌词文件（流式播放时用） */
 static bool    s_on_stream_local;            /* true = 下载兜底（本地文件） */
+static uint32_t s_on_dur_ms;                 /* 在线歌曲总时长（估出来的，0=未知） */
+/* 请求序号：点歌会立刻 ++，工作线程只在序号没变时才认自己的结果 ——
+ * 否则"点第二首时第一首的下载刚好完成"，tick 会先把旧的那首起播，
+ * 表现为"点了歌但没切过去"（先放旧的、几秒后才换）。 */
+static uint32_t s_on_seq;   /* 只在 LVGL 任务里改，工作线程只读一次比较 */
+
+/*
+ * 在线封面/歌词的**内存缓冲**（PSRAM，不落 SD）。
+ * 归属规则：online_prepare_task（工作线程）写入新分配；**只有 LVGL 任务释放**
+ * （start_track_online_at 消费时转移给封面解码请求 / 解析完歌词后 free；
+ * play_next / 点歌 / 退页丢弃未消费的 ready 时 free）。
+ * cover_kick 会把 s_on_cover_data **转移**进封面解码请求（请求独占，线程内释放），
+ * 所以这里释放的唯一竞态点被消掉了。
+ */
+static uint8_t *s_on_cover_data;             /* 已下载好的封面字节（JPEG/PNG） */
+static size_t   s_on_cover_len;
+static char    *s_on_lrc_data;               /* 已下载好的歌词文本（UTF-8） */
+static size_t   s_on_lrc_len;
 
 /*
  * 进度记忆的唯一出口：**在线流式不记**。
@@ -159,14 +185,44 @@ static void save_progress(uint32_t pos_ms)
     }
     play_state_track_set(s_track_path, pos_ms);
 }
-static char    s_on_cover[192];              /* 已下载好的封面 jpg 路径 */
 static volatile int  s_on_req = -1;          /* 待下载的曲目下标（-1 = 无） */
 static volatile bool s_on_busy;
 static bool    s_on_ready;                   /* 下载完成，等 LVGL 任务起播 */
 static int     s_on_ready_idx = -1;
+/* ready 对应的请求序号：tick 消费前必须与 s_on_seq 一致，否则是过期 ready
+ * （用户中间又点了别的歌），只做丢弃、不起播 —— 见 tick_cb 与 online_prepare_task */
+static uint32_t s_on_ready_seq;
 static bool    s_on_failed;                  /* 下载失败，等 LVGL 任务提示 */
-static int     s_prefetch_idx = -1;          /* 已预取的那一首 */
-static bool    s_on_prefetch;                /* 本次下载是预取（不下发起播） */
+/*
+ * 预取下一首的封面/歌词：**目前刻意不启用**（它占住唯一的准备槽位，用户这时点歌
+ * 就得干等它跑完，实测 1~3 秒 —— 为了"点了就切"的及时性去掉了入口，
+ * 见 tick_cb 里的说明）。这套标志与 online_prepare_task 的 prefetch 分支都还留着，
+ * 以后想在"网络空闲/缓冲充足"时重新启用，把入口调用加回来即可。
+ */
+static bool    s_on_prefetch;                /* 本次下载是预取（不起播） */
+
+/*
+ * 丢弃"已下载好、还没起播"的在线结果（封面/歌词缓冲也一并释放）。
+ * 只在 LVGL 任务里调：缓冲由工作线程发布、LVGL 任务独占释放，
+ * 发布点在工作线程最后几条指令里，最坏情况（发布窗口内恰好切歌）由
+ * s_on_ready_seq 的序号校验兜住 —— 过期的 ready 在 tick 里只会被丢弃释放，
+ * 不会再被消费。
+ */
+static void online_discard_ready(void)
+{
+    s_on_ready     = false;
+    s_on_ready_idx = -1;
+    if (s_on_cover_data) {
+        free(s_on_cover_data);
+        s_on_cover_data = NULL;
+        s_on_cover_len  = 0;
+    }
+    if (s_on_lrc_data) {
+        free(s_on_lrc_data);
+        s_on_lrc_data = NULL;
+        s_on_lrc_len  = 0;
+    }
+}
 
 /* 前向声明（start_track / tick_cb 在它们定义之前） */
 static void lyric_rebuild(void);
@@ -176,8 +232,12 @@ static void cover_show(uint8_t *px, int w, int h);
 static void cover_reap(void);
 static void cover_kick(void);
 static void online_prepare_kick(void);
-static void online_prefetch_next(void);
-static void start_track_online_at(int idx, const char *audio_path, const char *cover_jpg);
+static void set_buffering_hint(void);
+/* 正在显示"缓冲中"提示（tick_cb 里刷百分比、出声后撤掉） */
+static bool s_buf_show;
+static void start_track_online_at(int idx, const char *uri);
+/* 在线切歌的"界面先行"：先把播放器页切成目标歌曲（见实现处的说明） */
+static void online_switch_ui_to(int idx);
 
 /* ------------------------------------------------------------------ 播放模式 */
 
@@ -288,15 +348,16 @@ static void start_track_at(int idx, uint32_t resume_ms)
         return;
     }
 
-    /* 切回本地队列：清掉"在线队列"的任何残留（封面来源也要跟着换） */
+    /* 切回本地队列：清掉"在线队列"的任何残留（封面/歌词缓冲也要释放） */
     s_on_mode     = false;
-    s_cover_jpg[0] = '\0';
+    online_discard_ready();
 
     s_index      = idx;
     s_resume_ms  = resume_ms;
     /* 先把进度条摆到续播位置，别让它从 0 跳一下（真正的定位见 tick_cb） */
     s_elapsed_ms = resume_ms;
     s_dur_ms     = 0;
+    s_seeking    = false;
     s_lyric_cur  = -1;
     s_save_ticks = 0;
     s_resume_wait = 0;
@@ -324,6 +385,7 @@ static void start_track_at(int idx, uint32_t resume_ms)
     if (s_lyric_mode) {
         update_lyric_highlight();
     }
+    s_buf_show = false;    /* 本地文件：立刻出声，不要"缓冲中"提示 */
 
     /* 封面：先退回占位（别把上一首的封面留在屏上），再交给工作线程解 */
     cover_show(NULL, 0, 0);
@@ -379,13 +441,26 @@ static void play_next(int dir)
         } else {
             idx = (idx + dir + (int)s_on_count) % (int)s_on_count;
         }
-        s_on_ready = false;
-        s_on_ready_idx = -1;
+        s_index = idx;               /* 目标歌先记上：界面/状态立刻指向它 */
+        s_on_seq++;
+        online_discard_ready();      /* 清掉还没起播的旧结果（缓冲一并释放） */
         s_on_failed = false;
         s_on_req = idx;
+        /*
+         * 和点歌走同一套顺序（见 app_music_play_online）：
+         * 停旧歌 → 界面切到目标歌 → 再显示缓冲信息。
+         * 自动续播时旧歌本来就播完了，多调一次 stop 无害。
+         */
+        audio_service_stop();
+        s_playing = false;
+        if (s_p_btn) {
+            lv_label_set_text(lv_obj_get_child(s_p_btn, 0), LV_SYMBOL_PLAY);
+        }
+        online_switch_ui_to(idx);
         online_prepare_kick();
         if (s_on_busy) {
-            ui_toast("正在获取在线歌曲…", 1200);
+            ui_toast("缓冲中，请稍后...", 1200);
+            set_buffering_hint();
         }
         return;
     }
@@ -425,7 +500,7 @@ static void on_play_pause(lv_event_t *e)
     if (audio_service_toggle() != ESP_OK) {
         /* 在线模式：音频文件已在 SD 上，直接重起播即可（不用再下载） */
         if (s_on_mode && s_on_stream[0]) {
-            start_track_online_at(s_index, s_on_stream, s_on_cover);
+            start_track_online_at(s_index, s_on_stream);
         } else {
             start_track_at(s_index, s_elapsed_ms);
         }
@@ -502,6 +577,12 @@ static void on_seek_press(lv_event_t *e)
     }
 }
 
+/* 手指滑出抓取区：只把"正在拖动"清掉，不做定位 */
+static void on_seek_lost(lv_event_t *e)
+{
+    (void)e;
+    s_seeking = false;
+}
 static void on_seek_release(lv_event_t *e)
 {
     (void)e;
@@ -769,6 +850,29 @@ static void on_audio_evt(audio_evt_t evt, void *user)
     }
 }
 
+/*
+ * 文本没变就别写 label。
+ *
+ * lv_label_set_text() 每次都会 free 旧串 + malloc 新串，并对整块区域
+ * lv_obj_invalidate()（LVGL 9.5 的 set_text_internal）。而 tick_cb 是 500 ms
+ * 一次的常驻定时器，"当前时间 / 总时长 / 播放按钮"里总时长和按钮图标绝大多数
+ * 时候是不变的 —— 无条件重写等于让界面和堆每 500 ms 抖一次。
+ *
+ * 这里直接读 label 当前文本做比较，不额外维护一份缓存：缓存很容易和别处的
+ * 直接写入（切歌、暂停等路径）不同步，反而会漏掉该有的刷新。
+ */
+static void label_set_if_changed(lv_obj_t *label, const char *text)
+{
+    if (!label || !text) {
+        return;
+    }
+    const char *cur = lv_label_get_text(label);
+    if (cur && strcmp(cur, text) == 0) {
+        return;
+    }
+    lv_label_set_text(label, text);
+}
+
 static void update_lyric_highlight(void)
 {
     /* 纯文本歌词（内嵌 USLT 没有时间轴）：静态展示，不高亮也不滚动 */
@@ -779,13 +883,26 @@ static void update_lyric_highlight(void)
     if (idx == s_lyric_cur || !s_p_lyric_col) {
         return;
     }
+    const int prev = s_lyric_cur;
     s_lyric_cur = idx;
 
-    for (size_t i = 0; i < s_p_lyric_n; i++) {
-        if (!s_p_lyric_labels[i]) {
+    /*
+     * 只重设"上一行"和"当前行"。
+     *
+     * 歌词标签建的时候统一是 UI_FONT_SMALL + UI_COLOR_FG_DIM（见下面重建歌词
+     * 标签那段），不变式是"只有第 s_lyric_cur 行是强调色 + 大一号字"，
+     * 所以换行时动这两行就够。
+     *
+     * 原来对全部（最多 LYRIC_VIEW_MAX_LINES = 80）行调 set_style_text_font：
+     * 改字号等于改行高，会触发整列 flex 重新布局 —— 每换一行歌词就卡一下。
+     */
+    const int touched[2] = { prev, idx };
+    for (size_t k = 0; k < 2; k++) {
+        const int i = touched[k];
+        if (i < 0 || (size_t)i >= s_p_lyric_n || !s_p_lyric_labels[i]) {
             continue;
         }
-        bool cur = ((int)i == idx);
+        const bool cur = (i == idx);
         lv_obj_set_style_text_color(s_p_lyric_labels[i],
                                     cur ? UI_COLOR_ACCENT : UI_COLOR_FG_DIM, LV_PART_MAIN);
         lv_obj_set_style_text_font(s_p_lyric_labels[i],
@@ -822,7 +939,7 @@ static void media_cmd_tick(lv_timer_t *t)
             /* 管线是 STOPPED（开机恢复的曲目）时 resume 无效，要从记忆进度起播 */
             if (audio_service_resume() != ESP_OK) {
                 if (s_on_mode && s_on_stream[0]) {
-                    start_track_online_at(s_index, s_on_stream, s_on_cover);
+                    start_track_online_at(s_index, s_on_stream);
                 } else {
                     start_track_at(s_index, s_elapsed_ms);
                 }
@@ -870,19 +987,53 @@ static void tick_cb(lv_timer_t *t)
 
     /* 在线曲目：下载完成 → 起播；失败 → 提示（都在 LVGL 任务里处理） */
     if (s_on_ready) {
-        s_on_ready = false;
         const int idx = s_on_ready_idx;
+        s_on_ready = false;
         s_on_ready_idx = -1;
-        if (idx >= 0) {
-            start_track_online_at(idx, s_on_stream, s_on_cover);
+        if (idx >= 0 && s_on_ready_seq == s_on_seq) {
+            start_track_online_at(idx, s_on_stream);
+        } else {
+            /* 过期 ready（用户中间又点了别的歌，工作线程发布窗口里的旧结果）：
+             * 只把它的缓冲释放掉，不起播。 */
+            online_discard_ready();
         }
     } else if (s_on_req >= 0) {
         online_prepare_kick();
     } else if (s_on_failed) {
         s_on_failed = false;
         ui_toast("在线歌曲获取失败（网络/版权限制？）", 2200);
-    } else if (!s_on_busy && s_on_mode) {
-        online_prefetch_next();      /* 顺手把下一首缓存起来 */
+        /* 缓冲提示不能留在屏上：把歌词区恢复成 歌词 / 暂无歌词
+         * （s_buf_show 也要清掉，否则下一个 tick 又把"缓冲中…"写回去） */
+        s_buf_show = false;
+        lyric_apply_mode();
+    }
+    /* 注：原先这里会"顺手预取下一首的封面/歌词"，但它会占住唯一的准备槽位，
+     * 用户这时点歌就得干等它跑完（实测 1~3 秒）——为了"点了就切"的及时性，去掉。 */
+
+    /*
+     * 在线歌缓冲中：把**下载百分比**刷到右栏说明行（需求："缓冲的时候…
+     * 显示加载百分比"）。
+     *
+     * ★ 显示窗口 = 从 set_buffering_hint() 到**真的出声**
+     *   （audio_service_output_active）。为什么不用 s_on_busy 判：
+     *   s_on_busy 只覆盖"解析地址 + 抓封面/歌词"那一段，它在
+     *   audio_service_play_uri() 之前就结束了 —— 那时音频的 HTTP 流还没开始，
+     *   进度恒为 0，百分比几乎永远显示不出来。而 s_playing 又太早：
+     *   pipeline 一 run() 就是 playing，声音还没出来。所以用"PCM 到过 codec"
+     *   这个信号（见 audio_service_output_active 的注释）。
+     *   服务端分块传输（没有 Content-Length）时 stream_progress() 返回 false，
+     *   那就保持 set_buffering_hint() 写的那句"缓冲中，请稍后..."。
+     */
+    if (s_buf_show) {
+        if (audio_service_output_active()) {
+            s_buf_show = false;
+            lyric_apply_mode();          /* 出声了：说明行交回 歌词 / 暂无歌词 */
+        } else if (s_p_lyric_hint) {
+            int pct = 0;
+            if (audio_service_stream_progress(&pct)) {
+                lv_label_set_text_fmt(s_p_lyric_hint, "缓冲中… %d%%", pct);
+            }
+        }
     }
 
     /*
@@ -1009,16 +1160,16 @@ static void tick_cb(lv_timer_t *t)
     if (s_p_cur && !s_seeking) {
         char buf[16];
         fmt_time(s_elapsed_ms, buf, sizeof(buf));
-        lv_label_set_text(s_p_cur, buf);
+        label_set_if_changed(s_p_cur, buf);
     }
     if (s_p_tot) {
         char buf[16];
         fmt_time(s_dur_ms, buf, sizeof(buf));
-        lv_label_set_text(s_p_tot, buf);
+        label_set_if_changed(s_p_tot, buf);
     }
     if (s_p_btn) {
-        lv_label_set_text(lv_obj_get_child(s_p_btn, 0),
-                          s_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+        label_set_if_changed(lv_obj_get_child(s_p_btn, 0),
+                             s_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     }
     /* 输出设备可能被设置页/蓝牙事件改过：按钮图标跟着走 */
     out_btn_sync();
@@ -1062,13 +1213,16 @@ static void player_on_delete(lv_event_t *e)
     }
     s_p_title = s_p_artist = s_p_cur = s_p_tot = NULL;
     s_p_seek = s_p_seek_hit = s_p_btn = NULL;
-    s_p_cover_box = s_p_cover_img = s_p_cover_hint = NULL;
+    s_p_cover_box = s_p_cover_img = NULL;
     s_p_lyric_box = s_p_lyric_hint = s_p_lyric_col = NULL;
     s_p_mode_btn = s_p_mode_badge = NULL;
     s_lyric_mode = false;
     s_seeking    = false;
     s_p_lyric_n  = 0;
     memset(s_p_lyric_labels, 0, sizeof(s_p_lyric_labels));
+
+    /* 离开播放器页：没起播的在线结果直接丢弃（封面/歌词缓冲一并释放） */
+    online_discard_ready();
 
     /* 封面像素与描述符收回来（工作线程若还在跑，结果由下次 cover_reap / cover_show 收） */
     if (s_cover_pixels) {
@@ -1136,10 +1290,19 @@ static void cover_kick(void)
         return;
     }
     req->idx = idx;
-    if (s_cover_jpg[0]) {
-        /* 在线歌曲：封面是缓存目录里的独立 jpg，直接用 */
-        req->from_jpg = true;
-        snprintf(req->path, sizeof(req->path), "%s", s_cover_jpg);
+    if (s_on_mode) {
+        /* 在线歌曲：封面字节已经在 PSRAM 里（不落 SD）。
+         * 把缓冲**转移**给请求：请求独占、解码线程用完释放，
+         * 之后切换任何歌曲都不会再碰它。 */
+        if (!s_on_cover_data) {
+            free(req);              /* 没抓到封面：不排队解码（占位图兜底） */
+            return;
+        }
+        req->from_mem = true;
+        req->data     = s_on_cover_data;
+        req->len      = s_on_cover_len;
+        s_on_cover_data = NULL;
+        s_on_cover_len  = 0;
     } else {
         /* 本地歌曲：从音频文件里取内嵌封面。
          * 把路径**拷进请求结构**再交给工作线程：线程只认这块内存，
@@ -1149,7 +1312,9 @@ static void cover_kick(void)
             free(req);
             return;
         }
-        req->from_jpg = false;
+        req->from_mem = false;
+        req->data     = NULL;
+        req->len      = 0;
         snprintf(req->path, sizeof(req->path), "%s", t->path);
     }
 
@@ -1162,8 +1327,8 @@ static void cover_kick(void)
 }
 
 /*
- * 封面解码任务：只读文件 + 解 JPEG + 写全局标志，**绝不碰 LVGL**。
- * 结果由 tick_cb（LVGL 任务）搬到对象上。
+ * 封面解码任务：只读文件（本地）/ 解内存缓冲（在线）+ 解 JPEG/PNG + 写全局标志，
+ * **绝不碰 LVGL**。结果由 tick_cb（LVGL 任务）搬到对象上。
  */
 static void cover_task(void *arg)
 {
@@ -1171,9 +1336,13 @@ static void cover_task(void *arg)
     uint8_t *px = NULL;
     int w = 0, h = 0;
 
-    esp_err_t ret = req->from_jpg
-                        ? media_meta_jpeg_file_rgb565(req->path, COVER_MAX_DIM, &px, &w, &h)
+    esp_err_t ret = req->from_mem
+                        ? media_meta_image_mem_rgb565(req->data, req->len,
+                                                      COVER_MAX_DIM, &px, &w, &h)
                         : media_meta_cover_rgb565(req->path, COVER_MAX_DIM, &px, &w, &h);
+    if (req->data) {
+        free(req->data);        /* 内存封面：本请求独占的拷贝，用完释放 */
+    }
     if (ret != ESP_OK) {
         ESP_LOGD(TAG, "no cover for idx=%d (%s)", req->idx, esp_err_to_name(ret));
         px = NULL;
@@ -1194,6 +1363,7 @@ typedef struct {
     online_song_t song;      /* 拷贝一份，工作线程不再读共享数组 */
     int           idx;
     bool          prefetch;  /* 只是提前缓存，不下发起播 */
+    uint32_t      seq;       /* 发起时的请求序号 */
 } online_req_t;
 
 static void online_prepare_task(void *arg);
@@ -1217,6 +1387,7 @@ static void online_prepare_kick(void)
     req->song = s_on_songs[idx];
     req->idx  = idx;
     req->prefetch = s_on_prefetch;
+    req->seq      = s_on_seq;
     s_on_prefetch = false;
     s_on_busy = true;
     if (xTaskCreate(online_prepare_task, "on_fetch", ONLINE_TASK_STACK, req, 2, NULL) != pdPASS) {
@@ -1232,8 +1403,6 @@ static void online_prepare_task(void *arg)
     online_req_t *req = (online_req_t *)arg;
     char stream[560] = {0};
     char path[STORAGE_PATH_MAX] = {0};
-    char jpg[192] = {0};
-    char lrc[192] = {0};
 
     /* 预取只抓"下一首"的封面/歌词（几十 KB），音频等到真要播时再解析 */
     if (req->prefetch) {
@@ -1246,7 +1415,9 @@ static void online_prepare_task(void *arg)
     }
 
     /* 1) 解析 302 拿最终音频地址（不下载）→ 交给播放器流式播放 */
-    esp_err_t ret = online_song_stream_url(&req->song, stream, sizeof(stream));
+    s_on_dur_ms = 0;
+    esp_err_t ret = online_song_stream_info(&req->song, stream, sizeof(stream),
+                                             NULL, &s_on_dur_ms);
     uint8_t local_only = 0;
     if (ret != ESP_OK) {
         /* 2) 流式地址拿不到（版权/网络）→ 退回"先下载再播" */
@@ -1254,22 +1425,50 @@ static void online_prepare_task(void *arg)
         ret = online_song_prepare(&req->song, path, sizeof(path));
         local_only = 1;
     } else {
-        /* 只有封面与歌词要提前抓好 */
+        /* 只有封面与歌词要提前抓好（进 PSRAM 缓存，不落 SD） */
         online_song_prepare_stream(&req->song);
-        online_song_lyrics(&req->song, lrc, sizeof(lrc));
     }
-    online_song_cover(&req->song, jpg, sizeof(jpg));
+    /* 封面/歌词各取一份拷贝（PSRAM），起播时直接给解码/解析用 */
+    uint8_t *jpg = NULL;
+    size_t   jpg_len = 0;
+    char    *lrc = NULL;
+    size_t   lrc_len = 0;
+    online_song_cover_data(&req->song, &jpg, &jpg_len);
+    online_song_lyrics_data(&req->song, &lrc, &lrc_len);
+
+    /* 期间用户又点了别的歌：立刻收工，把"正在准备"让出去，
+     * 让新的那首尽快（下一个 tick）开始解析 */
+    if (req->seq != s_on_seq) {
+        ESP_LOGI(TAG, "abort stale online fetch (idx=%d)", req->idx);
+        free(jpg);
+        free(lrc);
+        s_on_busy = false;
+        free(req);
+        vTaskDelete(NULL);
+        return;
+    }
 
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "online prepare failed: %s", esp_err_to_name(ret));
+        free(jpg);
+        free(lrc);
         s_on_failed = true;
+    } else if (req->seq != s_on_seq) {
+        ESP_LOGI(TAG, "drop stale online result (idx=%d)", req->idx);
+        free(jpg);
+        free(lrc);
     } else {
         snprintf(s_on_stream, sizeof(s_on_stream), "%s", local_only ? path : stream);
-        snprintf(s_on_lrc, sizeof(s_on_lrc), "%s", lrc);
-        snprintf(s_on_cover, sizeof(s_on_cover), "%s", jpg);
         s_on_stream_local = (local_only != 0);
-        s_on_ready_idx = req->idx;
-        s_on_ready     = true;      /* 最后置位：上面的字段先写好 */
+        /* 封面/歌词缓冲：**所有权转给 LVGL 任务**（只有它在消费时释放，
+         * 见 s_on_cover_data 的注释与 online_discard_ready） */
+        s_on_cover_data = jpg;
+        s_on_cover_len  = jpg_len;
+        s_on_lrc_data   = lrc;
+        s_on_lrc_len    = lrc_len;
+        s_on_ready_idx  = req->idx;
+        s_on_ready_seq  = req->seq;
+        s_on_ready      = true;      /* 最后置位：上面的字段先写好 */
     }
     s_on_busy = false;
     free(req);
@@ -1280,8 +1479,10 @@ static void online_prepare_task(void *arg)
  * 起播一首在线歌（LVGL 任务上下文）。
  * uri 可能是 https 流地址（s_on_stream）或本地缓存路径（下载兜底）：
  * audio_service_play_uri() 两种都认。
+ * 封面/歌词走内存缓冲（s_on_cover_data / s_on_lrc_data，PSRAM，不落 SD）：
+ *   歌词在这里解析完就释放；封面转交给 cover_kick 的解码请求（请求独占）。
  */
-static void start_track_online_at(int idx, const char *uri, const char *cover_jpg)
+static void start_track_online_at(int idx, const char *uri)
 {
     if (!s_on_songs || idx < 0 || (size_t)idx >= s_on_count || !uri || !uri[0]) {
         return;
@@ -1292,23 +1493,27 @@ static void start_track_online_at(int idx, const char *uri, const char *cover_jp
     s_index      = idx;
     s_resume_ms  = 0;
     s_elapsed_ms = 0;
-    s_dur_ms     = 0;
+    s_dur_ms     = s_on_dur_ms;      /* 在线总时长（估算值；未知则为 0） */
+    s_seeking    = false;
     s_lyric_cur  = -1;
     s_save_ticks = 0;
     s_resume_wait = 0;
     snprintf(s_track_path, sizeof(s_track_path), "%s", uri);
-    snprintf(s_cover_jpg, sizeof(s_cover_jpg), "%s", cover_jpg ? cover_jpg : "");
 
-    /* 歌词：流式播放时音频在网络上，只有我们缓存的 .lrc 文件（独立路径）；
-     * 下载兜底时用"同目录同名 .lrc"的老规则 */
-    esp_err_t lrc_ret = ESP_ERR_NOT_FOUND;
-    if (s_on_lrc[0]) {
-        lrc_ret = media_meta_lyrics_load_file(s_on_lrc, &s_lrc);
+    /* 歌词：直接从内存里的 LRC 文本解析（不再读 SD 上的 .lrc 文件）。
+     * 解析会把每一行拷进 s_lrc，所以这里解析完就可以释放缓冲。 */
+    bool lrc_ok = false;
+    if (s_on_lrc_data) {
+        lrc_ok = (media_meta_lrc_parse(s_on_lrc_data, &s_lrc) == ESP_OK && s_lrc.count > 0);
+        free(s_on_lrc_data);
+        s_on_lrc_data = NULL;
+        s_on_lrc_len  = 0;
     }
-    if (lrc_ret != ESP_OK) {
-        lrc_ret = media_meta_lyrics_load(uri, &s_lrc);
+    /* 下载兜底（本地音频文件）：音频文件旁/全局 lrc 目录若还有边车歌词，兜底找一次 */
+    if (!lrc_ok && s_on_stream_local) {
+        lrc_ok = (media_meta_lyrics_load(uri, &s_lrc) == ESP_OK && s_lrc.count > 0);
     }
-    if (lrc_ret != ESP_OK) {
+    if (!lrc_ok) {
         media_meta_lrc_reset(&s_lrc);
     }
     if (s_p_title) {
@@ -1321,6 +1526,14 @@ static void start_track_online_at(int idx, const char *uri, const char *cover_jp
     if (s_lyric_mode) {
         update_lyric_highlight();
     }
+
+    /*
+     * ★ 重新挂上"缓冲中"提示：上面的 lyric_rebuild()/lyric_apply_mode() 会把说明行
+     * 交回歌词，但这时音频的 HTTP 流**还没开始下**（audio_service_play_uri 就在
+     * 下面几行）—— 而"缓冲中 xx%"最有意义的就是接下来这一段。tick_cb 会把它刷成
+     * 百分比，等真的出声（audio_service_output_active）再交回 lyric_apply_mode()。
+     */
+    set_buffering_hint();
 
     cover_show(NULL, 0, 0);
     cover_reap();
@@ -1354,6 +1567,58 @@ static void start_track_online_at(int idx, const char *uri, const char *cover_jp
 }
 
 /*
+ * ★ 在线切歌的"界面先行"：**先把播放器页切成目标歌曲，再显示缓冲信息**。
+ *
+ * 为什么要这样（用户 2026-10 提的）：点歌到真正起播之间有 1~3 秒
+ * （解析 302 地址 + 抓封面 + 取歌词，都在工作线程里），这段时间如果界面上
+ * 还留着**上一首**的标题/歌手/封面/歌词，看起来就是"点了没反应、切歌没生效"。
+ * 现在点下去就先把目标歌曲的信息铺上去，随后再由 tick_cb 在右栏说明行上
+ * 打"缓冲中… xx%"。
+ *
+ * 只动 UI 与几个状态量，**不碰播放器**：停旧歌由调用方负责（先停再调本函数），
+ * 封面/歌词等音频就绪后由 start_track_online_at() 再写一遍同一套字段（幂等）。
+ */
+static void online_switch_ui_to(int idx)
+{
+    if (!s_on_songs || idx < 0 || (size_t)idx >= s_on_count) {
+        return;
+    }
+    const online_song_t *song = &s_on_songs[idx];
+
+    if (s_p_title) {
+        lv_label_set_text(s_p_title, song->title);
+    }
+    if (s_p_artist) {
+        lv_label_set_text(s_p_artist, song->artist[0] ? song->artist : "未知歌手");
+    }
+    /* 总时长/进度都还不知道：给占位值（tick 里对 s_dur_ms == 0 处处有保护） */
+    if (s_p_tot) {
+        lv_label_set_text(s_p_tot, "--:--");
+    }
+    if (s_p_cur) {
+        lv_label_set_text(s_p_cur, "0:00");
+    }
+    if (s_p_seek) {
+        lv_bar_set_value(s_p_seek, 0, LV_ANIM_OFF);
+    }
+    s_elapsed_ms = 0;
+    s_dur_ms     = 0;
+    s_buf_show   = false;      /* 让 set_buffering_hint() 重新置位（下面调用方会调） */
+    s_seeking    = false;
+
+    /* 封面：先退回占位（别把上一首的封面留在屏上），就绪后再解新的 */
+    cover_show(NULL, 0, 0);
+    cover_reap();
+    s_cover_want = idx;
+
+    /* 歌词：先清空并重画（此时新歌词还没抓到），别继续显示上一首的歌词；
+     * lyric_rebuild() 会顺带把右栏说明行切成"暂无歌词"，紧接着调用方的
+     * set_buffering_hint() 会把它改成"缓冲中…"。 */
+    media_meta_lrc_reset(&s_lrc);
+    lyric_rebuild();
+}
+
+/*
  * 在线音乐 app 的入口：把一份在线歌单交给播放器并从第 idx 首开始播。
  * **必须在 LVGL 任务上下文调用**（会更新播放器页控件）。
  */
@@ -1366,28 +1631,28 @@ void app_music_play_online(const online_song_t *songs, size_t count, size_t idx)
     s_on_count = count;
     s_on_mode  = true;
     s_index    = (int)idx;
-    s_on_ready = false;
-    s_on_ready_idx = -1;
+    s_on_seq++;
+    online_discard_ready();      /* 点歌即弃：旧结果（若有）不再起播 */
     s_on_failed = false;
     s_on_req   = (int)idx;
-    ui_toast("正在获取在线歌曲…", 1500);
-    online_prepare_kick();
-}
 
-/* 在线模式下提前把"下一首"下下来，切歌时就不用等（尽力而为）。
- * 注意：预取也会置 s_on_ready，tick 里要区分"要播的"和"预取的"。 */
-static void online_prefetch_next(void)
-{
-    if (!s_on_mode || !s_on_songs || s_on_count < 2 || s_on_busy || s_on_req >= 0) {
-        return;
+    /*
+     * ★ 点击必须**立刻有反馈**：
+     *   1) 先把正在播的那首停掉（否则旧歌会一直唱到新歌的"地址解析 + 封面 +
+     *      歌词"全都就绪，实测这张网要 1~3 秒，听感就是"点了没反应"）；
+     *   2) **再把播放器页切成目标歌曲**（标题/歌手/封面占位/歌词清空/进度归零）；
+     *   3) 最后才显示缓冲信息（说明行"缓冲中… xx%"，tick 里刷百分比）。
+     * 顺序很关键：用户要的是"先看到切到了哪首，再看到它在缓冲"。
+     */
+    audio_service_stop();
+    s_playing = false;
+    if (s_p_btn) {
+        lv_label_set_text(lv_obj_get_child(s_p_btn, 0), LV_SYMBOL_PLAY);
     }
-    const int next = ((int)s_index + 1) % (int)s_on_count;
-    if (next == (int)s_index || next == s_prefetch_idx) {
-        return;
-    }
-    s_prefetch_idx = next;
-    s_on_req       = next;
-    s_on_prefetch  = true;
+    online_switch_ui_to((int)idx);
+    ui_toast("缓冲中，请稍后...", 1500);
+    set_buffering_hint();
+    online_prepare_kick();
 }
 
 /*
@@ -1470,18 +1735,6 @@ static void build_cover_view(lv_obj_t *parent)
     lv_image_set_inner_align(s_p_cover_img, LV_IMAGE_ALIGN_COVER);
     lv_obj_remove_flag(s_p_cover_img, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(s_p_cover_img, LV_OBJ_FLAG_HIDDEN);
-
-    /* 下沿提示：垫深色半透明底，压在任何封面上都看得清 */
-    s_p_cover_hint = lv_label_create(cover);
-    lv_obj_set_style_text_font(s_p_cover_hint, UI_FONT_SMALL, LV_PART_MAIN);
-    lv_obj_set_style_text_color(s_p_cover_hint, UI_COLOR_FG, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(s_p_cover_hint, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_p_cover_hint, LV_OPA_50, LV_PART_MAIN);
-    lv_obj_set_style_radius(s_p_cover_hint, UI_PX_H(9), LV_PART_MAIN);
-    lv_obj_set_style_pad_hor(s_p_cover_hint, UI_PX_W(8), LV_PART_MAIN);
-    lv_obj_set_style_pad_ver(s_p_cover_hint, UI_PX_H(2), LV_PART_MAIN);
-    lv_label_set_text(s_p_cover_hint, "轻点查看歌词");
-    lv_obj_align(s_p_cover_hint, LV_ALIGN_BOTTOM_MID, 0, -UI_PX_H(8));
 }
 
 /* ------------------------------------------------------------------ 右栏：歌词（封面右侧） */
@@ -1516,31 +1769,48 @@ static void lyric_rebuild(void)
 }
 
 /*
- * 展开/收起：歌词区**始终占着那块空间**，只切里面"提示"和"歌词列"的可见性，
- * 这样展开歌词不会把下面的进度条与控制排顶来顶去。
- * 展开但确实没有歌词时，提示改成"暂无歌词"，而不是给一块空白。
+ * 在线歌的"解析地址 + 抓封面 + 取歌词"是异步的（实测 1~3 秒）。
+ * 这段时间右栏说明行显示"缓冲中，请稍后..."，让用户看到明确的等待状态；
+ * 起播时 start_track_online_at() 会走 lyric_rebuild() → lyric_apply_mode()
+ * 把它恢复成 歌词 / 暂无歌词。
+ *
+ * 置 s_buf_show 之后，tick_cb 会把它刷成"缓冲中… xx%"（在线流式的下载进度），
+ * 并在真的出声时交回 lyric_apply_mode()。
+ */
+static void set_buffering_hint(void)
+{
+    if (!s_p_lyric_hint) {
+        return;
+    }
+    s_buf_show = true;
+    lv_obj_remove_flag(s_p_lyric_hint, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(s_p_lyric_hint, "缓冲中，请稍后...");
+}
+
+/*
+ * 歌词**常驻显示**（需求：不再用"点封面显示/隐藏"）。
+ * 有歌词就显示歌词列、没歌词就显示"暂无歌词"，封面那块也不再是切换按钮，
+ * 只是封面本身。s_lyric_mode 保留但恒为 true，历史分支不再改可见性。
  */
 static void lyric_apply_mode(void)
 {
     const bool has_lyric = (s_p_lyric_n > 0);
+    s_lyric_mode = true;
 
     if (s_p_lyric_hint) {
-        if (s_lyric_mode && has_lyric) {
+        if (has_lyric) {
             lv_obj_add_flag(s_p_lyric_hint, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_remove_flag(s_p_lyric_hint, LV_OBJ_FLAG_HIDDEN);
-            lv_label_set_text(s_p_lyric_hint, s_lyric_mode ? "暂无歌词" : "轻点封面显示歌词");
+            lv_label_set_text(s_p_lyric_hint, "暂无歌词");
         }
     }
     if (s_p_lyric_col) {
-        if (s_lyric_mode && has_lyric) {
+        if (has_lyric) {
             lv_obj_remove_flag(s_p_lyric_col, LV_OBJ_FLAG_HIDDEN);
         } else {
             lv_obj_add_flag(s_p_lyric_col, LV_OBJ_FLAG_HIDDEN);
         }
-    }
-    if (s_p_cover_hint) {
-        lv_label_set_text(s_p_cover_hint, s_lyric_mode ? "轻点收起歌词" : "轻点查看歌词");
     }
 }
 
@@ -1618,6 +1888,10 @@ static lv_obj_t *page_player(void)
     lv_obj_set_style_pad_row(right, UI_PX_H(10), LV_PART_MAIN);
     lv_obj_remove_flag(right, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 播放器页会被路由压栈打开（首页/本地/在线都会进这里）：返回键由
+     * ui_core 的全局返回键自动叠在顶层，这里不再自己画。标题行仍按
+     * UI_HEADER_TEXT_X 起排，给左侧按钮留位。 */
+
     /* 标题与副标题用独立的 block 元素，不要塞进同一个 label 的 inline span */
     s_p_title = lv_label_create(right);
     lv_obj_set_style_text_font(s_p_title, UI_FONT_TITLE, LV_PART_MAIN);
@@ -1666,6 +1940,10 @@ static lv_obj_t *page_player(void)
     lv_obj_add_event_cb(s_p_seek_hit, on_seek_press, LV_EVENT_PRESSED, NULL);
     lv_obj_add_event_cb(s_p_seek_hit, on_seek_press, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(s_p_seek_hit, on_seek_release, LV_EVENT_RELEASED, NULL);
+    /* 手指滑出抓取区时 LVGL 只发 PRESS_LOST，不发 RELEASED：不处理的话
+     * s_seeking 会永久停在 true，tick 里的进度更新全被跳过 —— 表现就是
+     * "进度条概率性不再动/像消失了"。这里一并按松手处理。 */
+    lv_obj_add_event_cb(s_p_seek_hit, on_seek_lost, LV_EVENT_PRESS_LOST, NULL);
 
     /* 只要进度条本体：用 lv_bar（没有 knob 部件），不要拖拽小圆点 */
     s_p_seek = lv_bar_create(s_p_seek_hit);
@@ -1678,6 +1956,10 @@ static lv_obj_t *page_player(void)
     lv_obj_set_style_bg_color(s_p_seek, UI_COLOR_PILL, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_p_seek, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(s_p_seek, UI_PX_H(5), LV_PART_MAIN);
+    /* 描边保证"时长未知 / 进度为 0"时轨道也一定看得见 */
+    lv_obj_set_style_border_width(s_p_seek, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(s_p_seek, UI_COLOR_FG_DIM, LV_PART_MAIN);
+    lv_obj_set_style_border_opa(s_p_seek, LV_OPA_60, LV_PART_MAIN);
     lv_obj_set_style_bg_color(s_p_seek, UI_COLOR_ACCENT, LV_PART_INDICATOR);
     lv_obj_set_style_radius(s_p_seek, UI_PX_H(5), LV_PART_INDICATOR);
 
@@ -1770,15 +2052,68 @@ static lv_obj_t *page_player(void)
 static lv_obj_t *s_list_col;
 static lv_obj_t *s_list_hint;
 static char      s_cur_dir[STORAGE_PATH_MAX] = "/sdcard";
-static fs_entry_t *s_entries;                 /* 目录条目缓冲（PSRAM，一次分配） */
-static int        s_entry_n;
+static fs_entry_t *s_entries;                 /* 目录条目缓冲（PSRAM，按需扩容） */
+static size_t    s_entries_cap;               /* s_entries 的容量（条） */
+static int        s_entry_n;                  /* 当前目录的条目总数 */
+static int        s_page;                     /* 当前页（从 0 开始） */
 
 #define LOCAL_ROOT   "/sdcard"
+
+/*
+ * 一页最多画这么多行。
+ *
+ * 为什么要分页而不是一次把 2000 条全建出来：每行是 5~6 个 LVGL 对象，2000 条就是
+ * 上万个对象 —— 建页要几百毫秒、滚动每帧都在遍历它们，越"全"越卡。分页后对象数
+ * 有上界，任何规模的目录都能秒开，而且**所有歌都翻得到**（完整性问题不能靠截断解决，
+ * 靠分页解决）。播放队列仍然是整个目录（见 storage_service_load_dir），所以
+ * 上一首/下一首在整目录里轮转，跟翻不翻页无关。
+ */
+#define LOCAL_PAGE_ROWS   120
+
+/* local_add_row 的 sel 取值：>=0 是 s_entries 的下标，负数是这几种动作行 */
+#define LOCAL_SEL_NONE    (-1)   /* 提示行，不可点 */
+#define LOCAL_SEL_PARENT  (-2)   /* ".." 上一级 */
+#define LOCAL_SEL_PREV    (-3)   /* 上一页 */
+#define LOCAL_SEL_NEXT    (-4)   /* 下一页 */
 
 static void local_rebuild(void);
 static void on_local_entry(lv_event_t *e);
 
-/* 一行：图标 + 名字（+ 文件大小）。sel: 0 = ".."，>0 = s_entries[sel-1] */
+/*
+ * 确保条目缓冲至少能装 need 条。按 64 → 翻倍 → 上限的顺序扩容，优先 PSRAM
+ * （一条 fs_entry_t 264 字节，2000 条就是 ~516 KB，放内部 RAM 会把 WiFi/音频挤掉）。
+ * 返回能否满足。
+ */
+#define LOCAL_ENTRIES_MAX  8192
+
+static bool local_reserve_entries(size_t need)
+{
+    if (need <= s_entries_cap) {
+        return true;
+    }
+    if (need > LOCAL_ENTRIES_MAX) {
+        need = LOCAL_ENTRIES_MAX;
+    }
+    size_t cap = s_entries_cap ? s_entries_cap : 64;
+    while (cap < need) {
+        cap *= 2;
+    }
+    fs_entry_t *p = (fs_entry_t *)heap_caps_realloc(s_entries, cap * sizeof(fs_entry_t),
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        p = (fs_entry_t *)realloc(s_entries, cap * sizeof(fs_entry_t));
+    }
+    if (!p) {
+        ESP_LOGE(TAG, "local: entry buffer grow to %u failed", (unsigned)cap);
+        return false;
+    }
+    s_entries     = p;
+    s_entries_cap = cap;
+    ESP_LOGI(TAG, "local: entry buffer -> %u entries", (unsigned)cap);
+    return s_entries_cap >= need;
+}
+
+/* 一行：图标 + 名字（+ 文件大小）。sel 见 LOCAL_SEL_* / s_entries 下标 */
 static void local_add_row(const char *name, bool is_dir, bool is_audio, uint32_t size, int sel)
 {
     if (!s_list_col) {
@@ -1838,57 +2173,143 @@ static void local_add_row(const char *name, bool is_dir, bool is_audio, uint32_t
     lv_obj_add_event_cb(row, on_local_entry, LV_EVENT_CLICKED, (void *)(intptr_t)sel);
 }
 
-static void local_rebuild(void)
+/* 只重画"当前页"的行（不碰数据）：翻页走这里，不重读 SD 目录，翻页是瞬时的 */
+static void local_render(void)
 {
-    if (!s_list_col || !s_entries) {
+    if (!s_list_col) {
         return;
     }
     lv_obj_clean(s_list_col);
 
-    if (s_list_hint) {
-        lv_label_set_text(s_list_hint, s_cur_dir);
+    const int pages = (s_entry_n + LOCAL_PAGE_ROWS - 1) / LOCAL_PAGE_ROWS;
+    if (pages <= 0) {
+        s_page = 0;
+    } else if (s_page >= pages) {
+        s_page = pages - 1;
+    } else if (s_page < 0) {
+        s_page = 0;
+    }
+    const int first = s_page * LOCAL_PAGE_ROWS;
+    int last = first + LOCAL_PAGE_ROWS;
+    if (last > s_entry_n) {
+        last = s_entry_n;
     }
 
-    s_entry_n = storage_service_browse(s_cur_dir, s_entries, STORAGE_BROWSE_MAX);
-    if (s_entry_n < 0) {
-        s_entry_n = 0;
-        local_add_row("读取目录失败", false, false, 0, -1);
-        return;
+    if (s_list_hint) {
+        if (pages > 1) {
+            lv_label_set_text_fmt(s_list_hint, "%s · 第 %d/%d 页 · 共 %d 项",
+                                  s_cur_dir, s_page + 1, pages, s_entry_n);
+        } else {
+            lv_label_set_text_fmt(s_list_hint, "%s · 共 %d 项", s_cur_dir, s_entry_n);
+        }
     }
-    /* 队列 = 当前目录这一层的音频（上一首/下一首也在这个目录里轮转） */
-    storage_service_load_dir(s_cur_dir);
 
     if (strcmp(s_cur_dir, LOCAL_ROOT) != 0) {
-        local_add_row("..", true, false, 0, 0);      /* 返回上一级（根目录不给） */
+        local_add_row("..", true, false, 0, LOCAL_SEL_PARENT);   /* 返回上一级（根目录不给） */
     }
-    for (int i = 0; i < s_entry_n; i++) {
+    for (int i = first; i < last; i++) {
         local_add_row(s_entries[i].name, s_entries[i].is_dir,
-                      s_entries[i].is_audio, s_entries[i].size, i + 1);
+                      s_entries[i].is_audio, s_entries[i].size, i);
+    }
+    if (s_page > 0) {
+        local_add_row(LV_SYMBOL_LEFT " 上一页", false, false, 0, LOCAL_SEL_PREV);
+    }
+    if (last < s_entry_n) {
+        local_add_row("下一页 " LV_SYMBOL_NEXT, false, false, 0, LOCAL_SEL_NEXT);
     }
     if (s_entry_n == 0) {
         /* 空目录：根目录直接提示；子目录此时上面已经有 ".." 那一行，
          * 再补一条说明，免得看着像一个坏掉/空的列表 */
-        local_add_row("（这个目录没有文件）", false, false, 0, -1);
+        local_add_row("（这个目录没有文件）", false, false, 0, LOCAL_SEL_NONE);
     }
+}
+
+/* 换目录：重读条目 → 重建播放队列 → 重画第一页 */
+static void local_rebuild(void)
+{
+    if (!s_list_col) {
+        return;
+    }
+
+    /*
+     * 取目录条目：先按当前容量取一次，browse 返回的是**真实条数**（可能大于容量）。
+     * 装不下就扩容重来 —— 容量翻倍增长，所以最多几轮就够，任何规模的目录都能列全。
+     * （旧代码把容量写死 64 条且不看返回值，目录一大就静默只剩前 64 条。）
+     */
+    s_entry_n = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (!s_entries && !local_reserve_entries(64)) {
+            break;
+        }
+        const int got = storage_service_browse(s_cur_dir, s_entries, (int)s_entries_cap);
+        if (got < 0) {
+            s_entry_n = -1;
+            break;
+        }
+        s_entry_n = got;
+        if ((size_t)got <= s_entries_cap) {
+            break;                                  /* 全装下了 */
+        }
+        const size_t cap_before = s_entries_cap;
+        if (!local_reserve_entries((size_t)got)) {
+            break;                                  /* 分配失败：按现有容量列 */
+        }
+        if (s_entries_cap == cap_before) {
+            break;   /* 已到 LOCAL_ENTRIES_MAX，再扫一遍目录也是同样结果 */
+        }
+    }
+    if (s_entry_n < 0) {
+        s_entry_n = 0;
+        lv_obj_clean(s_list_col);
+        local_add_row("读取目录失败", false, false, 0, LOCAL_SEL_NONE);
+        return;
+    }
+    /*
+     * 不变量：s_entry_n 必须 ≤ 缓冲容量 —— 下面按页取 s_entries[i] 的下标，
+     * 一旦 n 大于容量就会越界读（目录条目超过 LOCAL_ENTRIES_MAX 时只列前
+     * LOCAL_ENTRIES_MAX 条，并留下日志）。
+     */
+    if ((size_t)s_entry_n > s_entries_cap) {
+        ESP_LOGW(TAG, "local: %d entries but buffer holds %u — listing the first %u",
+                 s_entry_n, (unsigned)s_entries_cap, (unsigned)s_entries_cap);
+        s_entry_n = (int)s_entries_cap;
+    }
+
+    /* 队列 = 当前目录这一层的**全部**音频（上一首/下一首在整目录里轮转，与翻页无关） */
+    storage_service_load_dir(s_cur_dir);
+
+    local_render();
 }
 
 static void on_local_entry(lv_event_t *e)
 {
     const int sel = (int)(intptr_t)lv_event_get_user_data(e);
-    if (sel < 0) {
+    if (sel == LOCAL_SEL_NONE) {
         return;
     }
-    if (sel == 0) {                                  /* ".." 上一级 */
+    if (sel == LOCAL_SEL_PARENT) {                   /* ".." 上一级 */
         char *slash = strrchr(s_cur_dir, '/');
         if (slash && slash != s_cur_dir) {
             *slash = '\0';
         } else {
             snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", LOCAL_ROOT);
         }
+        s_page = 0;
         local_rebuild();
         return;
     }
-    const fs_entry_t *en = &s_entries[sel - 1];
+    if (sel == LOCAL_SEL_PREV || sel == LOCAL_SEL_NEXT) {
+        s_page += (sel == LOCAL_SEL_NEXT) ? 1 : -1;
+        if (s_page < 0) {
+            s_page = 0;
+        }
+        local_render();          /* 只重画一页：不重读 SD 目录，翻页是瞬时的 */
+        return;
+    }
+    if (sel < 0 || sel >= s_entry_n) {
+        return;
+    }
+    const fs_entry_t *en = &s_entries[sel];
 
     char full[STORAGE_PATH_MAX];
     int n = snprintf(full, sizeof(full), "%s/%s", s_cur_dir, en->name);
@@ -1899,6 +2320,7 @@ static void on_local_entry(lv_event_t *e)
 
     if (en->is_dir) {
         snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", full);
+        s_page = 0;
         local_rebuild();
         return;
     }
@@ -1938,11 +2360,13 @@ static lv_obj_t *page_local(void)
     lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);
     lv_obj_set_style_pad_top(scr, UI_STATUSBAR_H + UI_PAGE_PAD, LV_PART_MAIN);
 
+    /* 本地音乐页由路由压栈进入：返回键由 ui_core 全局返回键自动叠在顶层，
+     * 这里不再自己画。标题按 UI_HEADER_TEXT_X 起排，给左侧按钮留位。 */
     lv_obj_t *head = lv_label_create(scr);
     lv_obj_set_style_text_font(head, UI_FONT_TITLE, LV_PART_MAIN);
     lv_obj_set_style_text_color(head, UI_COLOR_FG, LV_PART_MAIN);
     lv_label_set_text(head, "本地音乐");
-    lv_obj_align(head, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_align(head, LV_ALIGN_TOP_LEFT, UI_HEADER_TEXT_X, 0);
 
     s_list_hint = lv_label_create(scr);
     lv_obj_set_style_text_font(s_list_hint, UI_FONT_SMALL, LV_PART_MAIN);
@@ -1966,20 +2390,21 @@ static lv_obj_t *page_local(void)
     lv_obj_set_style_bg_opa(s_list_col, LV_OPA_60, LV_PART_SCROLLBAR);
     lv_obj_set_style_radius(s_list_col, UI_PX_W(3), LV_PART_SCROLLBAR);
 
+    /* （返回键已由 ui_core 全局返回键承担，且它挂在 lv_layer_top 上、
+     *   z 序永远高于本页的 s_list_col，不会再出现"列表盖住返回键"的问题） */
+
     lv_obj_add_event_cb(scr, local_page_watch, LV_EVENT_DELETE, NULL);
 
     if (!bsp_sdcard_is_mounted()) {
         lv_label_set_text(s_list_hint, "未检测到 SD 卡");
-        local_add_row("未检测到 SD 卡，仅在线音乐可用", false, false, 0, -1);
+        local_add_row("未检测到 SD 卡，仅在线音乐可用", false, false, 0, LOCAL_SEL_NONE);
         return scr;
     }
-    if (!s_entries) {
-        s_entries = (fs_entry_t *)malloc((size_t)STORAGE_BROWSE_MAX * sizeof(fs_entry_t));
-        if (!s_entries) {
-            local_add_row("内存不足，无法列出文件", false, false, 0, -1);
-            return scr;
-        }
+    if (!local_reserve_entries(64)) {
+        local_add_row("内存不足，无法列出文件", false, false, 0, LOCAL_SEL_NONE);
+        return scr;
     }
+    s_page = 0;
     snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", bsp_sdcard_mount_point());
     local_rebuild();
     ESP_LOGI(TAG, "local browser at %s", s_cur_dir);
@@ -2045,6 +2470,7 @@ static void restore_last_session(void)
     s_index      = idx;
     s_elapsed_ms = pos;
     s_dur_ms     = 0;
+    s_seeking    = false;
     s_resume_ms  = pos;
     s_save_ticks = 0;
     s_resume_wait = 0;

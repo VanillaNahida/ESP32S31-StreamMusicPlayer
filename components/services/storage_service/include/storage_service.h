@@ -55,8 +55,15 @@ bool storage_service_is_audio(const char *name);
  * 返回条目数，负数为错误。
  */
 #define STORAGE_NAME_MAX    256    /* FATFS 单个文件名最长 255 字节 + NUL */
-#define STORAGE_BROWSE_MAX  64     /* 一次最多列这么多条（调用方给缓冲） */
 
+/*
+ * 返回值可能**大于** max：那说明目录里条目比缓冲多、out 里只装了前 max 条
+ * （排序后仍是最小的那批），真实条数就是返回值。调用方据此扩容后重调一次
+ * 即可拿全 —— 这样"缓冲给多大"由调用方决定，服务不再替它砍数据。
+ *
+ * 旧的 STORAGE_BROWSE_MAX = 64 就是"显示不全"的根因：一个目录超过 64 首时，
+ * 列表和播放队列都只剩前 64 条（而且是 readdir 顺序的前 64 条，不是字母序前 64）。
+ */
 typedef struct {
     char     name[STORAGE_NAME_MAX];
     bool     is_dir;
@@ -69,6 +76,9 @@ int storage_service_browse(const char *dir, fs_entry_t *out, int max);
 /*
  * 把某个目录**这一层**的音频文件设为播放队列（上一首/下一首就在这个目录里轮转），
  * 返回曲目数。浏览页每次进目录都会调它。
+ *
+ * 队列按目录内**实际音频文件数**动态扩容（不再有 64 条的固定上限）；
+ * 极端情况（单目录几万首）由服务内部的 TRACK_MAX 安全上限兜住，并打日志。
  */
 int storage_service_load_dir(const char *dir);
 

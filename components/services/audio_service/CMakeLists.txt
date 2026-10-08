@@ -8,6 +8,8 @@ idf_component_register(
         gmf_core
         media_meta
         bt_service
+        gmf_io
+        mbedtls
         play_state
 )
 

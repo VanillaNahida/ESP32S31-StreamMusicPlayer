@@ -852,9 +852,19 @@ esp_err_t bt_service_set_enabled(bool on)
     bt_settings_save_enabled(on);
     ESP_LOGI(TAG, "bt switch -> %s", on ? "on" : "off");
     if (on) {
+        /*
+         * 重新打开：先等一下再 init。
+         * esp_bt_audio_deinit() 之后，BTC 任务还要跑完它的收尾（A2DP 侧的
+         * g_a2dp_on_deinit 由 BTC 异步清），立刻重新注册 SBC SEP 会撞
+         * ESP_ERR_INVALID_STATE 并 abort。300 ms 足够它跑完；配合"钉在 BTC 核"
+         * 一起用（见 app_settings 里的 radio_toggle_task）。
+         */
+        vTaskDelay(pdMS_TO_TICKS(300));
         return bt_service_init();
     }
-    return bt_service_deinit();
+    const esp_err_t ret = bt_service_deinit();
+    vTaskDelay(pdMS_TO_TICKS(100));      /* 让控制器 deinit 收尾，别立刻又 init */
+    return ret;
 }
 
 /*

@@ -13,12 +13,16 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
 #include "esp_audio_simple_player.h"
-#include "esp_audio_simple_player_advance.h"   /* get_pipeline：拖动定位要用 */
+#include "esp_audio_simple_player_advance.h"   /* get_pipeline / register_io */
+#include "esp_gmf_io_http.h"                   /* 自己注册 http IO：放大流缓冲 */
+#include "esp_http_client.h"                   /* 事件钩子里读 Content-Length */
+#include "esp_crt_bundle.h"                    /* 音频流也做证书校验 */
 #include "esp_codec_dev.h"
 #include "bsp.h"
 #include "media_meta.h"
@@ -46,6 +50,16 @@ static audio_out_t       s_out = AUDIO_OUT_SPEAKER;   /* 当前输出通道（ou
 /* 当前播放的 VFS 路径：MUSIC_INFO 里若带不出码率，用它回文件里探测帧头 */
 #define AUDIO_PATH_MAX   (600)
 static char              s_cur_path[AUDIO_PATH_MAX];
+/* 本首是否已经真的出声（PCM 写到过 codec/蓝牙）。out_write_cb 里置位、
+ * 每次换曲清零；UI 用它把"缓冲中 xx%"换回歌词。 */
+static volatile bool     s_out_flowing;
+/* 在线流式的缓冲进度统计（见 stream_evt_hook / audio_service_stream_progress）：
+ *   s_stream_total/s_stream_got —— 事件钩子从 Content-Length 与收到的数据里数出来的；
+ *   s_stream_io                —— 我们注册进 ASP 池子的那个 http IO，进度优先问它
+ *                                 （esp_gmf_io_get_pos 是"真读到多少字节"，更准）。 */
+static volatile uint32_t s_stream_total;
+static volatile uint32_t s_stream_got;
+static esp_gmf_io_handle_t s_stream_io;
 
 /* ---------------------------------------------------------------- out 回调 */
 
@@ -58,6 +72,9 @@ static char              s_cur_path[AUDIO_PATH_MAX];
  */
 static int out_write_cb(uint8_t *data, int data_size, void *ctx)
 {
+    /* 有 PCM 真的送到 codec 了 —— 这就是"缓冲结束、开始出声"的信号，
+     * UI 用它把"缓冲中 xx%"换回歌词（见 audio_service_output_active） */
+    s_out_flowing = true;
     if (s_out == AUDIO_OUT_BLUETOOTH) {
         (void)bt_service_write_pcm(data, (size_t)data_size);
         return data_size;
@@ -240,6 +257,11 @@ static esp_err_t play_uri_locked(const char *uri, const char *local_path)
     /* 记下当前"路径"：本地是文件路径；在线流式记 URI（MUSIC_INFO 兜底探测用） */
     snprintf(s_cur_path, sizeof(s_cur_path), "%s", local_path ? local_path : uri);
 
+    /* 换曲：流缓冲的进度计数清零（钩子会重新填 total/got），出声标志也清掉 */
+    s_stream_total = 0;
+    s_stream_got   = 0;
+    s_out_flowing  = false;
+
     /* 播放前解除静音并开功放由事件回调负责 */
     s_info_valid = false;   /* 旧曲目的流信息作废 */
     /* 容器头部长度：MP3 要跳过 ID3v2 标签，拖动定位的字节换算才不会整体偏后。
@@ -291,10 +313,138 @@ esp_err_t audio_service_play_path(const char *vfs_abs_path)
  *   - s_cur_path 记的是 URI（进度记忆/日志用；在线曲目的"续播"由上层按歌曲 ID 处理）。
  * 传进来是绝对路径时自动走本地那条路，调用方不用判断。
  */
+/*
+ * 流式播放的缓冲：GMF 的 HTTP IO 默认只有 20 KB 环形缓冲（头文件里写死的宏，
+ * 没有 Kconfig 可调），Wi-Fi 一抖就容易 `Run timeout`。这里注册一个自己的
+ * http IO 覆盖池里那个默认的：
+ *   - 环形缓冲 **4 MB**：GMF 的分配器在 CONFIG_SPIRAM_BOOT_INIT=y 时优先用
+ *     PSRAM（esp_gmf_oal_mem.c 里就是 heap_caps_malloc(MALLOC_CAP_SPIRAM)），
+ *     所以这块缓冲落在 PSRAM，不占内部 RAM。4 MB ≈ 320 kbps 的 100 秒音频 ——
+ *     相当于"一次缓冲一大段"，网络抖动时靠这段顶着，不再几秒一卡。
+ *   - 每次读 8 KB（默认 3 KB），减少 TLS 记录边界上的往返；
+ *   - 挂上事件钩子：**统计已收字节 / 总字节**，给 UI 显示"缓冲中 xx%"；
+ *   - 顺手挂上证书包：音频流以前是不校验的。
+ * 只在第一次流式播放前做一次；失败就退回 ASP 默认的 IO（不影响播放）。
+ */
+#define STREAM_RING_BYTES   (4 * 1024 * 1024)
+
+/*
+ * HTTP IO 的事件钩子。返回值语义（见 esp_gmf_io_http.h）：
+ *   0 = 不干预，继续正常收发；-1 = 让 HTTP 客户端停下。
+ * 我们只**旁观**，永远返回 0。
+ *
+ *   HTTP_STREAM_FINISH_REQUEST：响应头已到手，此时能从 http_client 拿到
+ *                               Content-Length（分块传输时是 -1，那就显示不了百分比）；
+ *   HTTP_STREAM_ON_RESPONSE   ：收到一段数据（buffer_len 是本段字节数）。
+ */
+static int stream_evt_hook(http_stream_event_msg_t *msg)
+{
+    if (!msg) {
+        return 0;
+    }
+    switch (msg->event_id) {
+    case HTTP_STREAM_FINISH_REQUEST: {
+        const int64_t len = esp_http_client_get_content_length(
+                                (esp_http_client_handle_t)msg->http_client);
+        s_stream_total = (len > 0) ? (uint32_t)len : 0;
+        ESP_LOGI(TAG, "stream size %" PRId32 " bytes", (int32_t)len);
+        break;
+    }
+    case HTTP_STREAM_ON_RESPONSE:
+        if (msg->buffer_len > 0) {
+            s_stream_got += (uint32_t)msg->buffer_len;
+        }
+        break;
+    default:
+        break;
+    }
+    return 0;
+}
+
+static void ensure_stream_io(void)
+{
+    static bool done;
+    if (done || !s_player) {
+        return;
+    }
+    done = true;
+
+    http_io_cfg_t cfg = HTTP_STREAM_CFG_DEFAULT();
+    cfg.dir               = ESP_GMF_IO_DIR_READER;
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    cfg.event_handle      = stream_evt_hook;
+    cfg.io_cfg.buffer_cfg.io_size     = 8 * 1024;
+    cfg.io_cfg.buffer_cfg.buffer_size = STREAM_RING_BYTES;
+    cfg.io_cfg.thread.stack_in_ext    = true;
+
+    esp_gmf_io_handle_t io = NULL;
+    if (esp_gmf_io_http_init(&cfg, &io) != ESP_GMF_ERR_OK || !io) {
+        ESP_LOGW(TAG, "custom http io init failed, keep default");
+        return;
+    }
+    if (esp_audio_simple_player_register_io(s_player, io) != ESP_GMF_ERR_OK) {
+        ESP_LOGW(TAG, "register http io failed, keep default");
+        return;
+    }
+    s_stream_io = io;                 /* 进度查询要用（见 audio_service_stream_progress） */
+    ESP_LOGI(TAG, "stream io ready: ring %d KB (PSRAM), read %d KB",
+             (int)(cfg.io_cfg.buffer_cfg.buffer_size / 1024),
+             (int)(cfg.io_cfg.buffer_cfg.io_size / 1024));
+}
+
+bool audio_service_stream_progress(int *percent)
+{
+    if (!s_stream_io) {
+        return false;
+    }
+    /* 总长度：钩子从 Content-Length 拿到的优先，拿不到就问 IO 自己 */
+    uint32_t total = s_stream_total;
+    if (total == 0) {
+        uint64_t size = 0;
+        if (esp_gmf_io_get_size(s_stream_io, &size) == ESP_GMF_ERR_OK && size > 0) {
+            total = (size > UINT32_MAX) ? UINT32_MAX : (uint32_t)size;
+        }
+    }
+    if (total == 0) {
+        return false;                 /* 分块传输/未知长度：显示不了百分比 */
+    }
+
+    /*
+     * 已收字节：**优先问 IO 的读位置** —— 它按"实际读到多少字节"推进，是准的。
+     *
+     * 为什么不用钩子里的 s_stream_got 当主：ON_RESPONSE 是在**读之前**派发的，
+     * msg->buffer_len 是"这次想读多少"（我们的 io_size = 8 KB），不是真读到的字节数。
+     * 网络一慢（一次 TLS 记录只回来 1~2 KB），按 8 KB 累加就会冲到 100% 而实际远没下完。
+     * 所以那个计数只当兜底。
+     */
+    uint32_t got = 0;
+    uint64_t pos = 0;
+    if (esp_gmf_io_get_pos(s_stream_io, &pos) == ESP_GMF_ERR_OK && pos > 0) {
+        got = (pos > total) ? total : (uint32_t)pos;
+    } else {
+        got = s_stream_got;
+        if (got > total) {
+            got = total;
+        }
+    }
+    if (percent) {
+        *percent = (int)((uint64_t)got * 100 / total);
+    }
+    return true;
+}
+
+bool audio_service_output_active(void)
+{
+    return s_out_flowing;
+}
+
 esp_err_t audio_service_play_uri(const char *uri)
 {
     if (!s_player || !uri || !uri[0]) {
         return ESP_ERR_INVALID_ARG;
+    }
+    if (uri[0] != '/') {
+        ensure_stream_io();          /* 流式播放：换成大缓冲（PSRAM）的 http IO */
     }
     if (uri[0] == '/') {
         return audio_service_play_path(uri);

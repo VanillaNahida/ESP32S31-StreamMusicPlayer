@@ -50,6 +50,17 @@
 #define UI_HOME_CELL_H    UI_PX_H(140)   /* 首页格高 */
 #define UI_PAGE_PAD       UI_PX_W(8)     /* 页面安全区（不放可点元素） */
 
+/*
+ * 页面标题行的返回键。
+ *
+ * 左边缘 UI_EDGE_HOTZONE 是返回手势热区，它挂在 lv_layer_top 上、z 序高于页面，
+ * 所以标题行左侧的按钮**不能贴 x=0**：贴边的话左半截被热区吃掉，按了没反应。
+ * 按钮放在热区右侧，标题再让开按钮宽 + 间距。
+ */
+#define UI_BACK_BTN_X     UI_EDGE_HOTZONE
+#define UI_BACK_BTN_SIZE  UI_PX_H(36)
+#define UI_HEADER_TEXT_X  (UI_BACK_BTN_X + UI_BACK_BTN_SIZE + UI_PX_W(8))
+
 /* 主题色（深色） */
 #define UI_COLOR_BG          lv_color_hex(0x0B0B10)
 #define UI_COLOR_BG_ALT      lv_color_hex(0x121218)
@@ -70,11 +81,19 @@
 #define UI_COLOR_ICON_SETTINGS lv_color_hex(0x6E6E78)
 
 /*
- * 字体（M5 前先落一版能用的）：
+ * 字体：
  *
- * UI 文本用**自带的位图字体** ui_font_sc16（components/ui_font，由
- * tools/font/gen_lvgl_font.py 生成）：16 px 梦源黑体，**GB2312 全集 + ASCII +
- * LVGL 图标**。
+ * UI 文本用 components/ui_font 里的位图字体（由 tools/font/gen_lvgl_font.py 生成，
+ * 16 px 梦源黑体），一共三份、按 fallback 链串起来（见 ui_font.h）：
+ *
+ *   ui_font_sc16   GB2312 全集 + ASCII + LVGL 图标  4 bpp ← 中文/UI 主字体
+ *   ui_font_jp1_16 JIS X 0208 第 1 水準 + 日文记号   4 bpp ← 常用日文汉字
+ *   ui_font_jp2_16 JIS X 0208 第 2 水準              2 bpp ← 生僻日文汉字
+ *
+ * 为什么要有日文那两份：GB2312 是简体中文字符集，"鎖""転"这类**日文汉字**的码位
+ * 不在里面（中文是 锁/转，码位不同），日文曲名会缺字成方框。
+ * UI 代码只管用下面的宏 —— 指向的是 ui_font.c 里那个带 fallback 链的可写包装
+ * `ui_font_text`，**但必须先 ui_font_init()**（ui_core_init 的第一件事）才能用。
  *
  * 为什么不用 LVGL 内置的 lv_font_source_han_sans_sc_16_cjk：
  *   它只收 "1338 most common CJK radicals"，GB2312 里其余汉字一律渲染成
@@ -83,18 +102,16 @@
  * 为什么 SMALL 也指向它：
  *   UI_FONT_SMALL 被用在状态栏、列表提示、控制中心小药丸等**含中文**的标签上，
  *   而 lv_font_montserrat_14 完全没有汉字，结果就是那些中文全变方框。
- *   app 分区目前放得下一套 16 px 字库；等 M5 体积预算明确后再补 14 px 版本
- *   （见开发指南 5.5 的"梦源黑体 + 文泉驿等宽"方案）。
  *
  * 数字仍走蒙塞拉特，等宽数字（文泉驿微米黑）在 M5 接入。
  */
-LV_FONT_DECLARE(ui_font_sc16)
+#include "ui_font.h"
 
-#define UI_FONT_TEXT   (&ui_font_sc16)
-#define UI_FONT_TITLE  (&ui_font_sc16)
+#define UI_FONT_TEXT   (&ui_font_text)
+#define UI_FONT_TITLE  (&ui_font_text)
 #define UI_FONT_CLOCK  (&lv_font_montserrat_40)
 #define UI_FONT_NUM    (&lv_font_montserrat_20)
-#define UI_FONT_SMALL  (&ui_font_sc16)
+#define UI_FONT_SMALL  (&ui_font_text)
 
 #ifdef __cplusplus
 extern "C" {

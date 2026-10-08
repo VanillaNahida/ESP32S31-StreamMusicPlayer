@@ -11,14 +11,17 @@
  * 落盘（需求："抓取歌单后把歌单列表二进制保存在存储卡内"）：
  *   /sdcard/online/pl_<歌单ID>.bin     定长头 + 定长记录数组（见 online_service.cc）
  *   /sdcard/online/audio/<歌曲ID>.<ext>  已下载的音频（播放的就是它）
- *   /sdcard/online/audio/<歌曲ID>.lrc    歌词缓存：与音频**同目录同主名**，
- *                                        于是 media_meta_lyrics_load(音频路径)
- *                                        的第一档"同目录同名 .lrc"直接命中，
- *                                        播放端不需要任何在线专用分支
- *   /sdcard/online/cover/<歌曲ID>.jpg    封面缓存（在线封面是独立 jpg）
+ *
+ * 封面 / 歌词**只缓存在 PSRAM，不写 SD 卡**（2026-10 改）：
+ *   之前封面/歌词落 SD，切歌时读/写这些文件会让 SD 卡忙到"切歌阻塞"（日志里
+ *   一排 sdmmc_req 0x107 超时，封面还下成 0 字节）。现在下载后整段留在 PSRAM：
+ *     online_song_cover_data()  → 调用方拿到一张 malloc 的图片字节拷贝（JPEG/PNG）
+ *     online_song_lyrics_data() → 调用方拿到一段 malloc 的 LRC 文本
+ *   同一首歌二次请求直接命中内存缓存，不再碰网络与 SD。SD 上历史遗留的
+ *   cover/ 目录与 *.lrc 文件在 online_service_init() 时清掉。
  *
  * 为什么"先下载再播放"而不是直接流式播放：
- *   1) 播放通路与本地文件完全一致 —— 封面/歌词/进度/拖动定位这些"和本地一样"的
+ *   1) 播放通路与本地文件完全一致 —— 进度/拖动定位这些"和本地一样"的
  *      需求不用再写第二套；
  *   2) meting 的音频地址是 302 到 https CDN，先落地可以把 TLS/断流问题集中在
  *      下载这一处，播放时不再受网络抖动影响。
@@ -40,6 +43,7 @@ extern "C" {
 
 #define ONLINE_MAX_PLAYLISTS   8      /* 最多保存几个歌单 ID */
 #define ONLINE_ID_MAX          24
+#define ONLINE_NAME_MAX        40     /* 歌单显示名（用户可重命名，UTF-8 按字节算） */
 #define ONLINE_TITLE_MAX       128
 #define ONLINE_ARTIST_MAX      96
 #define ONLINE_URL_MAX         320
@@ -54,7 +58,8 @@ typedef struct {
     char     lrc_url[ONLINE_URL_MAX];
 } online_song_t;
 
-/* 初始化：建目录、读 NVS 里保存的歌单 ID 列表。可重复调用。 */
+/* 初始化：建目录、读 NVS 里保存的歌单 ID 列表、清掉历史遗留的 SD 封面/歌词。
+ * 可重复调用。 */
 esp_err_t online_service_init(void);
 
 /* 当前网络是否可用（WiFi 拿到 IP）——在线功能的前置条件 */
@@ -64,6 +69,29 @@ bool online_has_network(void);
 
 size_t      online_playlist_count(void);
 const char *online_playlist_id(size_t idx);
+/*
+ * 歌单的显示名（用户在界面上重命名过就是它）。
+ * 没起过名返回**空串**（不是 NULL）—— 展示决策交给 UI：一般退回显示 ID。
+ * idx 越界返回 NULL。
+ */
+const char *online_playlist_name(size_t idx);
+/* 重命名（存 NVS）；name 传 NULL 或空串 = 清掉自定义名，退回显示 ID */
+esp_err_t online_playlist_rename(size_t idx, const char *name);
+
+/* ---------------------------------------------------------------- 搜索历史
+ *
+ * 存 NVS（最多 ONLINE_HISTORY_MAX 条，**新的在最前**，同一关键词去重后提前）。
+ * 只存关键词本身，展示与交互（长按删单条 / 一键清空）由 UI 决定。
+ */
+#define ONLINE_HISTORY_MAX  10
+#define ONLINE_KW_MAX       64     /* 搜索关键词上限（UTF-8 按字节） */
+
+size_t      online_history_count(void);
+/* 第 idx 条关键词（0 = 最新）；越界返回 NULL */
+const char *online_history_at(size_t idx);
+esp_err_t   online_history_add(const char *kw);
+esp_err_t   online_history_remove(size_t idx);
+esp_err_t   online_history_clear(void);
 
 /*
  * 最近一次失败的可读原因（中文，给 UI 的 Toast 用）；没有失败过返回 NULL。
@@ -100,10 +128,17 @@ esp_err_t online_search(const char *keyword, online_song_t **out, size_t *count,
 /*
  * **流式播放**（默认路径，见文件头"设计选择"）：
  *   1) online_song_stream_url()      解析 302 拿到音频最终 https 地址（不下载）
- *   2) online_song_prepare_stream()  只抓封面/歌词（几十~几百 KB）
+ *   2) online_song_prepare_stream()  只抓封面/歌词（几十~几百 KB，进 PSRAM 缓存）
  *   3) 上层 audio_service_play_uri(最终地址) 边下边播
  */
 esp_err_t online_song_stream_url(const online_song_t *song, char *out, size_t cap);
+/*
+ * 同上，但顺带把**总时长**估出来（读 4 KB 前缀拿 MP3 码率 × Content-Length）。
+ * 在线流式播放拿不到 duration_ms（GMF 的 music info 恒为 "0 bps, 0 ms"），
+ * 所以播放器页/列表的"总时长"要靠它。out_bytes/out_dur_ms 可为 NULL。
+ */
+esp_err_t online_song_stream_info(const online_song_t *song, char *out, size_t cap,
+                                  int64_t *out_bytes, uint32_t *out_dur_ms);
 esp_err_t online_song_prepare_stream(const online_song_t *song);
 
 /*
@@ -112,13 +147,23 @@ esp_err_t online_song_prepare_stream(const online_song_t *song);
  */
 esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_t cap);
 
-/* 封面缓存路径（已下载则直接返回路径；没有就下载）。找不到返回 ESP_ERR_NOT_FOUND */
-esp_err_t online_song_cover(const online_song_t *song, char *jpg_path, size_t cap);
+/*
+ * 封面字节（PSRAM 缓存，不落 SD）。
+ * 成功时 *out 是**调用方所有**的 malloc 缓冲（PSRAM 优先，JPEG/PNG 原样字节），
+ * 用完 free()。同一首歌二次调用直接命中内存缓存（不再下载）。
+ * 没封面 URL / 没网返回 ESP_ERR_NOT_FOUND；下载失败返回对应错误码。
+ */
+esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_t *out_len);
 
-/* 歌词缓存路径（同上，内容是纯文本 LRC，可直接交给 media_meta_lrc_parse） */
-esp_err_t online_song_lyrics(const online_song_t *song, char *lrc_path, size_t cap);
+/*
+ * 歌词文本（PSRAM 缓存，不落 SD）。
+ * 成功时 *out 是**调用方所有**的 NUL 结尾 malloc 文本（UTF-8 原样，直接交给
+ * media_meta_lrc_parse），用完 free()。二次调用命中缓存。
+ * 没歌词 URL / 没网返回 ESP_ERR_NOT_FOUND；下载失败返回对应错误码。
+ */
+esp_err_t online_song_lyrics_data(const online_song_t *song, char **out, size_t *out_len);
 
-/* 清掉下载缓存（音频/封面/歌词），歌单二进制保留 */
+/* 清掉下载缓存（音频 SD 文件 + PSRAM 封面/歌词缓存），歌单二进制保留 */
 esp_err_t online_cache_clear(void);
 
 #ifdef __cplusplus

@@ -65,6 +65,25 @@ esp_err_t bsp_display_register_lvgl(lv_display_t **out_disp)
     disp_cfg.tear_avoid_mode = lcd_tear_mode(lcd_cfg->sub_cfg.rgb.panel_config.num_fbs);
 
     /*
+     * 绘制缓冲（LVGL 画一"条"，再 flush 给面板）。
+     *
+     * 默认宏给的是 buffer_height = 50 且 use_psram = false：
+     *   - 480 行 ÷ 50 = 一帧要 **10 次 flush**，每次 80 KB。滑屏动画每帧都是整屏
+     *     重绘，这 10 次调用的固定开销（每次都要按区域做 cache 回写 + 提交面板
+     *     传输）是实打实的白给；
+     *   - 80 KB 还占的是**内部 RAM** —— 本工程内部 RAM 只有 ~300 KB，WiFi/蓝牙/
+     *     音频都在抢。
+     *
+     * 改成 120 行 × 800 × 2 B = 192 KB，一帧 4 条；放 PSRAM（16 MB，不紧张）。
+     * 依据：esp_lvgl_adapter README「缓冲调优」——提高 buffer_height 减少 flush
+     * 次数、提升吞吐量，代价只是 RAM。
+     *
+     * 想回退/微调就改这两个数：48~120 都合理（越小越省 RAM、flush 越多）。
+     */
+    disp_cfg.profile.buffer_height = 120;
+    disp_cfg.profile.use_psram     = true;
+
+    /*
      * 打开 PPA（Pixel Processing Accelerator，带 2D-DMA）硬件加速。
      *
      * ESP32-S31 有 PPA（SOC_PPA_SUPPORTED / SOC_DMA2D_SUPPORTED 均为 1），

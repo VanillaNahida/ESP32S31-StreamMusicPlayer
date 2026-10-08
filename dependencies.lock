@@ -535,7 +535,7 @@ dependencies:
       require: private
       version: ^1.2.13
     source:
-      registry_url: https://components.espressif.com
+      registry_url: https://components.espressif.com/
       type: service
     version: 1.6.58~2
   espressif/usb:
@@ -649,9 +649,10 @@ direct_dependencies:
 - espressif/esp_lcd_touch_gt1151
 - espressif/esp_lvgl_adapter
 - espressif/led_strip
+- espressif/libpng
 - idf
 - lvgl/lvgl
 - lvgl_pinyin_ime
-manifest_hash: 4d651bdf567b4eea92008293f6fb55596fbf51b569a0c37a06628aab8195c6eb
+manifest_hash: 4398a2008c5affc03fff09fb173370496b6f632252c60f94623bba787705a9bc
 target: esp32s31
 version: 3.0.0

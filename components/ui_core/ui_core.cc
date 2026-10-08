@@ -122,6 +122,94 @@ void ui_cc_toggle(void) { ui_cc_apply_open(!ui_cc_state(), true); }
 void ui_drawer_open(void)  { ui_volume_hide(); ui_drawer_apply_open(true, true); }
 void ui_drawer_close(void) { ui_drawer_apply_open(false, true); }
 
+/* ------------------------------------------------------------------ 页面返回键 */
+
+/*
+ * 全局返回键：建在 lv_layer_top 上的一个圆钮，由 ui_router 在
+ * push / pop / init_home 之后调用 ui_back_button_update() 刷新显示状态。
+ *
+ * 显示条件（ui_router_top_needs_back）：栈深 > 1 且当前页 desc.no_back == false
+ * —— 首页与"自带返回钮"的设置页不显示，其余二级页（播放器 / 在线音乐 /
+ * 占位页…）自动就有返回键，页面里不用再画。
+ *
+ * z 序：本对象在 ui_core_init 里**最先**创建，排在它后面的控制中心 /
+ * 状态栏 / 抽屉 / Toast / 手势热区都会盖在它上面 —— 模态遮罩（app 运行时
+ * 新建在 layer_top 上的）也一样。于是：
+ *   - 控制中心 / 抽屉展开、搜索遮罩打开时返回键被盖住、点不到（符合预期）；
+ *   - 它们关闭后按钮自动恢复可见，无需额外代码。
+ */
+static lv_obj_t *s_back_btn;
+
+static void back_button_clicked(lv_event_t *e)
+{
+    (void)e;
+    ui_router_pop();
+}
+
+lv_obj_t *ui_back_button_global_create(lv_obj_t *parent)
+{
+    if (!parent) {
+        return NULL;
+    }
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, UI_BACK_BTN_SIZE, UI_BACK_BTN_SIZE);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_80, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, back_button_clicked, LV_EVENT_CLICKED, NULL);
+    /*
+     * 位置：与页面内容区第一行对齐 —— 页面 pad_top 是
+     * UI_STATUSBAR_H + UI_PAGE_PAD，标题行就落在那里；
+     * x 用 UI_BACK_BTN_X 让开左边缘手势热区（同手动返回键）。
+     */
+    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, UI_BACK_BTN_X, UI_STATUSBAR_H + UI_PAGE_PAD);
+
+    lv_obj_t *l = lv_label_create(btn);
+    lv_obj_set_style_text_font(l, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, UI_COLOR_FG, LV_PART_MAIN);
+    lv_label_set_text(l, LV_SYMBOL_LEFT);
+    lv_obj_center(l);
+
+    s_back_btn = btn;
+    ui_back_button_update();
+    return btn;
+}
+
+void ui_back_button_update(void)
+{
+    if (!s_back_btn) {
+        return;
+    }
+    const bool need = ui_router_top_needs_back();
+    if (need) {
+        lv_obj_remove_flag(s_back_btn, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_back_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+lv_obj_t *ui_back_button_create(lv_obj_t *parent, lv_align_t align)
+{
+    if (!parent) {
+        return NULL;
+    }
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, UI_BACK_BTN_SIZE, UI_BACK_BTN_SIZE);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(btn, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_80, LV_PART_MAIN);
+    lv_obj_add_event_cb(btn, back_button_clicked, LV_EVENT_CLICKED, NULL);
+    /* UI_BACK_BTN_X 让开了左侧手势热区，贴 x=0 的话左半截点不到（见头文件） */
+    lv_obj_align(btn, align, UI_BACK_BTN_X, 0);
+
+    lv_obj_t *l = lv_label_create(btn);
+    lv_obj_set_style_text_font(l, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, UI_COLOR_FG, LV_PART_MAIN);
+    lv_label_set_text(l, LV_SYMBOL_LEFT);
+    lv_obj_center(l);
+    return btn;
+}
+
 /* ------------------------------------------------------------------ 主题 */
 
 /*
@@ -149,6 +237,11 @@ static void ui_theme_init(void)
 
 esp_err_t ui_core_init(void)
 {
+    /* ★ 第一件事：把字体 fallback 链建起来（中文主字体 → 常用日文 → 生僻日文）。
+     * UI_FONT_TEXT/TITLE/SMALL 指向的 ui_font_text 在 ui_font_init() 之前是全零，
+     * 任何标签都必须在它之后再创建 —— 所以放在主题与控件之前（见 ui_font.h）。 */
+    ui_font_init();
+
     ui_theme_init();
 
     lv_obj_t *top = lv_layer_top();
@@ -157,7 +250,9 @@ esp_err_t ui_core_init(void)
 
     ui_metrics_selfcheck();
 
-    /* 全局层：状态栏在最上、控制中心与抽屉次之、Toast 最上 */
+    /* 全局层：返回键最先建（z 序最底，见 ui_back_button_global_create 的说明）：
+     * 控制中心 / 抽屉 / Toast / 模态遮罩展开时都能盖住它 */
+    ui_back_button_global_create(top);
     ui_cc_create(top);           /* 控制中心（默认隐藏） */
     lv_obj_t *sb = ui_status_bar_create(top);
     ui_toast_create(top);

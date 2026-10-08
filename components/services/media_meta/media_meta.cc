@@ -11,8 +11,9 @@
  *   歌曲同目录同名 .lrc → <SD>/lrc/<同名>.lrc → 内嵌 ID3（USLT，或 SYLT 转 LRC）
  *   最后一档取到后会**自动写入 <SD>/lrc/<同名>.lrc**，下次直接命中第二档。
  *
- * 封面：MP3 的 ID3v2 APIC/PIC、FLAC 的 PICTURE 块 → esp_new_jpeg 解成
- * RGB565（LVGL 可直接用），只解 JPEG（见文件后半段的说明）。
+ * 封面：MP3 的 ID3v2 APIC/PIC、FLAC 的 PICTURE 块 → 解成 RGB565（LVGL 可直接用）。
+ * JPEG 走 esp_new_jpeg，PNG 走官方 libpng 组件；两条路在 image_to_rgb565() 里
+ * 按文件魔数分派（APIC 的 MIME 字段常常是错的，不能拿它当依据）。
  */
 #include "media_meta.h"
 
@@ -26,6 +27,12 @@
 #include "esp_log.h"
 #include "esp_jpeg_dec.h"
 #include "esp_jpeg_common.h"
+#include "png.h"             /* 官方 libpng 组件的上游头（PNG 封面，见 image_to_rgb565） */
+#include "esp_heap_caps.h"   /* 全尺寸封面缓冲走 PSRAM */
+
+/* 全尺寸解码（JPEG/PNG）→ 盒式降采样。定义在文件末尾，这里先声明。 */
+static esp_err_t image_to_rgb565(const uint8_t *data, size_t len, int max_dim,
+                                 uint8_t **out_pixels, int *out_w, int *out_h);
 
 static const char *TAG = "media_meta";
 
@@ -140,7 +147,7 @@ static int cmp_line(const void *a, const void *b)
     return 0;
 }
 
-esp_err_t media_meta_lrc_parse(const char *text, lrc_t *out)
+static esp_err_t lrc_parse_utf8(const char *text, lrc_t *out)
 {
     if (!text || !out) {
         return ESP_ERR_INVALID_ARG;
@@ -295,9 +302,10 @@ int media_meta_lrc_index_at(const lrc_t *lrc, uint32_t pos_ms)
  *   FLAC 元数据块里的 PICTURE(type 6)
  * 其它容器（M4A 的 covr atom、OGG 的 METADATA_BLOCK_PICTURE）留到后续里程碑。
  *
- * 编码只解 JPEG（esp_new_jpeg）。PNG 封面会返回 ESP_ERR_NOT_SUPPORTED：
- * 本工程没有打开任何 PNG 解码器（LV_USE_LODEPNG / libpng 都没接进 UI 通路），
- * 硬塞一个 PNG 解码器不划算 —— 绝大多数专辑图是 JPEG。
+ * 编码：JPEG 走 esp_new_jpeg，PNG 走官方 libpng 组件（见 image_to_rgb565）。
+ * 实际按**文件魔数**分派，不看 MIME —— 不少 MP3 的 APIC 把 MIME 写成 image/jpeg
+ * 却塞的是 PNG（或反过来），信 MIME 会解不出来。
+ * 其它编码返回 ESP_ERR_NOT_SUPPORTED。
  */
 
 /* ---------------------------------------------------------- 字节序小工具 */
@@ -653,7 +661,7 @@ esp_err_t media_meta_cover_rgb565(const char *audio_path, int max_dim,
     }
     uint8_t *raw    = NULL;
     size_t   raw_sz = 0;
-    bool     is_png = false;
+    bool     is_png = false;   /* 只为日志：解码内部按魔数分派 */
     esp_err_t ret;
     if (strcasecmp(dot, ".mp3") == 0) {
         ret = id3_cover(f, &raw, &raw_sz, &is_png);
@@ -667,13 +675,8 @@ esp_err_t media_meta_cover_rgb565(const char *audio_path, int max_dim,
     if (ret != ESP_OK) {
         return ret;
     }
-    if (is_png) {
-        ESP_LOGI(TAG, "cover is PNG, not supported yet (skip)");
-        free(raw);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    ret = jpeg_to_rgb565(raw, raw_sz, max_dim, pixels, out_w, out_h);
+    /* PNG 也走同一条路（image_to_rgb565 内部按魔数分派） */
+    ret = image_to_rgb565(raw, raw_sz, max_dim, pixels, out_w, out_h);
     free(raw);
     if (ret == ESP_OK) {
         ESP_LOGI(TAG, "cover decoded %dx%d (max_dim=%d)", *out_w, *out_h, max_dim);
@@ -691,28 +694,35 @@ void media_meta_cover_free(uint8_t *pixels)
 }
 
 /*
- * 独立 JPEG 文件 → RGB565。
+ * 独立的封面图文件（JPEG 或 PNG）→ RGB565。
  *
- * 在线歌曲（网易云/Meting）的封面是一张单独的 .jpg，不在音频文件里，
+ * 在线歌曲（网易云/Meting）的封面是一张单独的文件，不在音频文件里，
  * 所以不能走 id3_cover/flac_cover 那条路；把整张图读进内存后复用同一个
- * jpeg_to_rgb565()，出来的像素格式与 media_meta_cover_rgb565() 完全一致
+ * image_to_rgb565()，出来的像素格式与 media_meta_cover_rgb565() 完全一致
  * （RGB565 LE，16 字节对齐，用 media_meta_cover_free() 释放）。
  *
- * 封面图常见 100~300 KB，上限给 2 MB；超出直接判为不支持，别把内存吃光。
+ * **JPEG / PNG 都能吃**：缓存下来的文件名带着 .jpg，但 Meting 的 pic 接口
+ * 不保证给的就是 JPEG，所以这里同样按文件魔数分派（image_to_rgb565 内部判断），
+ * 扩展名只当提示。
+ *
+ * 封面图常见 100~300 KB。上限跟在线侧的 COVER_MAX_BYTES 对齐（都是 4 MB）——
+ * 两边不一致会出现"下下来了却解不了"这种最难查的组合。
+ * 内存安全不靠这个值兜：PNG 那条路另有"边长 > max_dim × 8 直接跳过"的判定
+ * （见 image_to_rgb565 里的 side_limit），JPEG 也是先按原始尺寸解、超限就拒。
  */
-#define MEDIA_META_JPEG_MAX (2u * 1024u * 1024u)
+#define MEDIA_META_COVER_FILE_MAX (4u * 1024u * 1024u)
 
-esp_err_t media_meta_jpeg_file_rgb565(const char *jpg_path, int max_dim,
-                                      uint8_t **pixels, int *out_w, int *out_h)
+esp_err_t media_meta_image_file_rgb565(const char *img_path, int max_dim,
+                                       uint8_t **pixels, int *out_w, int *out_h)
 {
-    if (!jpg_path || !pixels || !out_w || !out_h || max_dim <= 0) {
+    if (!img_path || !pixels || !out_w || !out_h || max_dim <= 0) {
         return ESP_ERR_INVALID_ARG;
     }
     *pixels = NULL;
     *out_w  = 0;
     *out_h  = 0;
 
-    FILE *f = fopen(jpg_path, "rb");
+    FILE *f = fopen(img_path, "rb");
     if (!f) {
         return ESP_ERR_NOT_FOUND;
     }
@@ -722,7 +732,7 @@ esp_err_t media_meta_jpeg_file_rgb565(const char *jpg_path, int max_dim,
     }
     long sz = ftell(f);
     fclose(f);
-    if (sz <= 3 || (size_t)sz > MEDIA_META_JPEG_MAX) {
+    if (sz <= 3 || (size_t)sz > MEDIA_META_COVER_FILE_MAX) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -730,7 +740,7 @@ esp_err_t media_meta_jpeg_file_rgb565(const char *jpg_path, int max_dim,
     if (!buf) {
         return ESP_ERR_NO_MEM;
     }
-    f = fopen(jpg_path, "rb");
+    f = fopen(img_path, "rb");
     if (!f) {
         free(buf);
         return ESP_ERR_NOT_FOUND;
@@ -742,9 +752,29 @@ esp_err_t media_meta_jpeg_file_rgb565(const char *jpg_path, int max_dim,
         return ESP_FAIL;
     }
 
-    esp_err_t ret = jpeg_to_rgb565(buf, got, max_dim, pixels, out_w, out_h);
+    esp_err_t ret = image_to_rgb565(buf, got, max_dim, pixels, out_w, out_h);
     free(buf);
     return ret;
+}
+
+/*
+ * 内存缓冲版：封面字节已经在 PSRAM 里（在线服务不再把封面写 SD），
+ * 直接喂给同一套 image_to_rgb565()，少一次 SD 读、也不占临时 malloc。
+ * 上限与文件版一致（2 MB），解码行为完全相同。
+ */
+esp_err_t media_meta_image_mem_rgb565(const uint8_t *data, size_t len, int max_dim,
+                                      uint8_t **pixels, int *out_w, int *out_h)
+{
+    if (!data || !pixels || !out_w || !out_h || max_dim <= 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *pixels = NULL;
+    *out_w  = 0;
+    *out_h  = 0;
+    if (len <= 3 || len > MEDIA_META_COVER_FILE_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return image_to_rgb565(data, len, max_dim, pixels, out_w, out_h);
 }
 
 /* ================================================================== MP3 帧头探测
@@ -1372,5 +1402,359 @@ esp_err_t media_meta_lyrics_load_file(const char *lrc_path, lrc_t *out)
 
     const esp_err_t ret = media_meta_lrc_parse(buf, out);
     free(buf);
+    return ret;
+}
+/* ============================================================ 封面：全尺寸 → 缩放
+ *
+ * 为什么不再用 esp_new_jpeg 的 scale：
+ *   它的 scale 必须是 8 的倍数、且最大 1/8，小图（例如 248x248 缩到 240）会直接报
+ *   "The scaled width(248) should be greater than the minimum 1/8 scale width(250)"
+ *   然后解码失败（封面就没了）。所以改成：
+ *     1) 按原始尺寸解到一块**临时缓冲**（优先 PSRAM，16 字节对齐）；
+ *     2) 自己做盒式平均（box filter）等比缩到 max_dim；
+ *     3) 输出用 jpeg_calloc_align 分配，保证 media_meta_cover_free() 的语义不变。
+ *   PNG 走官方 libpng 组件的简化 API（png_image）：先解成 RGB888 再**就地**压成
+ *   RGB565（PNG_FORMAT_RGB，不要 alpha），之后与 JPEG 完全共用同一段降采样。
+ */
+static esp_err_t image_to_rgb565(const uint8_t *data, size_t len, int max_dim,
+                                 uint8_t **out_pixels, int *out_w, int *out_h)
+{
+    if (!data || len < 8 || max_dim <= 0 || !out_pixels || !out_w || !out_h) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const bool is_png = (data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G');
+
+    uint8_t *full = NULL;
+    int fw = 0, fh = 0;
+
+    if (is_png) {
+        /*
+         * 官方 libpng 组件的**简化 API**（png_image）：一次调用就把整张图解成
+         * 想要的像素格式，不用自己写 read 回调、也不用 png_read_row 逐行搬。
+         * 调色板 / 灰度 / 16 bit / 隔行扫描这些形态 libpng 会自己转换到目标格式。
+         *
+         * 目标格式选 PNG_FORMAT_RGB（不带 alpha）：封面在界面上是不透明的，
+         * RGB 比 RGBA 少 1/4 内存，还省掉逐像素丢 alpha 的那一步。
+         */
+        png_image img;
+        memset(&img, 0, sizeof(img));
+        img.version = PNG_IMAGE_VERSION;
+
+        if (!png_image_begin_read_from_memory(&img, data, len)) {
+            ESP_LOGW(TAG, "png: header read failed (%s)", img.message);
+            png_image_free(&img);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        /*
+         * begin_read 之后 IHDR 已经解出来，**先按尺寸挡掉畸形图再申请内存**：
+         * PNG 是高压缩格式，"文件只有几十 KB、解出来 8000x8000"（png bomb）
+         * 完全可能，而这条路和 JPEG 一样是按**原始尺寸**解进临时缓冲的。
+         * 封面最终只缩到 max_dim，比它大 8 倍以上的图再解也没有意义
+         * （盒式 8:1 降采样已经把细节抹平了）。
+         */
+        const int64_t side_limit = (int64_t)max_dim * 8;
+        if (img.width == 0 || img.height == 0 ||
+            (int64_t)img.width > side_limit || (int64_t)img.height > side_limit) {
+            ESP_LOGW(TAG, "png: %ux%u exceeds the %d px side limit, skipped",
+                     (unsigned)img.width, (unsigned)img.height, (int)side_limit);
+            png_image_free(&img);
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        img.format = PNG_FORMAT_RGB;
+        const size_t need = PNG_IMAGE_SIZE(img);
+        full = (uint8_t *)heap_caps_aligned_alloc(16, need,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!full) {
+            png_image_free(&img);
+            return ESP_ERR_NO_MEM;
+        }
+
+        if (!png_image_finish_read(&img, NULL, full, 0, NULL)) {
+            ESP_LOGW(TAG, "png: decode failed (%s)", img.message);
+            png_image_free(&img);
+            free(full);
+            return ESP_FAIL;
+        }
+        fw = (int)img.width;
+        fh = (int)img.height;
+        png_image_free(&img);   /* 成功时 finish_read 内部已清过，这里是空操作 */
+
+        /*
+         * RGB888 → RGB565 little-endian，**就地压缩**：
+         * 读第 3i..3i+2 字节、写第 2i..2i+1 字节。2i <= 3i 且 i 递增，
+         * 被覆盖的永远是已经读完的数据，所以不用再要一块 w*h*2 的输出缓冲。
+         * 位序与 JPEG 那条路（JPEG_PIXEL_FORMAT_RGB565_LE）完全一致。
+         */
+        const size_t px_num = (size_t)fw * (size_t)fh;
+        for (size_t i = 0; i < px_num; i++) {
+            const uint8_t r = full[i * 3];
+            const uint8_t g = full[i * 3 + 1];
+            const uint8_t b = full[i * 3 + 2];
+            const uint16_t px = (uint16_t)(((uint16_t)(r & 0xF8) << 8) |
+                                           ((uint16_t)(g & 0xFC) << 3) |
+                                           ((uint16_t)b >> 3));
+            full[i * 2]     = (uint8_t)(px & 0xFF);
+            full[i * 2 + 1] = (uint8_t)(px >> 8);
+        }
+    } else {
+        jpeg_dec_config_t cfg = DEFAULT_JPEG_DEC_CONFIG();
+        cfg.output_type = JPEG_PIXEL_FORMAT_RGB565_LE;
+        cfg.scale.width  = 0;      /* ★ 不缩放：自己缩，绕开 1/8 限制 */
+        cfg.scale.height = 0;
+
+        jpeg_dec_handle_t dec = NULL;
+        if (jpeg_dec_open(&cfg, &dec) != JPEG_ERR_OK) {
+            return ESP_FAIL;
+        }
+        jpeg_dec_io_t io = {};
+        io.inbuf     = (uint8_t *)data;
+        io.inbuf_len = (int)len;
+        jpeg_dec_header_info_t info = {};
+        if (jpeg_dec_parse_header(dec, &io, &info) != JPEG_ERR_OK) {
+            jpeg_dec_close(dec);
+            return ESP_FAIL;
+        }
+        int out_len = 0;
+        if (jpeg_dec_get_outbuf_len(dec, &out_len) != JPEG_ERR_OK || out_len <= 0) {
+            jpeg_dec_close(dec);
+            return ESP_FAIL;
+        }
+        full = (uint8_t *)heap_caps_aligned_alloc(16, (size_t)out_len,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!full) {
+            /* PSRAM 拿不到就退回组件自带的缩放路径（宁可糊一点也别没封面） */
+            jpeg_dec_close(dec);
+            return jpeg_to_rgb565(data, len, max_dim, out_pixels, out_w, out_h);
+        }
+        io.outbuf   = full;
+        io.out_size = out_len;
+        const jpeg_error_t jerr = jpeg_dec_process(dec, &io);
+        jpeg_dec_close(dec);
+        if (jerr != JPEG_ERR_OK) {
+            free(full);
+            return ESP_FAIL;
+        }
+        fw = info.width;
+        fh = info.height;
+    }
+
+    if (fw <= 0 || fh <= 0) {
+        free(full);
+        return ESP_FAIL;
+    }
+
+    const int long_side = (fw > fh) ? fw : fh;
+    if (long_side <= max_dim) {
+        uint8_t *out = (uint8_t *)jpeg_calloc_align((size_t)fw * (size_t)fh * 2, 16);
+        if (!out) {
+            free(full);
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(out, full, (size_t)fw * (size_t)fh * 2);
+        free(full);
+        *out_pixels = out;
+        *out_w = fw;
+        *out_h = fh;
+        return ESP_OK;
+    }
+
+    const int dw = (fw >= fh) ? max_dim : (int)(((int64_t)fw * max_dim + fh / 2) / fh);
+    const int dh = (fw >= fh) ? (int)(((int64_t)fh * max_dim + fw / 2) / fw) : max_dim;
+    uint8_t *out = (uint8_t *)jpeg_calloc_align((size_t)dw * (size_t)dh * 2, 16);
+    if (!out) {
+        free(full);
+        return ESP_ERR_NO_MEM;
+    }
+    for (int y = 0; y < dh; y++) {
+        const int sy0 = (int)((int64_t)y * fh / dh);
+        int sy1 = (int)((int64_t)(y + 1) * fh / dh);
+        if (sy1 <= sy0) {
+            sy1 = sy0 + 1;
+        }
+        for (int x = 0; x < dw; x++) {
+            const int sx0 = (int)((int64_t)x * fw / dw);
+            int sx1 = (int)((int64_t)(x + 1) * fw / dw);
+            if (sx1 <= sx0) {
+                sx1 = sx0 + 1;
+            }
+            uint32_t r = 0, g = 0, b = 0, n = 0;
+            for (int sy = sy0; sy < sy1; sy++) {
+                const uint8_t *row = full + ((size_t)sy * fw + sx0) * 2;
+                for (int sx = sx0; sx < sx1; sx++, row += 2) {
+                    const uint16_t px = (uint16_t)(row[0] | (row[1] << 8));
+                    r += (px >> 11) & 0x1F;
+                    g += (px >> 5) & 0x3F;
+                    b += px & 0x1F;
+                    n++;
+                }
+            }
+            const uint16_t o = (uint16_t)(((r / n) << 11) | ((g / n) << 5) | (b / n));
+            uint8_t *d = out + ((size_t)y * dw + x) * 2;
+            d[0] = (uint8_t)(o & 0xFF);
+            d[1] = (uint8_t)(o >> 8);
+        }
+    }
+    free(full);
+    *out_pixels = out;
+    *out_w = dw;
+    *out_h = dh;
+    return ESP_OK;
+}
+/* ==================================================== 歌词编码自动检测（UTF-8 / GBK）
+ *
+ * 需求：UTF-8 与 GBK/GB2312 的歌词都要能显示。以前一律按 UTF-8 解析，
+ * 于是从中文站点/播放器导出的 GBK 歌词整段乱码。
+ *
+ * 判定顺序（够用且不误判）：
+ *   1) BOM：EF BB BF → UTF-8（跳过）；FF FE → UTF-16LE；FE FF → UTF-16BE；
+ *   2) 整段按严格 UTF-8 走一遍：全部合法就当 UTF-8（纯 ASCII 也走这条，
+ *      反正两种编码下 ASCII 完全一样）；
+ *   3) 否则按 **GBK** 解码（GB2312 是 GBK 子集，同一张表覆盖），
+ *      逐字节转成 UTF-8；查不到的字节退化成 '?'。
+ *
+ * 表在 gbk_table.c（Python 从本机 gbk codec 生成，见文件头注释），
+ * 126*191*2 = 48 KB flash，只读常量。
+ */
+extern const uint16_t gbk_to_uni[126][191];
+
+static char *utf8_put(char *d, uint32_t cp)
+{
+    if (cp < 0x80) {
+        *d++ = (char)cp;
+    } else if (cp < 0x800) {
+        *d++ = (char)(0xC0 | (cp >> 6));
+        *d++ = (char)(0x80 | (cp & 0x3F));
+    } else {
+        *d++ = (char)(0xE0 | (cp >> 12));
+        *d++ = (char)(0x80 | ((cp >> 6) & 0x3F));
+        *d++ = (char)(0x80 | (cp & 0x3F));
+    }
+    return d;
+}
+
+/* 严格校验 UTF-8（含过长编码、代理区、超范围） */
+static bool is_valid_utf8(const uint8_t *s, size_t n)
+{
+    size_t i = 0;
+    while (i < n) {
+        const uint8_t c = s[i];
+        if (c < 0x80) {
+            i++;
+            continue;
+        }
+        size_t extra;
+        uint32_t cp;
+        if ((c & 0xE0) == 0xC0) {
+            extra = 1;
+            cp = c & 0x1F;
+        } else if ((c & 0xF0) == 0xE0) {
+            extra = 2;
+            cp = c & 0x0F;
+        } else if ((c & 0xF8) == 0xF0) {
+            extra = 3;
+            cp = c & 0x07;
+        } else {
+            return false;
+        }
+        if (i + extra >= n) {
+            return false;
+        }
+        for (size_t k = 1; k <= extra; k++) {
+            if ((s[i + k] & 0xC0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (s[i + k] & 0x3F);
+        }
+        if ((extra == 1 && cp < 0x80) || (extra == 2 && cp < 0x800) ||
+            (extra == 3 && cp < 0x10000) || cp > 0x10FFFF ||
+            (cp >= 0xD800 && cp <= 0xDFFF)) {
+            return false;
+        }
+        i += extra + 1;
+    }
+    return true;
+}
+
+/* 原始字节 → UTF-8（返回 malloc 的字符串；调用方 free） */
+static char *lrc_bytes_to_utf8(const uint8_t *raw, size_t n)
+{
+    if (!raw) {
+        return NULL;
+    }
+    if (n >= 3 && raw[0] == 0xEF && raw[1] == 0xBB && raw[2] == 0xBF) {
+        raw += 3;
+        n -= 3;
+    } else if (n >= 2 && (raw[0] == 0xFF) && (raw[1] == 0xFE)) {
+        /* UTF-16LE → UTF-8 */
+        char *out = (char *)malloc(n * 3 + 1);
+        if (!out) return NULL;
+        char *d = out;
+        for (size_t i = 2; i + 1 < n; i += 2) {
+            d = utf8_put(d, (uint32_t)(raw[i] | (raw[i + 1] << 8)));
+        }
+        *d = '\0';
+        return out;
+    } else if (n >= 2 && raw[0] == 0xFE && raw[1] == 0xFF) {
+        char *out = (char *)malloc(n * 3 + 1);
+        if (!out) return NULL;
+        char *d = out;
+        for (size_t i = 2; i + 1 < n; i += 2) {
+            d = utf8_put(d, (uint32_t)((raw[i] << 8) | raw[i + 1]));
+        }
+        *d = '\0';
+        return out;
+    }
+
+    if (is_valid_utf8(raw, n)) {
+        char *out = (char *)malloc(n + 1);
+        if (!out) return NULL;
+        memcpy(out, raw, n);
+        out[n] = '\0';
+        return out;
+    }
+
+    /* GBK/GB2312 → UTF-8 */
+    char *out = (char *)malloc(n * 3 + 1);
+    if (!out) {
+        return NULL;
+    }
+    char *d = out;
+    for (size_t i = 0; i < n;) {
+        const uint8_t b = raw[i];
+        if (b < 0x80) {
+            *d++ = (char)b;
+            i++;
+            continue;
+        }
+        if (b >= 0x81 && b <= 0xFE && i + 1 < n) {
+            const uint8_t t = raw[i + 1];
+            if (t >= 0x40 && t <= 0xFE) {
+                const uint16_t u = gbk_to_uni[b - 0x81][t - 0x40];
+                if (u) {
+                    d = utf8_put(d, u);
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        *d++ = '?';          /* 认不出的字节：不吞掉后面的内容 */
+        i++;
+    }
+    *d = '\0';
+    ESP_LOGD(TAG, "lrc encoding: GBK/GB2312 -> UTF-8 (%u bytes in)", (unsigned)n);
+    return out;
+}
+
+/* 公开入口：检测编码后交给 UTF-8 解析器 */
+esp_err_t media_meta_lrc_parse(const char *text, lrc_t *out)
+{
+    if (!text || !out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char *u8 = lrc_bytes_to_utf8((const uint8_t *)text, strlen(text));
+    const esp_err_t ret = lrc_parse_utf8(u8 ? u8 : text, out);
+    free(u8);
     return ret;
 }

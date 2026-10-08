@@ -21,6 +21,12 @@ dependencies:
   # ---- 网络 / JSON ----
   espressif/cjson: "^1.7.19"
 
+  # ---- 封面解码 ----
+  # JPEG 走 esp_new_jpeg；PNG 走官方 libpng 组件（自带上游 zlib）。
+  # 有些专辑图 / 在线封面是 PNG（Meting 的 pic 接口不保证 jpg），
+  # 只有 JPEG 解码器时这些歌就只能显示占位图。
+  espressif/libpng: "^1.6.58"
+
   # ---- 音频管线 ----
   # esp_audio_simple_player 是官方在 ESP-GMF 之上搭好的播放门面
   # （依赖 gmf_audio + gmf_io），M2 本地/在线播放走它；M4 蓝牙再用

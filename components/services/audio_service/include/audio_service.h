@@ -90,6 +90,29 @@ typedef struct {
 
 bool audio_service_get_info(audio_info_t *out);
 
+/*
+ * 在线流式播放的**缓冲进度**（需求："缓冲的时候…显示加载百分比"）。
+ *
+ * 返回 true 时 *percent 是 0~100（已下载字节 / Content-Length）；返回 false 表示
+ * 现在算不出来 —— 还没开始流过、或者服务端用分块传输（没有 Content-Length）。
+ * 调用方（UI）判 false 就别显示百分比，退回"缓冲中…"即可。
+ *
+ * 语义：这是**下载**进度，不是播放进度。流式播放的环形缓冲放在 PSRAM
+ * （`STREAM_RING_BYTES`，4 MB，见 audio_service.cc 的 ensure_stream_io），
+ * 条子满了/歌下完了就会到 100%（一首 3~4 MB 的歌基本上一口气就拉完）。
+ * 纯查询，任何任务里调都安全。
+ */
+bool audio_service_stream_progress(int *percent);
+
+/*
+ * 本首是否**已经真的出声**（有 PCM 写到 codec / 蓝牙）。
+ * 起播与换曲时清零（见 play_uri_locked），由 out 回调置位。
+ *
+ * UI 用它决定"缓冲中 xx%"什么时候换回歌词：只看 audio_service_is_playing()
+ * 不行 —— pipeline 一 run() 状态就是 playing，那时还没声音。
+ */
+bool audio_service_output_active(void);
+
 #ifdef __cplusplus
 }
 #endif

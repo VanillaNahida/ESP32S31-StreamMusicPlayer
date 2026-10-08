@@ -25,8 +25,16 @@ void ui_gesture_suspend(bool suspend);
 
 /* 路由内部入口（ui_router.cc） */
 esp_err_t ui_router_init_home(void);
+/* 不带动画的退栈：给返回手势用（手势已经把顶层页 1:1 滑出去了） */
+esp_err_t ui_router_pop_immediate(void);
 lv_obj_t *ui_router_top_screen(void);
 lv_obj_t *ui_router_under_screen(void);
+/* 当前栈顶页是否需要全局返回键（栈深 > 1 且 desc.no_back == false） */
+bool ui_router_top_needs_back(void);
+
+/* 全局返回键（ui_core.cc）：建在 lv_layer_top，路由 push/pop 后自动刷新 */
+lv_obj_t *ui_back_button_global_create(lv_obj_t *parent);
+void ui_back_button_update(void);
 
 /* 首页（ui_home.cc） */
 lv_obj_t *ui_home_create(void);

@@ -10,6 +10,7 @@ idf_component_register(
         "ui_control_center.cc"
         "ui_volume_panel.cc"
         "ui_gesture.cc"
+        "ui_icons.c"
     INCLUDE_DIRS "include"
     REQUIRES
         lvgl

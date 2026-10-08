@@ -72,9 +72,51 @@ CONFIG_LV_OBJ_STYLE_CACHE=y
 CONFIG_LV_USE_SYSMON=y
 CONFIG_LV_USE_PERF_MONITOR=y
 
-# 绘制单元数量：PPA 加速要求保持 1（见 esp_lvgl_adapter README「PPA/DMA2D 加速」），
-# 本工程 PPA 已开，因此**不要**为了多核并行改成 2。
+# 绘制单元数量：esp_lvgl_adapter 的 PPA 加速要求保持 1（见 esp_lvgl_adapter
+# README「PPA/DMA2D 加速」），因此**不要**为了多核并行改成 2。
 CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
+
+# PPA（Pixel Processing Accelerator，带 2D-DMA）硬件加速 —— **走 esp_lvgl_adapter
+# 自己的实现，不开 LVGL 原生 PPA draw unit**。
+#
+# bsp_display.cc 把 disp_cfg.profile.enable_ppa_accel 置 true 后，esp_lvgl_adapter
+# 会为 RGB565 注册自定义 blend/fill 处理器（lvgl_ppa_accel_v9.c），把填充与
+# alpha 混合从 CPU 挪到 PPA —— 页面切换的滑屏动画（lv_screen_load_anim 的
+# 两层合成）主要就吃这部分。这条路只依赖 CONFIG_SOC_PPA_SUPPORTED，不需要
+# CONFIG_LV_USE_PPA。
+#
+# ⚠ 不要在这里开 CONFIG_LV_USE_PPA=y：那是 LVGL 9.5 自带的 espressif PPA draw
+# unit，它要求 CONFIG_LV_DRAW_BUF_ALIGN == CONFIG_CACHE_L2_CACHE_LINE_SIZE，
+# 且需要把 esp_driver_ppa 的头文件路径接进 lvgl 组件（9.5.0 的 CMake 没做），
+# 实测开了会直接编译失败（#error + driver/ppa.h 找不到）。两个 PPA 是重复的，
+# 用适配器那条就够了。
+
+# ---------------------------------------------------------------------------
+# 编译优化级别 —— 动画帧率的**头号因素**（本工程一直漏了这一项）
+#
+# 不写这一项时 IDF 用的是 -Og（"为调试优化"，几乎不做内联/强度削减），而 LVGL 是
+# **纯软件渲染**：一帧 800×480 的滑屏动画要做几十万次填充/字形混合，渲染循环在
+# -Og 下比 -O2/-Os 慢一倍以上 —— 表现就是"切页有点卡"。
+# esp_lvgl_adapter README 也把 CONFIG_COMPILER_OPTIMIZATION_PERF 列在推荐配置里。
+#
+# 这里选 SIZE(-Os) 而不是 PERF(-O2)：app 分区只剩 ~31 KB 余量（输入法两套字体
+# 占了 2.4 MB），-O2 的代码膨胀必然撑爆分区。而 -Os 同样开启了真正决定渲染速度的
+# 那些优化（函数内联、寄存器分配、循环优化），只是禁掉体积膨胀的变换 —— 相对 -Og
+# 是"又小又快"。以后若扩大了 app 分区，可以换成 PERF 再快一档。
+#
+# 副作用：栈回溯里的行号/变量会比 -Og 难读一些（发布固件可接受）。
+# ---------------------------------------------------------------------------
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# ---------------------------------------------------------------------------
+# LVGL 用 C 库的 string / sprintf（esp_lvgl_adapter README 推荐项）
+#   LVGL 自带的 lv_strlen/lv_snprintf 是逐字节的简化实现，标签排版、样式查找
+#   这些热路径上调用很频繁；换成 newlib 的实现更快，而且省掉 LVGL 那份代码。
+#   附带好处：lv_label_set_text_fmt("...%.1f MB") 的浮点格式化由 newlib 处理，
+#   行为与 printf 完全一致。
+# ---------------------------------------------------------------------------
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
 
 # ---------------------------------------------------------------------------
 # LVGL 内存分配（本地音乐列表崩溃的根因所在，别改回去）
