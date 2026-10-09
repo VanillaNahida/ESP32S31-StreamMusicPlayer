@@ -55,6 +55,28 @@ const char *bsp_sdcard_mount_point(void);
 /* 容量（KB）；未挂载返回 0 */
 esp_err_t bsp_sdcard_capacity_kb(uint32_t *total_kb, uint32_t *free_kb);
 
+/*
+ * SD 卡的**物理信息**（"设置 → 存储"详情页用；容量之外的那些）。
+ * 取不到的字段保持 0 / 空串，不报错 —— UI 少显示一行即可。
+ *
+ * 各字段来源（与 IDF 的 sdmmc_card_print_info() 同一套解码，别自己发明）：
+ *   card_bytes = csd.capacity × csd.sector_size，type 由 ocr 的 CCS/S18R 位判定，
+ *   数据线宽度取 ssr.cur_bus_width（**当前**宽度，不是卡支持的最大值）。
+ */
+typedef struct {
+    uint64_t card_bytes;    /* 卡容量（CSD） */
+    int      freq_khz;      /* 实际工作频率 */
+    int      max_freq_khz;  /* 卡支持的最高频率 */
+    int      bus_width;     /* 当前数据线位宽：1 / 4 / 8 */
+    bool     ddr;           /* 是否 DDR 模式 */
+    char     type[20];      /* SDSC / SDHC / SDHC/SDXC (UHS-I) / MMC / SDIO */
+    char     name[16];      /* CID 里的产品名（尾部空格已去掉） */
+    uint32_t serial;        /* CID 序列号 */
+} bsp_sd_card_info_t;
+
+/* 未挂载返回 ESP_ERR_INVALID_STATE；拿到卡句柄失败返回其他错误码 */
+esp_err_t bsp_sdcard_card_info(bsp_sd_card_info_t *out);
+
 /* ---------------------------------------------------------------- 音频 */
 
 /* 初始化 ES8389 DAC 通路（保持静音） */

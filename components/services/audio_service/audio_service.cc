@@ -144,15 +144,32 @@ static int player_event_cb(esp_asp_event_pkt_t *pkt, void *ctx)
             s_info.bits        = (uint8_t)info.bits;
             s_info.duration_ms = 0;
             /*
-             * GMF 对 MP3 经常只填采样率，bitrate 报 0 —— 那样"文件大小 / 码率"
-             * 估不出总时长，进度条永远是 0、拖动定位也没有换算系数。
-             * 这里回文件里读帧头补上（同一次事件里做，之后不再重复）。
+             * ★ 本文件的码率**一律优先用自己探测的平均码率**（media_meta_probe_mp3
+             *   读 Xing/Info 帧算平均，没有 Xing 时按帧头平均），只有当"没有文件可探测"
+             *   （在线流式）时才用 GMF 报的值。
+             *
+             * 为什么必须这样（2026-10 用户报"多次拖动进度条后歌词高亮异常"）：
+             *   `audio_service_seek_ms()` 把"时间"换成"字节"用的是**平均码率**
+             *   （byte = offset + ms×bitrate/8000）。而 GMF 的 MUSIC_INFO 里给的是
+             *   **解码器读到的第一帧**的码率 —— VBR 文件上它和平均码率能差 30% 以上，
+             *   于是"拖到 3:00"实际落到了别的时刻；上层却把 s_elapsed_ms 直接对齐到
+             *   **请求**的时刻，歌词高亮（和进度条）就与实际听到的位置对不上，
+             *   越拖越歪。换成平均码率后，定位落点与时间轴一致，歌词自然对齐。
+             *   CBR 文件两者相等，切成"总是优先探测"不会变差。
              */
-            if (s_info.bitrate <= 0 && s_cur_path[0]) {
+            if (s_cur_path[0]) {
                 audio_probe_t probe = {};
                 if (media_meta_probe_mp3(s_cur_path, &probe) == ESP_OK) {
-                    s_info.bitrate     = (int)probe.bitrate;
-                    s_info.duration_ms = probe.duration_ms;
+                    if (probe.bitrate > 0) {
+                        if (info.bitrate > 0 && (int)probe.bitrate != info.bitrate) {
+                            ESP_LOGI(TAG, "bitrate: GMF %d -> probe(avg) %u bps",
+                                     info.bitrate, (unsigned)probe.bitrate);
+                        }
+                        s_info.bitrate = (int)probe.bitrate;
+                    }
+                    if (probe.duration_ms > 0) {
+                        s_info.duration_ms = probe.duration_ms;
+                    }
                 }
             }
             s_info_valid       = true;

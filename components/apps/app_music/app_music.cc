@@ -29,6 +29,7 @@
 
 #include "ui_core.h"
 #include "ui_metrics.h"
+#include "ui_ba.h"          /* 碧蓝档案风格弹窗工具箱 */
 #include "ui_app_registry.h"
 #include "esp_lv_adapter.h"
 
@@ -38,6 +39,7 @@
 #include "media_meta.h"
 #include "play_state.h"    /* 音量/曲目/进度记忆（NVS） */
 #include "bt_service.h"    /* 输出设备弹窗要显示蓝牙连接/推流状态 */
+#include "app_settings.h"  /* 长按输出设备按钮 → 跳到设置的蓝牙页 */
 #include "online_service.h"/* 在线歌单队列（在线音乐 app 交过来） */
 
 static const char *TAG = "app_music";
@@ -153,6 +155,11 @@ static volatile int s_cover_out_idx = -1;
 static const online_song_t *s_on_songs;
 static size_t  s_on_count;
 static bool    s_on_mode;                    /* 当前队列是否来自在线歌单 */
+/* 在线流式"卡死看门狗"状态（见 tick_cb 里的说明） */
+#define STALL_TICKS     (20000 / TICK_MS)    /* 连续 20 s 没有 PCM 输出 = 卡住 */
+#define STALL_KICK_MAX  3                    /* 每首最多踢 3 次 */
+static int     s_stall_ticks;
+static int     s_stall_kicks;
 /* 要播放的地址：流式是 https 地址，下载兜底是本地缓存路径
  * （audio_service_play_uri() 两种都认） */
 static char    s_on_stream[560];
@@ -230,10 +237,45 @@ static void online_discard_ready(void)
     }
 }
 
+/* ------------------------------------------------- 在线队列的所有权（2026-10）
+ *
+ * s_on_songs 由 app_online 交过来。**换队列时不能由 app_online 直接 free**：
+ * 用户"点歌 → 又连着打开两个别的歌单"之后，播放器还存着旧数组的指针，
+ * 上/下一首与自动续播就会读已释放内存（曲名乱码/串到别的歌、甚至崩溃）。
+ * 所以 app_online 换队列时调 app_music_online_detach()：本模块接管那块内存，
+ * 等**自己换队列或退回本地播放**时再释放。
+ */
+static const online_song_t *s_on_owned;   /* 托管中、等换队列时释放的旧在线队列 */
+
+static void online_owned_drop(void)
+{
+    if (s_on_owned && s_on_owned != s_on_songs) {
+        free((void *)s_on_owned);
+        s_on_owned = NULL;
+    }
+}
+
+void app_music_online_detach(const online_song_t *songs)
+{
+    if (!songs) {
+        return;
+    }
+    if (s_on_mode && s_on_songs == songs) {
+        online_owned_drop();          /* 上一份托管的先放掉（此时它已不是当前队列） */
+        s_on_owned = songs;
+        ESP_LOGD(TAG, "online queue handed over (still in use)");
+        return;
+    }
+    ESP_LOGD(TAG, "online queue released (unused)");
+    free((void *)songs);
+}
+
 /* 前向声明（start_track / tick_cb 在它们定义之前） */
 static void lyric_rebuild(void);
 static void lyric_apply_mode(void);
 static void update_lyric_highlight(void);
+/* 定位（拖动进度条 / 续播定位）之后重新对齐高亮与居中；定义在歌词那一段 */
+static void lyric_resync(void);
 static void cover_show(uint8_t *px, int w, int h);
 static void cover_reap(void);
 static void cover_kick(void);
@@ -354,9 +396,15 @@ static void start_track_at(int idx, uint32_t resume_ms)
         return;
     }
 
-    /* 切回本地队列：清掉"在线队列"的任何残留（封面/歌词缓冲也要释放） */
+    /* 切回本地队列：清掉"在线队列"的任何残留（封面/歌词缓冲也要释放）。
+     * s_on_songs 置空 + 把托管的旧队列放掉：本地播放不会再引用它，
+     * 而 app_online 那边已经不再持有这块内存（所有权在本模块）。 */
     s_on_mode     = false;
     online_discard_ready();
+    s_on_songs    = NULL;
+    s_on_count    = 0;
+    s_on_req      = -1;            /* 本地播放：丢掉还没发出去的在线请求 */
+    online_owned_drop();
 
     s_index      = idx;
     s_resume_ms  = resume_ms;
@@ -636,7 +684,6 @@ static void on_seek_release(lv_event_t *e)
 
     /* 位置本来靠墙钟累计，定位成功后要对齐过去，否则下一次 tick 会把进度拉回原处 */
     s_elapsed_ms = target;
-    s_lyric_cur  = -1;
     /* 进度记忆跟着用户的手动定位走（落盘由 play_state 防抖合并） */
     if (s_track_path[0]) {
         save_progress(target);
@@ -649,9 +696,12 @@ static void on_seek_release(lv_event_t *e)
         fmt_time(target, buf, sizeof(buf));
         lv_label_set_text(s_p_cur, buf);
     }
-    if (s_lyric_mode) {
-        update_lyric_highlight();
-    }
+    /*
+     * ★ 高亮跟着新位置走。用 lyric_resync() 而**不是**"先 s_lyric_cur = -1 再调
+     *   update_lyric_highlight()"：后者会让"上一行"变成 -1，旧那行的高亮永远
+     *   复位不掉 —— 多拖几次进度条，歌词区就亮起好几行（2026-10 用户报）。
+     */
+    lyric_resync();
 }
 
 /* 轻点封面：在封面**右侧**展开 / 收起歌词 */
@@ -681,6 +731,7 @@ static void on_toggle_view(lv_event_t *e)
 
 static lv_obj_t  *s_out_btn_icon;                 /* 控制排上输出按钮里的图标 */
 static lv_obj_t  *s_out_overlay;                  /* 输出设备弹窗（lv_layer_top 上） */
+static ui_ba_dialog_t s_out_dlg;                  /* BA 对话框句柄（与 s_out_overlay 同生共死） */
 static audio_out_t s_out_shown = (audio_out_t)-1; /* 按钮图标当前画的是哪个输出 */
 
 static const char *out_icon_of(audio_out_t o)
@@ -704,7 +755,14 @@ static const char *out_name_of(audio_out_t o)
          */
         static char bt_desc[BT_NAME_MAX + 32];
         const char *nm = bt_service_peer_name();
-        if (nm && nm[0]) {
+        /*
+         * ★ 只认**已连接**（2026-10 用户报"配对了但没连接，还是显示已连接 XX"）：
+         *   bt_service_peer_name() 是"上次连过的对端名"，只配对过就会一直留着，
+         *   所以这里必须再用 bt_service_is_connected() 卡一道 —— 没连接就退回类别名，
+         *   既不显示设备名、也不显示"已连接"。
+         */
+        const bool conn = bt_service_is_connected();
+        if (conn && nm && nm[0]) {
             snprintf(bt_desc, sizeof(bt_desc), "蓝牙音频设备 %s 已连接", nm);
             return bt_desc;
         }
@@ -718,7 +776,8 @@ static const char *out_name_of(audio_out_t o)
 static void out_picker_close(void)
 {
     if (s_out_overlay) {
-        lv_obj_delete_async(s_out_overlay);
+        /* 下滑 + 缩小 + 淡出（BA 退场），动画结束由 ui_popup_out 自己删 */
+        ui_ba_close(&s_out_dlg);
         s_out_overlay = NULL;
     }
 }
@@ -728,7 +787,7 @@ static void on_out_pick(lv_event_t *e)
     const audio_out_t o = (audio_out_t)(intptr_t)lv_event_get_user_data(e);
     esp_err_t ret = audio_service_set_output(o);
     if (ret == ESP_ERR_INVALID_STATE) {
-        ui_toast("先在「设置 → 蓝牙」里连接设备", 2000);   /* 弹窗留着，方便连完再来 */
+        ui_toast("请先在「设置 → 蓝牙」里连接设备", 2000);   /* 弹窗留着，方便连完再来 */
         return;
     }
     if (ret != ESP_OK) {
@@ -753,15 +812,16 @@ static void out_picker_row(lv_obj_t *col, audio_out_t o, const char *sym, uint32
     lv_obj_t *row = lv_obj_create(col);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, LV_PCT(100), UI_LIST_ROW_H);
-    lv_obj_set_style_bg_color(row, UI_COLOR_SURFACE, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(row, cur ? LV_OPA_COVER : LV_OPA_70, LV_PART_MAIN);
-    lv_obj_set_style_radius(row, UI_PX_H(10), LV_PART_MAIN);
+    /* BA 列表行：浅底 + 左侧色条；当前输出那行换成浅蓝底 + 蓝字 */
+    lv_obj_set_style_bg_color(row, lv_color_hex(cur ? BA_BLUE_SOFT : 0xF8FAFC), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(row, UI_PX_H(8), LV_PART_MAIN);
     lv_obj_set_style_pad_hor(row, UI_PX_W(12), LV_PART_MAIN);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
-    /* 当前输出那行加一圈琥珀描边（比只靠底色深浅更好认） */
-    lv_obj_set_style_border_width(row, cur ? UI_PX_H(2) : 0, LV_PART_MAIN);
-    lv_obj_set_style_border_color(row, UI_COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, UI_PX_W(4), LV_PART_MAIN);
+    lv_obj_set_style_border_side(row, LV_BORDER_SIDE_LEFT, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(cur ? BA_BLUE : accent), LV_PART_MAIN);
 
     lv_obj_t *icon = lv_obj_create(row);
     lv_obj_remove_style_all(icon);
@@ -773,13 +833,13 @@ static void out_picker_row(lv_obj_t *col, audio_out_t o, const char *sym, uint32
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *is = lv_label_create(icon);
     lv_obj_set_style_text_font(is, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(is, lv_color_hex(0x14141A), LV_PART_MAIN);
+    lv_obj_set_style_text_color(is, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_label_set_text(is, sym);
     lv_obj_center(is);
 
     lv_obj_t *nm = lv_label_create(row);
     lv_obj_set_style_text_font(nm, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(nm, UI_COLOR_FG, LV_PART_MAIN);
+    lv_obj_set_style_text_color(nm, lv_color_hex(cur ? BA_BLUE : BA_TEXT), LV_PART_MAIN);
     lv_label_set_text(nm, out_name_of(o));
     lv_obj_align(nm, LV_ALIGN_LEFT_MID, UI_PX_H(52), 0);
 
@@ -795,7 +855,7 @@ static void out_picker_row(lv_obj_t *col, audio_out_t o, const char *sym, uint32
     }
     lv_obj_t *sv = lv_label_create(row);
     lv_obj_set_style_text_font(sv, UI_FONT_SMALL, LV_PART_MAIN);
-    lv_obj_set_style_text_color(sv, cur ? UI_COLOR_ACCENT : UI_COLOR_FG_DIM, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sv, lv_color_hex(cur ? BA_BLUE : BA_TEXT_DIM), LV_PART_MAIN);
     lv_label_set_text(sv, cur ? "使用中" : st);
     lv_obj_align(sv, LV_ALIGN_RIGHT_MID, 0, 0);
 
@@ -812,43 +872,55 @@ static void on_output_click(lv_event_t *e)
     }
     ui_volume_hide();      /* 焦点转移：把音量条收掉 */
 
-    lv_obj_t *scrim = lv_obj_create(lv_layer_top());
-    lv_obj_remove_style_all(scrim);
-    lv_obj_set_size(scrim, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(scrim, LV_OPA_50, LV_PART_MAIN);
-    lv_obj_remove_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_add_event_cb(scrim, on_out_scrim, LV_EVENT_CLICKED, NULL);
-    s_out_overlay = scrim;
+    /* 碧蓝档案风格白卡片（标题 + 黄色下划线 + 右上角 ✕） */
+    s_out_dlg = ui_ba_open("选择输出设备", 58, LV_ALIGN_CENTER, 0);
+    s_out_overlay = s_out_dlg.scrim;
+    /* 点卡片之外的空白 = 关闭（lv_obj 默认不带 EVENT_BUBBLE，点卡片自己不会冒上来） */
+    lv_obj_add_event_cb(s_out_overlay, on_out_scrim, LV_EVENT_CLICKED, NULL);
+    ui_ba_on_close(&s_out_dlg, [](void *user) { (void)user; out_picker_close(); }, NULL);
 
-    lv_obj_t *panel = lv_obj_create(scrim);
-    lv_obj_remove_style_all(panel);
-    lv_obj_set_width(panel, UI_PCT_X(58));
-    lv_obj_set_height(panel, LV_SIZE_CONTENT);
-    lv_obj_set_style_bg_color(panel, UI_COLOR_BG_ALT, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(panel, UI_PX_H(16), LV_PART_MAIN);
-    lv_obj_set_style_pad_all(panel, UI_PX_H(14), LV_PART_MAIN);
-    lv_obj_set_style_pad_row(panel, UI_PX_H(6), LV_PART_MAIN);
-    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
-    lv_obj_remove_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);   /* 吃掉点击，别穿透到遮罩 */
-    lv_obj_center(panel);
+    out_picker_row(s_out_dlg.body, AUDIO_OUT_SPEAKER,   LV_SYMBOL_VOLUME_MAX, 0xE8973A);
+    out_picker_row(s_out_dlg.body, AUDIO_OUT_BLUETOOTH, LV_SYMBOL_BLUETOOTH,  0x4A6FA5);
+    out_picker_row(s_out_dlg.body, AUDIO_OUT_NONE,      LV_SYMBOL_MUTE,       0x6E6E78);
 
-    lv_obj_t *title = lv_label_create(panel);
-    lv_obj_set_style_text_font(title, UI_FONT_TITLE, LV_PART_MAIN);
-    lv_obj_set_style_text_color(title, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(title, "选择输出设备");
+    ui_ba_hint(s_out_dlg.body, "长按这个按钮可以直接进「设置 → 蓝牙」");
+}
 
-    out_picker_row(panel, AUDIO_OUT_SPEAKER,   LV_SYMBOL_VOLUME_MAX, 0xE8973A);
-    out_picker_row(panel, AUDIO_OUT_BLUETOOTH, LV_SYMBOL_BLUETOOTH,  0x4A6FA5);
-    out_picker_row(panel, AUDIO_OUT_NONE,      LV_SYMBOL_MUTE,       0x6E6E78);
+/* --------------------------------------------------- 长按输出设备 → 蓝牙设置页
+ *
+ * 需求：长按输出设备按钮直接跳到"设置 → 蓝牙"，省掉"进设置 → 点蓝牙"两步。
+ *
+ * ★ 长按里**不能**直接 push 页面（和 app_online 的长按菜单是同一个坑，见 AGENTS 14.6）：
+ *   LVGL 在按压期间会不断重新命中手指下的对象（lv_indev.c 的 pointer_search_obj），
+ *   而 indev_proc_release() 里**长按之后照样补发 CLICKED**（它只跳过 short_click）。
+ *   跳过去的蓝牙页里，手指那个位置正好可能是设备列表的一行 —— 松手那一下就会
+ *   莫名其妙去连一台设备。所以长按只置一个请求，等**手指抬起来**再跳。
+ */
+static bool s_open_bt_req;
 
-    lv_obj_t *hint = lv_label_create(panel);
-    lv_obj_set_style_text_font(hint, UI_FONT_SMALL, LV_PART_MAIN);
-    lv_obj_set_style_text_color(hint, UI_COLOR_FG_DIM, LV_PART_MAIN);
-    lv_label_set_text(hint, "点空白处关闭");
+static void open_bt_deferred(void *arg)
+{
+    (void)arg;
+    if (!s_open_bt_req) {
+        return;
+    }
+    const lv_indev_t *indev = lv_indev_active();
+    if (indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
+        lv_async_call(open_bt_deferred, NULL);   /* 还按着：下一轮再看 */
+        return;
+    }
+    s_open_bt_req = false;
+    if (app_settings_open_bt() != ESP_OK) {
+        ui_toast("打不开蓝牙设置页", 1500);
+    }
+}
+
+static void on_output_long(lv_event_t *e)
+{
+    (void)e;
+    out_picker_close();          /* 弹窗开着就先收掉，别跟着一起被压在下面 */
+    s_open_bt_req = true;
+    lv_async_call(open_bt_deferred, NULL);
 }
 
 /* 按钮图标跟着实际输出走（由 tick_cb 调用，改动才写 LVGL） */
@@ -907,25 +979,24 @@ static void label_set_if_changed(lv_obj_t *label, const char *text)
     lv_label_set_text(label, text);
 }
 
-static void update_lyric_highlight(void)
+/*
+ * 把"当前行"移到 idx：**复位上一行 → 点亮 idx → 整列平移居中**。
+ *
+ * ⚠ 这里读的 `s_lyric_cur`（= 上一行）必须在**赋值之前**读出来 —— 见下面的
+ *   lyric_resync()：早先拖动定位处直接把 s_lyric_cur 清成 -1 再调高亮，
+ *   于是"上一行"永远是 -1，**旧那行再也没被复位**，多拖几次就亮一片
+ *   （2026-10 用户报"多次拖动进度条后歌词高亮异常"）。
+ */
+static void lyric_apply_cur(int idx)
 {
-    /* 纯文本歌词（内嵌 USLT 没有时间轴）：静态展示，不高亮也不滚动 */
-    if (!s_lrc.timed) {
-        return;
-    }
-    int idx = media_meta_lrc_index_at(&s_lrc, s_elapsed_ms);
-    if (idx == s_lyric_cur || !s_p_lyric_col) {
-        return;
-    }
     const int prev = s_lyric_cur;
     s_lyric_cur = idx;
 
     /*
      * 只重设"上一行"和"当前行"。
      *
-     * 歌词标签建的时候统一是 UI_FONT_SMALL + UI_COLOR_FG_DIM（见下面重建歌词
-     * 标签那段），不变式是"只有第 s_lyric_cur 行是强调色 + 大一号字"，
-     * 所以换行时动这两行就够。
+     * 歌词标签建的时候统一是 UI_FONT_SMALL + UI_COLOR_FG_DIM（见 lyric_rebuild），
+     * 不变式是"只有第 s_lyric_cur 行是强调色 + 大一号字"，所以换行时动这两行就够。
      *
      * 原来对全部（最多 LYRIC_VIEW_MAX_LINES = 80）行调 set_style_text_font：
      * 改字号等于改行高，会触发整列 flex 重新布局 —— 每换一行歌词就卡一下。
@@ -956,6 +1027,34 @@ static void update_lyric_highlight(void)
         const int32_t target = box_h / 2 - line_h / 2 - (int32_t)idx * line_h;
         lv_obj_set_style_translate_y(s_p_lyric_col, target, LV_PART_MAIN);
     }
+}
+
+/* 定时器里用：位置变了才动（没变就一行都不碰） */
+static void update_lyric_highlight(void)
+{
+    /* 纯文本歌词（内嵌 USLT 没有时间轴）：静态展示，不高亮也不滚动 */
+    if (!s_lrc.timed || !s_p_lyric_col) {
+        return;
+    }
+    const int idx = media_meta_lrc_index_at(&s_lrc, s_elapsed_ms);
+    if (idx == s_lyric_cur) {
+        return;
+    }
+    lyric_apply_cur(idx);
+}
+
+/*
+ * **定位之后**（拖动进度条 / 从上次位置续播）强制重新对齐高亮与居中。
+ *
+ * 与 update_lyric_highlight() 的区别：即使行号没变也要重贴一遍（居中位置可能因为
+ * 换页/重建而偏），但绝不能先把 s_lyric_cur 清成 -1 —— 那样上一行的复位就丢了。
+ */
+static void lyric_resync(void)
+{
+    if (!s_lrc.timed || !s_p_lyric_col) {
+        return;
+    }
+    lyric_apply_cur(media_meta_lrc_index_at(&s_lrc, s_elapsed_ms));
 }
 
 /* 蓝牙媒体命令：跑在 LVGL 任务里（由 s_media_timer 每 100 ms 取一次） */
@@ -1109,6 +1208,43 @@ static void tick_cb(lv_timer_t *t)
     }
 
     /*
+     * ★ 在线流式播放的**卡死看门狗**（2026-10 用户报"后台播放在线音乐概率会卡住"）。
+     *
+     * 现象：网络侧一个读操作卡住时，GMF 的 HTTP IO 会一直等（既不出错也不返回），
+     * ASP 状态仍然是 RUNNING，但**再也没有 PCM 写出来** —— 界面上进度/歌词定住、
+     * 也没人重试，用户看到的就是"卡住不动"。
+     *
+     * 这里用最可靠的判据盯它：**"声称在播"但"连续 N 秒没有 PCM 输出"**。
+     *   - 只看在线曲目（本地文件不会这样卡，卡了也该报错而不是重试）；
+     *   - 缓冲突发（起播/切歌那几秒）本来就 output_active=false，所以阈值给 10 s；
+     *   - 触发后**踢一下管线**：暂停再恢复（等价于重新拉起 IO），必要时再补一次
+     *     seek 到当前进度 —— 实测能把卡住的 HTTP 读唤醒；
+     *   - 每首最多踢 3 次，之后只打日志（不无限折腾），日志里带上下载进度便于定位。
+     */
+    if (s_on_mode && audio_service_is_playing() && !audio_service_output_active()) {
+        if (++s_stall_ticks >= STALL_TICKS) {
+            s_stall_ticks = 0;
+            if (s_stall_kicks < STALL_KICK_MAX) {
+                s_stall_kicks++;
+                int pct = -1;
+                audio_service_stream_progress(&pct);
+                ESP_LOGW(TAG, "stream stall: 无输出 %u s，踢一下管线（第 %d 次，下载 %d%%）",
+                         (unsigned)(STALL_TICKS * TICK_MS / 1000), s_stall_kicks, pct);
+                audio_service_pause();
+                if (audio_service_resume() != ESP_OK) {
+                    audio_service_seek_ms(s_elapsed_ms);   /* resume 不回来就重定位一次 */
+                }
+            } else {
+                ESP_LOGW(TAG, "stream stall: 已重试 %d 次仍无输出（网络/服务端问题）",
+                         STALL_KICK_MAX);
+                s_stall_kicks = 0;                          /* 下个 10 s 再来一轮 */
+            }
+        }
+    } else {
+        s_stall_ticks = 0;
+    }
+
+    /*
      * ★ 墙钟只在**真的出声之后**才累加（2026-10 修"歌词与歌曲不同步"）：
      *   simple_player 没有位置 API，进度只能靠墙钟累加；而在线歌从 run() 到
      *   真正出声之间还有 1~3 秒的缓冲 —— 以前这段时间也被算进 s_elapsed_ms，
@@ -1155,7 +1291,8 @@ static void tick_cb(lv_timer_t *t)
                 s_resume_ms = 0;
                 if (audio_service_seek_ms(target) == ESP_OK) {
                     s_elapsed_ms = target;
-                    s_lyric_cur  = -1;
+                    /* 续播定位之后同样要"复位上一行 + 重新居中"（别清 s_lyric_cur，见 lyric_resync） */
+                    lyric_resync();
                     ESP_LOGI(TAG, "resumed at %u ms", (unsigned)target);
                 } else {
                     s_elapsed_ms = 0;      /* 定位失败：界面别停在假进度上 */
@@ -1280,8 +1417,13 @@ static void player_on_delete(lv_event_t *e)
 
 /* ------------------------------------------------------------------ 播放器页 */
 
-static lv_obj_t *make_round_btn(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
-                                lv_color_t bg, lv_color_t fg)
+/*
+ * 圆形按钮。
+ * code 一般传 LV_EVENT_CLICKED；**有长按动作的按钮要传 LV_EVENT_SHORT_CLICKED**——
+ * 见下面输出设备按钮处的说明。
+ */
+static lv_obj_t *make_round_btn_ex(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
+                                   lv_event_code_t code, lv_color_t bg, lv_color_t fg)
 {
     lv_obj_t *b = lv_button_create(parent);
     lv_obj_set_size(b, UI_PX_H(56), UI_PX_H(56));
@@ -1297,9 +1439,15 @@ static lv_obj_t *make_round_btn(lv_obj_t *parent, const char *sym, lv_event_cb_t
     lv_obj_center(l);
 
     if (cb) {
-        lv_obj_add_event_cb(b, cb, LV_EVENT_CLICKED, NULL);
+        lv_obj_add_event_cb(b, cb, code, NULL);
     }
     return b;
+}
+
+static lv_obj_t *make_round_btn(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
+                                lv_color_t bg, lv_color_t fg)
+{
+    return make_round_btn_ex(parent, sym, cb, LV_EVENT_CLICKED, bg, fg);
 }
 
 /* ------------------------------------------------------------------ 封面 */
@@ -1541,6 +1689,9 @@ static void start_track_online_at(int idx, const char *uri)
     s_lyric_cur  = -1;
     s_save_ticks = 0;
     s_resume_wait = 0;
+    /* 新的一首：卡死看门狗计数从零开始（见 tick_cb 里的说明） */
+    s_stall_ticks = 0;
+    s_stall_kicks = 0;
     snprintf(s_track_path, sizeof(s_track_path), "%s", uri);
 
     /* 歌词：直接从内存里的 LRC 文本解析（不再读 SD 上的 .lrc 文件）。
@@ -1673,6 +1824,9 @@ void app_music_play_online(const online_song_t *songs, size_t count, size_t idx)
     s_on_songs = songs;
     s_on_count = count;
     s_on_mode  = true;
+    /* 队列已经换成 songs：托管中的旧队列（若有）现在可以放了。
+     * 顺序很重要 —— 先让 s_on_songs 指向新数组，再 free 旧的。 */
+    online_owned_drop();
     s_index    = (int)idx;
     s_on_seq++;
     online_discard_ready();      /* 点歌即弃：旧结果（若有）不再起播 */
@@ -2055,9 +2209,20 @@ static lv_obj_t *page_player(void)
     make_round_btn(ctl, LV_SYMBOL_NEXT, on_next, UI_COLOR_PILL, UI_COLOR_FG);
     make_round_btn(ctl, LV_SYMBOL_VOLUME_MAX, on_volume, UI_COLOR_PILL, UI_COLOR_FG);
 
-    /* 输出设备选择：图标跟着当前输出走（扬声器/蓝牙/静音），点开是选择弹窗 */
-    lv_obj_t *out_btn = make_round_btn(ctl, out_icon_of(audio_service_get_output()),
-                                       on_output_click, UI_COLOR_PILL, UI_COLOR_FG);
+    /*
+     * 输出设备选择：图标跟着当前输出走（扬声器/蓝牙/静音）。
+     *   点   = 打开选择弹窗
+     *   长按 = 直接跳到"设置 → 蓝牙"（要连耳机时少点两下）
+     *
+     * ★ 短按必须挂 **LV_EVENT_SHORT_CLICKED** 而不是 CLICKED：
+     *   indev_proc_release() 里 SHORT_CLICKED 只在 long_pr_sent == 0 时才发，
+     *   而 CLICKED 是**无条件**发的 —— 用 CLICKED 的话长按之后松手会
+     *   "既跳了设置页、又开出选择弹窗"（同源结论见 AGENTS 14.6）。
+     */
+    lv_obj_t *out_btn = make_round_btn_ex(ctl, out_icon_of(audio_service_get_output()),
+                                          on_output_click, LV_EVENT_SHORT_CLICKED,
+                                          UI_COLOR_PILL, UI_COLOR_FG);
+    lv_obj_add_event_cb(out_btn, on_output_long, LV_EVENT_LONG_PRESSED, NULL);
     s_out_btn_icon = lv_obj_get_child(out_btn, 0);
     s_out_shown    = audio_service_get_output();
 

@@ -155,6 +155,130 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
  */
 esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_t *out_len);
 
+/* ============================================================ 网易云账号登录
+ *
+ * 架构（2026-10）：设备端**不做 weapi 加密** —— 一律走自建的 API 服务
+ * （参考工程 D:\Codes\ESP32S31-StreamMusicPlayer\NeteaseCloudMusicApi =
+ *   @neteasecloudmusicapienhanced/api v4.41.1，加密/签名/cookie 都在服务端做）。
+ * 接口契约（已核对它的 module/login_qr_*.js 源码）：
+ *   GET {base}/login/qr/key                        → data.unikey
+ *   GET {base}/login/qr/create?key=<k>&qrimg=true  → data.qrurl（手机扫的链接）
+ *                                                    data.qrimg（"data:image/png;base64,…"）
+ *   GET {base}/login/qr/check?key=<k>              → code 800/801/802/803
+ * 803（登录成功）时响应里带 cookie → 存到 /sdcard/online/netease_cookie.txt，
+ * 之后所有账号接口都带 `cookie=<urlencoded>` 调。
+ *
+ * ⚠ base 是**可配置**的（NVS 'online'/'nb'）：服务可能跑在你的 PC 上（局域网 IP:3000）
+ *   或部署到公网，固件不硬编码。
+ */
+#define NET_QR_WAIT   801   /* 等待扫码 */
+#define NET_QR_SCAN   802   /* 已扫码，待手机确认 */
+#define NET_QR_OK     803   /* 登录成功 */
+#define NET_QR_EXPIRE 800   /* 二维码失效（需要重新取 key） */
+
+/* API 服务地址：set 写 NVS（传 NULL/空串 = 恢复默认）；get 永不返回 NULL */
+esp_err_t online_netease_api_base_set(const char *base);
+const char *online_netease_api_base(void);
+
+/* 1) 取二维码 key（unikey）；out_key 至少 64 字节 */
+esp_err_t online_netease_qr_key(char *out_key, size_t cap);
+/* 2) 用 key 换二维码：out_url = 手机要扫的链接；qrimg = **PNG 原始字节**（调用方 free） */
+esp_err_t online_netease_qr_create(const char *key, char *out_url, size_t url_cap,
+                                   uint8_t **qrimg, size_t *qrimg_len);
+/* 3) 轮询扫码结果：*out_code 取 NET_QR_* 四个值之一；成功时自动保存 cookie */
+esp_err_t online_netease_qr_poll(const char *key, int *out_code);
+
+/*
+ * 登录态。cookie 有两个来源，按优先级：
+ *   1) SD 上扫码登录存下来的 /sdcard/online/netease_cookie.txt（最新，优先）；
+ *   2) 构建期编进固件的内置 cookie —— 见 main/Kconfig.projbuild 的
+ *      CONFIG_ONLINE_NETEASE_CK_FILE（相对工程根目录的路径，默认 assets/ncm-ck.txt，
+ *      留空 = 不启用）。有这个时开机即为已登录，不用扫码。
+ * 两个都没有 = 未登录，界面走扫码流程。
+ */
+bool online_netease_logged_in(void);
+const char *online_netease_cookie(void);      /* 未登录返回空串，不是 NULL */
+
+/*
+ * 重新从 SD 读一次 cookie（只在**当前判定为未登录**时才有意义，已登录时直接返回）。
+ *
+ * 为什么需要它：开机后马上进在线页时，SD 卡可能还没挂上 —— 那次 fopen 失败并不
+ * 代表"没登录过"，但 net_cookie_load() 一旦下了结论就会一直沿用，界面于是永远停在
+ * "未登录"，用户得重新扫码。UI 在重建账号页时调这个，挂载完成后就能自动恢复登录态。
+ */
+esp_err_t online_netease_cookie_reload(void);
+
+/*
+ * 已登录账号昵称（NVS 持久化，重启后立刻可用）。
+ * 没有存过 / 已退出登录返回**空串**（不是 NULL）。
+ *
+ * 为什么要落 NVS：昵称只能靠 /user/account 请求拿到，重启后要等网络往返（几秒，
+ * 没网就一直没有）—— 期间界面上"已登录：XX"会变成"已登录：网易云账号"，
+ * 看起来就是"用户名丢了"。
+ */
+const char *online_netease_nickname(void);
+/* 记下昵称（传 NULL/空串 = 清掉）；online_netease_account() 成功时会自动调它 */
+esp_err_t online_netease_nickname_set(const char *name);
+/* 退出登录：清内存 + 删 SD 上的 cookie 文件 */
+esp_err_t online_netease_logout(void);
+
+/* ---------------------------------------------------------------- 账号数据
+ *
+ * 下面这些都带 cookie 调（`?cookie=<urlencoded>`）。
+ * cookie 失效时的表现已实测：/user/account 返回 {"account":null,"profile":null}
+ * —— 所以 online_netease_account() 返 ESP_ERR_INVALID_STATE 就表示"要重新登录"。
+ */
+
+typedef struct {
+    char uid[24];
+    char nickname[64];
+} online_account_t;
+
+/* 账号信息（GET /user/account） */
+esp_err_t online_netease_account(online_account_t *out);
+
+typedef struct {
+    char id[ONLINE_ID_MAX];
+    char name[ONLINE_NAME_MAX];
+    char cover_url[ONLINE_URL_MAX];
+    int  track_count;
+    bool self_created;        /* true = 自己创建，false = 收藏的歌单 */
+} online_acct_playlist_t;
+
+/* 账号里的歌单（GET /user/playlist?uid=<uid>&limit=…） */
+esp_err_t online_netease_account_playlists(const char *uid, online_acct_playlist_t *out,
+                                           size_t max, size_t *out_n);
+
+/*
+ * 歌单里的歌 —— **分页取**（懒加载用；见 app_online 的"每页 100 首"）。
+ *
+ *   GET /playlist/track/all?id=<歌单ID>&limit=100&offset=<offset+已取>
+ *   内部按 PL_PAGE_SONGS(100) 首一页循环，直到取满 max 首或歌单结束：
+ *     ⚠ 服务端这个接口返回的是**完整 song detail 对象**（ar/al/dt/h/m/l/privileges…，
+ *       实测 ~2.3 KB/首）—— 一次要 300 首 ≈ 700 KB，超过单响应上限 NET_JSON_MAX(512 KB)
+ *       就会整个失败。所以**绝不能**一次要太多：单页 100 首 ≈ 250 KB 才稳。
+ *
+ *   *out_n = 实际取到几首；**< max 就说明已经到歌单末尾**（调用方据此收尾）。
+ *   只填 id / title / artist / cover_url —— audio_url 留空，播放时按需取直链
+ *   （见 online_netease_song_url）。offset 为 0 且第一页就失败时，退回
+ *   /playlist/detail 再试一次（老接口，只对小歌单有效）。
+ */
+#define ONLINE_PL_PAGE_SONGS  100
+esp_err_t online_netease_playlist_page(const char *pl_id, size_t offset,
+                                       online_song_t *out, size_t max, size_t *out_n);
+
+/* 每日推荐（GET /recommend/songs → data.dailySongs[]），同上只填元数据 */
+esp_err_t online_netease_daily_songs(online_song_t *out, size_t max, size_t *out_n);
+
+/*
+ * 带 cookie 取播放**直链**（GET /song/url/v1?id=<id>&level=standard）。
+ * 实测返回的就是可直接播的 http 地址（不再 302），并带 size/br —— 顺便把总时长算出来
+ * （之前"总时长算不出来"的老问题，在这条路上天然解决）。
+ * out_bytes / out_dur_ms 可为 NULL。
+ */
+esp_err_t online_netease_song_url(const char *song_id, char *out, size_t cap,
+                                  int64_t *out_bytes, uint32_t *out_dur_ms);
+
 /*
  * 歌词文本（PSRAM 缓存，不落 SD）。
  * 成功时 *out 是**调用方所有**的 NUL 结尾 malloc 文本（UTF-8 原样，直接交给

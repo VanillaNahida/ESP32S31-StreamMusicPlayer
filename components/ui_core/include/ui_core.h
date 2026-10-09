@@ -97,6 +97,13 @@ bool ui_drawer_is_open(void);
 
 void ui_toast(const char *text, uint32_t duration_ms);
 
+/*
+ * 立刻收掉当前 Toast（不等 duration 到点）。
+ * 给"结束时刻由代码决定"的场景用（例如开机启动图淡出：见 main/splash.cc）。
+ * 没有 Toast 显示时是空操作。
+ */
+void ui_toast_hide(void);
+
 /* ------------------------------------------------------------------ 弹层动画
  *
  * 弹窗/菜单/Toast 这类"突然出现、突然消失"的东西统一走这两个函数做**渐入渐出**

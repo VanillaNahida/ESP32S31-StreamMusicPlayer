@@ -7,6 +7,7 @@
 #include "ui_core.h"
 #include "ui_metrics.h"
 #include "ui_internal.h"
+#include "ui_home_bg.h"
 
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
@@ -22,41 +23,112 @@ static bool s_screen_off;
 
 /* ------------------------------------------------------------------ 弹层动画
  *
- * 统一的"渐入渐出"：遮罩只淡入淡出，面板额外做一点上滑（起点在下面 10 px），
- * 时间 160 ms 进 / 140 ms 出，ease_out。数值刻意偏快 —— 这是交互反馈，不是过场，
- * 太慢会显得"卡"（LVGL 是软渲染，每帧都在重绘浮层这块区域）。
+ * 照搬 assets/blue_archive_ui_replica.html 的那两条关键帧：
+ *
+ *   进场 slideInUp  0.38s cubic-bezier(0.16, 1, 0.3, 1)
+ *       0%   translateY(100vh) scale(0.95) opacity 0
+ *       70%  translateY(-8px)               opacity 1     ← 冲过头再回弹
+ *       100% translateY(0)     scale(1)     opacity 1
+ *
+ *   退场 slideOutDown 0.3s cubic-bezier(0.7, 0, 0.84, 0)
+ *       100% translateY(100vh) scale(0.92) opacity 0
+ *
+ * 三点移植上的取舍（都在 ESP32-S31 软渲染的前提下）：
+ *
+ * 1. **不做 scale**。LVGL 的缩放/旋转要先把整棵子树渲染进 ARGB8888 图层再变换，
+ *    一张 480x300 的卡片就是 ~560 KB 图层缓冲、而且动画期间**逐帧**申请释放。
+ *    这里只用 translate_y + opa（二者都是纯样式，不建图层），观感差别很小。
+ * 2. **"100vh" 换成固定像素**。整屏高的位移在 480 px 的屏上会让浮层从屏幕外
+ *    飞进来，配合 300 ms 的时长显得拖沓；取 UI_PX_H(46) 起步更有"弹"的感觉。
+ * 3. 时长 380/300 ms 收到 300/240 ms：这是触摸反馈不是过场，太慢会被当成卡顿。
+ *
+ * 缓动：cubic-bezier(0.16,1,0.3,1) ≈ 先快后极慢（出四分之三路程只用 1/4 时间），
+ * 用 1-(1-t)^4 很接近；退场那条 bezier 是"慢起快走"，用 t^3 近似。
+ * 回弹靠"70% 处过冲到 -6 px"这段分段函数实现。
  *
  * 用 lv_obj_set_style_opa 而不是 bg_opa：前者是**整个对象及其子树**的透明度，
  * 一次调用就能把面板里的图标/文字一起淡出，不用逐个改子对象。
  */
-#define POPUP_IN_MS    160
-#define POPUP_OUT_MS   140
-#define POPUP_SLIDE_PX UI_PX_H(10)
+#define POPUP_IN_MS     300
+#define POPUP_OUT_MS    240
+#define POPUP_SLIDE_PX  UI_PX_H(46)   /* 进场起点：卡片在目标位置下方这么远 */
+#define POPUP_OVER_PX   UI_PX_H(6)    /* 70% 处冲过头的距离 */
+#define BA_ANIM_RANGE   1000          /* 动画进度量程（0..1000） */
+
+static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+/* 1-(1-t)^4：进场用（t 为 0..1000） */
+static int32_t ease_out_quart(int32_t t)
+{
+    const int32_t u = 1000 - t;
+    /* u^4 / 1000^3，保持整数运算 */
+    int64_t p = (int64_t)u * u / 1000;
+    p = p * u / 1000;
+    p = p * u / 1000;
+    return 1000 - (int32_t)p;
+}
+
+/* t^3：退场用 */
+static int32_t ease_in_cubic(int32_t t)
+{
+    int64_t p = (int64_t)t * t / 1000;
+    p = p * t / 1000;
+    return (int32_t)p;
+}
 
 /* 只改透明度（遮罩用：整屏滑动看起来会晃） */
 static void popup_opa_cb(void *var, int32_t v)
 {
-    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)(v < 0 ? 0 : (v > 255 ? 255 : v)),
-                         LV_PART_MAIN);
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)clamp_i32(v, 0, 255), LV_PART_MAIN);
 }
 
-/* 透明度 + 上滑（面板/Toast 用）：v 从 0→255 是"进入"，255→0 是"退出" */
-static void popup_opa_slide_cb(void *var, int32_t v)
+/*
+ * 进场：进度 0..1000
+ *   位移  0~700 段：从 +SLIDE 收到 -OVER（用 ease_out_quart）
+ *         700~1000 段：从 -OVER 回落到 0（线性，很短）
+ *   透明度 0~120 段：0 → 255（CSS 的 12% 处就到 1.0），之后保持
+ */
+static void popup_in_cb(void *var, int32_t v)
 {
     lv_obj_t *o = (lv_obj_t *)var;
-    if (v < 0) {
-        v = 0;
-    } else if (v > 255) {
-        v = 255;
+    v = clamp_i32(v, 0, BA_ANIM_RANGE);
+
+    int32_t opa;
+    if (v >= 120) {
+        opa = 255;
+    } else {
+        opa = v * 255 / 120;
     }
-    lv_obj_set_style_opa(o, (lv_opa_t)v, LV_PART_MAIN);
-    /* 透明时下沉 POPUP_SLIDE_PX，不透明时归位（显式转 int：UI_PX_H 可能是浮点表达式） */
-    lv_obj_set_style_translate_y(o, (int32_t)((255 - v) * POPUP_SLIDE_PX / 255), LV_PART_MAIN);
+    lv_obj_set_style_opa(o, (lv_opa_t)opa, LV_PART_MAIN);
+
+    int32_t ty;
+    if (v < 700) {
+        const int32_t e = ease_out_quart(v * 1000 / 700);   /* 0..1000 */
+        ty = POPUP_SLIDE_PX + (int32_t)((int64_t)(-POPUP_OVER_PX - POPUP_SLIDE_PX) * e / 1000);
+    } else {
+        const int32_t e = (v - 700) * 1000 / 300;           /* 0..1000 */
+        ty = -POPUP_OVER_PX + (int32_t)((int64_t)POPUP_OVER_PX * e / 1000);
+    }
+    lv_obj_set_style_translate_y(o, ty, LV_PART_MAIN);
 }
 
-static void popup_anim(lv_obj_t *obj, int32_t from, int32_t to, uint32_t ms, bool slide)
+/* 退场：往下滑 + 淡出（t^3，慢起快走） */
+static void popup_out_cb(void *var, int32_t v)
 {
-    if (!obj) {
+    lv_obj_t *o = (lv_obj_t *)var;
+    v = clamp_i32(v, 0, BA_ANIM_RANGE);
+    const int32_t e = ease_in_cubic(v);
+    lv_obj_set_style_opa(o, (lv_opa_t)(255 - 255 * e / 1000), LV_PART_MAIN);
+    lv_obj_set_style_translate_y(o, (int32_t)((int64_t)POPUP_SLIDE_PX * e / 1000), LV_PART_MAIN);
+}
+
+static void popup_anim(lv_obj_t *obj, int32_t from, int32_t to, uint32_t ms,
+                       lv_anim_exec_xcb_t exec)
+{
+    if (!obj || !exec) {
         return;
     }
     lv_anim_t a;
@@ -64,17 +136,18 @@ static void popup_anim(lv_obj_t *obj, int32_t from, int32_t to, uint32_t ms, boo
     lv_anim_set_var(&a, obj);
     lv_anim_set_values(&a, from, to);
     lv_anim_set_duration(&a, ms);
-    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&a, slide ? popup_opa_slide_cb : popup_opa_cb);
+    lv_anim_set_path_cb(&a, lv_anim_path_linear);   /* 缓动在 exec 里自己做 */
+    lv_anim_set_exec_cb(&a, exec);
     lv_anim_start(&a);
 }
 
 void ui_popup_in(lv_obj_t *scrim, lv_obj_t *panel)
 {
     if (scrim) {
-        popup_anim(scrim, LV_OPA_TRANSP, LV_OPA_COVER, POPUP_IN_MS, false);
+        /* 遮罩只淡入（整屏跟着滑会晃） */
+        popup_anim(scrim, LV_OPA_TRANSP, LV_OPA_COVER, POPUP_IN_MS, popup_opa_cb);
     }
-    popup_anim(panel, LV_OPA_TRANSP, LV_OPA_COVER, POPUP_IN_MS, true);
+    popup_anim(panel, 0, BA_ANIM_RANGE, POPUP_IN_MS, popup_in_cb);
 }
 
 /* 淡出结束 → 删掉整块浮层（动画回调里删，所以用 async 版本） */
@@ -93,10 +166,10 @@ void ui_popup_out(lv_obj_t *scrim, lv_obj_t *panel)
         return;
     }
     if (scrim) {
-        popup_anim(scrim, LV_OPA_COVER, LV_OPA_TRANSP, POPUP_OUT_MS, false);
+        popup_anim(scrim, LV_OPA_COVER, LV_OPA_TRANSP, POPUP_OUT_MS, popup_opa_cb);
     }
     if (panel) {
-        popup_anim(panel, LV_OPA_COVER, LV_OPA_TRANSP, POPUP_OUT_MS, true);
+        popup_anim(panel, 0, BA_ANIM_RANGE, POPUP_OUT_MS, popup_out_cb);
     }
 
     /* 用 victim 上的那条动画作为"收尾"：它跑完就删（透明度那条也差不多同时结束） */
@@ -110,7 +183,50 @@ void ui_popup_out(lv_obj_t *scrim, lv_obj_t *panel)
     lv_anim_start(&a);
 }
 
-/* ------------------------------------------------------------------ Toast */
+/* ------------------------------------------------------------------ Toast
+ *
+ * ⚠ Toast **不走**碧蓝档案那套弹层动画/配色（用户明确要求保留原样）：
+ * 它是"屏幕下方 90 px 的黑色半透明小胶囊 + 淡入淡出各带一点上滑"，
+ * 与上面 ui_popup_in()/ui_popup_out() 的 BA 动效刻意分开。
+ * 时长与位移也保持原来的 160/140 ms、10 px，别跟 BA 的常量混用。
+ */
+#define TOAST_IN_MS    160
+#define TOAST_OUT_MS   140
+#define TOAST_SLIDE_PX UI_PX_H(10)
+
+/* 透明度 + 上滑：v 从 0→255 是"进入"，255→0 是"退出" */
+static void toast_opa_slide_cb(void *var, int32_t v)
+{
+    lv_obj_t *o = (lv_obj_t *)var;
+    v = clamp_i32(v, 0, 255);
+    lv_obj_set_style_opa(o, (lv_opa_t)v, LV_PART_MAIN);
+    /* 透明时下沉 TOAST_SLIDE_PX，不透明时归位（显式转 int：UI_PX_H 可能是浮点表达式） */
+    lv_obj_set_style_translate_y(o, (int32_t)((255 - v) * TOAST_SLIDE_PX / 255), LV_PART_MAIN);
+}
+
+static void toast_anim(lv_obj_t *o, int32_t from, int32_t to, uint32_t ms,
+                       lv_anim_ready_cb_t done)
+{
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, o);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, toast_opa_slide_cb);
+    if (done) {
+        lv_anim_set_ready_cb(&a, done);
+    }
+    lv_anim_start(&a);
+}
+
+/* 淡出结束 → 藏起来（对象常驻，不删） */
+static void toast_hidden_cb(lv_anim_t *an)
+{
+    if (an->var) {
+        lv_obj_add_flag((lv_obj_t *)an->var, LV_OBJ_FLAG_HIDDEN);
+    }
+}
 
 static void toast_hide_cb(lv_timer_t *t)
 {
@@ -118,19 +234,7 @@ static void toast_hide_cb(lv_timer_t *t)
     s_toast_timer = NULL;
     /* 淡出（不删对象：Toast 是常驻的，只是藏起来） */
     if (s_toast) {
-        lv_anim_t a;
-        lv_anim_init(&a);
-        lv_anim_set_var(&a, s_toast);
-        lv_anim_set_values(&a, LV_OPA_COVER, LV_OPA_TRANSP);
-        lv_anim_set_duration(&a, POPUP_OUT_MS);
-        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
-        lv_anim_set_exec_cb(&a, popup_opa_slide_cb);
-        lv_anim_set_ready_cb(&a, [](lv_anim_t *an) {
-            if (an->var) {
-                lv_obj_add_flag((lv_obj_t *)an->var, LV_OBJ_FLAG_HIDDEN);
-            }
-        });
-        lv_anim_start(&a);
+        toast_anim(s_toast, LV_OPA_COVER, LV_OPA_TRANSP, TOAST_OUT_MS, toast_hidden_cb);
     }
 }
 
@@ -147,13 +251,36 @@ void ui_toast(const char *text, uint32_t duration_ms)
     lv_obj_remove_flag(s_toast, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_toast);
     /* 渐入：连着来几个 Toast 也不会"跳"出来 */
-    popup_anim(s_toast, LV_OPA_TRANSP, LV_OPA_COVER, POPUP_IN_MS, true);
+    toast_anim(s_toast, LV_OPA_TRANSP, LV_OPA_COVER, TOAST_IN_MS, NULL);
 
     if (duration_ms == 0) {
         duration_ms = 1800;
     }
     s_toast_timer = lv_timer_create(toast_hide_cb, duration_ms, NULL);
     lv_timer_set_repeat_count(s_toast_timer, 1);
+}
+
+/*
+ * 立刻收掉当前 Toast（不等到 duration 到点）。
+ *
+ * 给"启动图淡出"这种**由代码决定结束时刻**的场景用：main/splash.cc 在过渡动画开始
+ * 时调一次，免得"正在初始化..."在首页上继续飘着（它的 duration 只是兜底）。
+ * 没有 Toast 时是空操作。
+ */
+void ui_toast_hide(void)
+{
+    if (!s_toast) {
+        return;
+    }
+    if (s_toast_timer) {
+        lv_timer_delete(s_toast_timer);
+        s_toast_timer = NULL;
+    }
+    if (lv_obj_has_flag(s_toast, LV_OBJ_FLAG_HIDDEN)) {
+        return;
+    }
+    /* 与 toast_hide_cb 同一套淡出：透明度动完就藏起来（对象常驻，不删） */
+    toast_anim(s_toast, LV_OPA_COVER, LV_OPA_TRANSP, TOAST_OUT_MS, toast_hidden_cb);
 }
 
 lv_obj_t *ui_toast_create(lv_obj_t *parent)
@@ -368,6 +495,13 @@ esp_err_t ui_core_init(void)
      * 拖音量不会误触功能抽屉；隐藏时整块在屏幕外，热区照常工作。 */
     ui_volume_panel_create(top);
 
+    /*
+     * 首页背景图（assets/background.jpg）：先把后台解码任务发出去，再去建首页 ——
+     * 这样几百毫秒的 JPEG 软解与建首页、徽标绘制重叠，用户看不到"先纯色再跳出壁纸"。
+     * 图是 screen 自己的 bg_image，贴图由 ui_home_bg.cc 负责（解好即贴）。
+     */
+    ui_home_bg_start();
+
     /* 首页 */
     esp_err_t ret = ui_router_init_home();
     if (ret != ESP_OK) {
@@ -375,7 +509,11 @@ esp_err_t ui_core_init(void)
         return ret;
     }
 
-    ui_toast("系统就绪", 1200);
+    /*
+     * 这里**不再**弹"系统就绪"的 Toast：开机那一段现在由 main/splash.cc 的启动图
+     * （assets/init.jpg + "正在初始化..."）负责，它盖在最上层，弹在这里也会被盖住
+     * —— 谁开场由 app 层决定，框架层不抢这个时机。
+     */
     ESP_LOGI(TAG, "ui_core ready");
     return ESP_OK;
 }

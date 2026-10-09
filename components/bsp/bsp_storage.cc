@@ -11,6 +11,8 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"          /* sdmmc_card_t（bsp_sdcard_card_info 用） */
+#include "sd_protocol_defs.h"   /* SD_OCR_SDHC_CAP / SD_OCR_S18_RA */
 #include "esp_board_manager_includes.h"
 
 static const char *TAG = "bsp_sd";
@@ -94,5 +96,60 @@ esp_err_t bsp_sdcard_capacity_kb(uint32_t *total_kb, uint32_t *free_kb)
     if (free_kb) {
         *free_kb = (uint32_t)(free_bytes / 1024);
     }
+    return ESP_OK;
+}
+
+/*
+ * 卡的物理信息（"设置 → 存储"详情页要显示的额外几行）。
+ *
+ * 解码口径**照抄 IDF 的 sdmmc_card_print_info()**（sdmmc/sdmmc_common.c:314-361），
+ * 别自己发明：类型靠 ocr 的 CCS/S18R 位判，数据线宽度取 ssr.cur_bus_width
+ * （那是**当前**宽度，不是卡支持的最大值）。
+ */
+esp_err_t bsp_sdcard_card_info(bsp_sd_card_info_t *out)
+{
+    if (!out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s_mounted) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    void *handle = NULL;
+    esp_err_t ret = esp_board_manager_get_device_handle(SD_DEV_NAME, &handle);
+    if (ret != ESP_OK || !handle) {
+        return (ret == ESP_OK) ? ESP_FAIL : ret;
+    }
+    const dev_fs_fat_handle_t *fat = (const dev_fs_fat_handle_t *)handle;
+    const sdmmc_card_t *card = fat->card;
+    if (!card) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    out->card_bytes   = (uint64_t)card->csd.capacity * (uint64_t)card->csd.sector_size;
+    out->freq_khz     = card->real_freq_khz;
+    out->max_freq_khz = (int)card->max_freq_khz;
+    out->bus_width    = card->ssr.cur_bus_width ? 4 : 1;
+    out->ddr          = card->is_ddr != 0;
+
+    if (card->is_mmc) {
+        snprintf(out->type, sizeof(out->type), "MMC");
+    } else if (card->is_sdio) {
+        snprintf(out->type, sizeof(out->type), "SDIO");
+    } else if ((card->ocr & SD_OCR_SDHC_CAP) == 0) {
+        snprintf(out->type, sizeof(out->type), "SDSC");
+    } else if (card->ocr & SD_OCR_S18_RA) {
+        snprintf(out->type, sizeof(out->type), "SDHC/SDXC (UHS-I)");
+    } else {
+        snprintf(out->type, sizeof(out->type), "SDHC");
+    }
+
+    /* CID 里的产品名是 8 字节、**空格填充**的（不是 NUL 结尾），要自己截 + 去尾空格 */
+    snprintf(out->name, sizeof(out->name), "%.8s", card->cid.name);
+    for (int i = (int)strlen(out->name) - 1; i >= 0 && out->name[i] == ' '; i--) {
+        out->name[i] = '\0';
+    }
+    out->serial = (uint32_t)card->cid.serial;
     return ESP_OK;
 }

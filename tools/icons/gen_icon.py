@@ -167,19 +167,19 @@ def resize_rgba(w: int, h: int, rgba: bytes, tw: int, th: int) -> bytes:
     return bytes(out)
 
 
-def emit_c(name: str, tw: int, th: int, rgba: bytes, src_name: str) -> str:
+def emit_icon(name: str, tw: int, th: int, rgba: bytes, src_name: str) -> str:
+    """单个图标的 C 代码块（静态像素表 + lv_image_dsc_t），不含 #include。"""
     lines = [
         "/*",
-        f" * {name} —— 由 tools/icons/gen_icon.py 从 assets/icons/{src_name} 生成。",
+        f" * {name} —— 由 tools/icons/gen_icon.py 从 {src_name} 生成。",
         " * 不要手改：重新生成 =",
-        f" *   tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \\",
-        f" *       assets/icons/{src_name} --name {name} --size {tw}",
+        " *   tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \\",
+        f" *       {src_name} --name {name} --size {tw}",
+        " * （或按 assets/icons/icons.txt 清单一次生成全部，见文件头）",
         " *",
         f" * {tw}x{th} ARGB8888（LVGL 字节序 B,G,R,A），像素已解码好 —— 运行时不需要",
         " * 任何 PNG 解码器（本工程没开 LV_USE_LIBPNG/LODEPNG）。",
         " */",
-        '#include "lvgl.h"',
-        "",
         f"static const uint8_t {name}_map[] = {{",
     ]
     per = 16   # 每行 16 个字节
@@ -206,32 +206,80 @@ def emit_c(name: str, tw: int, th: int, rgba: bytes, src_name: str) -> str:
     return "\n".join(lines)
 
 
+FILE_HEADER = """/*
+ * ui_icons.c —— 烘进固件的位图图标（全部由 tools/icons/gen_icon.py 生成，不要手改）
+ *
+ * 一次生成全部（清单在 assets/icons/icons.txt）：
+ *   tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \\
+ *       --manifest assets/icons/icons.txt -o components/ui_core/ui_icons.c
+ *
+ * 清单里那几个源图里有两个"扩展名撒谎"的（见 tools/icons/prepare_sources.ps1）：
+ * default.png 其实是 JPEG、MomoIcon.png 其实是 ICO，另外那个 ✕ 本来是内联 SVG。
+ * 换素材后先跑 prepare_sources.ps1 转成标准 PNG，再跑本脚本。
+ *
+ * 为什么烘成 C 数组而不是运行时解码：
+ *   图标是固定尺寸的小图，编译期解好 = 运行时零解码开销、也不占解码器代码；
+ *   声明见 include/ui_icons.h。
+ */
+#include "lvgl.h"
+
+"""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("png")
+    ap.add_argument("png", nargs="?", help="单个 PNG 源（不用 --manifest 时必填）")
+    ap.add_argument("--manifest", default=None,
+                    help="图标清单文件：每行 `路径 符号名 尺寸`，# 开头是注释")
     ap.add_argument("--name", default="netease_logo")
     ap.add_argument("--size", type=int, default=96, help="输出边长（默认 UI_HOME_ICON=96）")
     ap.add_argument("-o", "--out", default=None)
     a = ap.parse_args()
 
-    src = Path(a.png)
-    if not src.is_absolute():
-        src = ROOT / src
-    if not src.exists():
-        sys.exit(f"找不到 {src}")
+    jobs = []   # (源文件, 符号名, 尺寸)
+    if a.manifest:
+        man = Path(a.manifest)
+        if not man.is_absolute():
+            man = ROOT / man
+        if not man.exists():
+            sys.exit(f"找不到清单 {man}")
+        for lineno, raw in enumerate(man.read_text(encoding="utf-8").splitlines(), 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 3:
+                sys.exit(f"{man.name}:{lineno} 应该是 `路径 符号名 尺寸`，实际是 {raw!r}")
+            jobs.append((parts[0], parts[1], int(parts[2])))
+        if not jobs:
+            sys.exit("清单里一个图标都没有")
+    else:
+        if not a.png:
+            sys.exit("要么给一个 PNG 源，要么用 --manifest")
+        jobs.append((a.png, a.name, a.size))
 
-    w, h, rgba = decode_png(src)
-    print(f"输入 : {src.name}  {w}x{h}")
-    if w != h:
-        print(f"注意 : 输入不是正方形（{w}x{h}），会按 {a.size}x{a.size} 拉伸")
-    px = resize_rgba(w, h, rgba, a.size, a.size)
-    print(f"输出 : {a.name}  {a.size}x{a.size} ARGB8888  {len(px) / 1024:.1f} KB 位图")
+    blocks = []
+    px_bytes = 0
+    for path, name, size in jobs:
+        src = Path(path)
+        if not src.is_absolute():
+            src = ROOT / src
+        if not src.exists():
+            sys.exit(f"找不到 {src}")
+        w, h, rgba = decode_png(src)
+        note = "" if w == h else f"（源 {w}x{h} 非正方形，按 {size}x{size} 拉伸）"
+        print(f"{src.name:<26} {w}x{h} -> {name:<18} {size}x{size} {note}")
+        px = resize_rgba(w, h, rgba, size, size)
+        px_bytes += len(px)
+        blocks.append(emit_icon(name, size, size, px, f"assets/icons/{src.name}"
+                                if src.parent.name == "icons" else f"assets/{src.name}"))
 
     out = Path(a.out) if a.out else (ROOT / "components" / "ui_core" / "ui_icons.c")
     if not out.is_absolute():
         out = ROOT / out
-    out.write_text(emit_c(a.name, a.size, a.size, px, src.name), encoding="utf-8")
-    print(f"写入 : {out.relative_to(ROOT)}  {out.stat().st_size / 1024:.0f} KB 源码")
+    out.write_text(FILE_HEADER + "\n".join(blocks), encoding="utf-8")
+    print(f"写入 : {out.relative_to(ROOT)}  {out.stat().st_size / 1024:.0f} KB 源码 "
+          f"（{len(blocks)} 个图标，位图合计 {px_bytes / 1024:.1f} KB flash）")
     return 0
 
 

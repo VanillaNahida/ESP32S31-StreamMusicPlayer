@@ -212,3 +212,17 @@ CONFIG_LOG_MAXIMUM_LEVEL_DEBUG=y
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+# 网易云 API 服务地址（二维码登录/账号歌单/每日推荐）—— 见 main/Kconfig.projbuild
+CONFIG_ONLINE_NETEASE_API_BASE="http://localhost:3000"
+
+# 服务端访问鉴权 Token（Authorization: Bearer）—— 见 main/Kconfig.projbuild
+CONFIG_ONLINE_NETEASE_API_TOKEN="sk-kP0pF3yD4gF6aP2qW3lJ2wD8gV9zO"
+
+# ---------------------------------------------------------------------------
+# 内置网易云 cookie（免扫码登录）—— 见 main/Kconfig.projbuild
+#
+# 路径是**相对工程根目录**的，构建时该文件被 EMBED 进固件，
+# 设备端从中取 MUSIC_U / __csrf 用。留空 = 不启用（退回扫码登录）。
+# ⚠ 这份 cookie 等于账号凭证，别连同 assets/ncm-ck.txt 一起提交到公开仓库。
+# ---------------------------------------------------------------------------
+CONFIG_ONLINE_NETEASE_CK_FILE="assets/ncm-ck.txt"

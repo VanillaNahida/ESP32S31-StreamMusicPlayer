@@ -25,6 +25,7 @@
 
 #include "ui_core.h"
 #include "ui_metrics.h"
+#include "ui_ba.h"          /* 碧蓝档案风格弹窗工具箱（Wi-Fi 密码浮层用） */
 #include "ui_app_registry.h"
 
 #include "bsp.h"
@@ -34,10 +35,14 @@
 
 static const char *TAG = "app_settings";
 
-/* Wi-Fi / 蓝牙总开关的行内控件（settings_tick 里按服务真实状态刷新） */
-static lv_obj_t *s_sw_wifi;
-static lv_obj_t *s_sw_bt;
-static volatile int s_radio_busy;      /* 1 = 正在切 Wi-Fi，2 = 正在切蓝牙 */
+/*
+ * 无线总开关。
+ *   - `s_radio_busy`：1 = 正在切 Wi-Fi，2 = 正在切蓝牙（切换过程中开关位置不刷，
+ *     免得跟手指打架）；
+ *   - 开关控件本身登记在 s_radio_sw[] 里 —— 设置主页一行、Wi-Fi / 蓝牙子页顶部各一行，
+ *     它们是**同一个开关的两个实例**，由 radio_sw_sync() 一起拉齐。
+ */
+static volatile int s_radio_busy;
 
 /* ------------------------------------------------------------------ 公共部件 */
 
@@ -234,6 +239,10 @@ static lv_obj_t *make_row_btn_copy(lv_obj_t *row, const char *text, lv_event_cb_
 static lv_obj_t *page_wifi(void);
 static lv_obj_t *page_bt(void);
 static lv_obj_t *page_output(void);
+static lv_obj_t *page_storage(void);
+
+/* 容量格式化（KB → "12.3 GB" / "345 MB" / "78 KB"）；实现在下面的"存储"一段 */
+static void storage_fmt_size_kb(uint32_t kb, char *out, size_t cap);
 
 /* ================================================================== 一级：设置列表 */
 
@@ -249,8 +258,7 @@ static void settings_on_delete(lv_event_t *e)
         lv_timer_delete(s_sum_timer);
         s_sum_timer = NULL;
     }
-    s_sw_wifi = NULL;      /* 页面对象已销毁，指针别留着 */
-    s_sw_bt   = NULL;
+    /* 开关控件随页面一起销毁：它们的 LV_EVENT_DELETE 会自己从 s_radio_sw[] 注销 */
     memset(s_sum, 0, sizeof(s_sum));
 }
 
@@ -276,6 +284,11 @@ static void radio_toggle_task(void *arg)
 static void on_radio_switch(lv_event_t *e)
 {
     const int which = (int)(intptr_t)lv_event_get_user_data(e);
+    /*
+     * 值变了也拦下冒泡：这行本身是"点进子页"的，开关上的事件不该再传到行上
+     * （CLICKED 那条路见 on_radio_switch_clicked）。
+     */
+    lv_event_stop_bubbling(e);
     if (s_radio_busy) {
         return;                     /* 上一个还在切，忽略这次（tick 会把位置刷回来） */
     }
@@ -302,26 +315,149 @@ static void on_radio_switch(lv_event_t *e)
     }
 }
 
-/* 一行开关：图标块 + 名字 + 右侧 lv_switch */
+/* ---- 开关实例表：主页一行 + 子页顶部一行，共用一个同步函数 ---- */
+
+enum { RADIO_WIFI = 1, RADIO_BT = 2 };
+#define RADIO_SW_MAX 4
+
+static struct {
+    int       which;
+    lv_obj_t *sw;
+} s_radio_sw[RADIO_SW_MAX];
+
+static void radio_sw_register(int which, lv_obj_t *sw)
+{
+    for (size_t i = 0; i < RADIO_SW_MAX; i++) {
+        if (!s_radio_sw[i].sw) {
+            s_radio_sw[i].which = which;
+            s_radio_sw[i].sw    = sw;
+            return;
+        }
+    }
+}
+
+/*
+ * ★ 开关对象销毁时必须注销。
+ *   子页会被反复 push/pop，页面一销毁那个 lv_switch 就没了；不注销的话
+ *   radio_sw_sync() 会拿一个已释放的指针去 add/remove_state（use-after-free）。
+ */
+static void radio_sw_deleted(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target_obj(e);
+    for (size_t i = 0; i < RADIO_SW_MAX; i++) {
+        if (s_radio_sw[i].sw == sw) {
+            s_radio_sw[i].sw = NULL;
+        }
+    }
+}
+
+/*
+ * 把所有开关实例拉回"服务真实状态"。
+ *
+ * 每个页面各自的 500 ms tick 都会调它（settings_tick / wifi_tick / bt_tick），
+ * 所以不管当前在哪一页，主页与子页的开关都是同一个状态 —— 这就是"双向同步"。
+ */
+static void radio_sw_sync(void)
+{
+    if (s_radio_busy) {
+        return;                     /* 正在切：等服务给出结果再对齐 */
+    }
+    for (size_t i = 0; i < RADIO_SW_MAX; i++) {
+        lv_obj_t *sw = s_radio_sw[i].sw;
+        if (!sw) {
+            continue;
+        }
+        const bool on = (s_radio_sw[i].which == RADIO_WIFI) ? wifi_service_is_enabled()
+                                                           : bt_service_is_enabled();
+        if (on == lv_obj_has_state(sw, LV_STATE_CHECKED)) {
+            continue;
+        }
+        if (on) {
+            lv_obj_add_state(sw, LV_STATE_CHECKED);
+        } else {
+            lv_obj_remove_state(sw, LV_STATE_CHECKED);
+        }
+    }
+}
+
+/* 点开关图案：只切开关。顺带拦下 CLICKED，别冒泡到行上变成"进子页" */
+static void on_radio_switch_clicked(lv_event_t *e)
+{
+    lv_event_stop_bubbling(e);
+}
+
+/*
+ * 子页描述：router 的 page_desc_t 里 id/create 是**按值拷贝指针**的，
+ * 所以这两个成员必须是静态存储期 —— 用静态常量描述符传给 make_switch_row 即可。
+ */
+typedef struct {
+    lv_obj_t *(*create)(void);
+    const char *id;
+} subpage_desc_t;
+
+/* Wi-Fi / 蓝牙子页（静态存储期：router 直接存 id/create 指针） */
+static const subpage_desc_t SUB_WIFI = { page_wifi, "set_wifi" };
+static const subpage_desc_t SUB_BT   = { page_bt,   "set_bt"   };
+static const subpage_desc_t SUB_STORAGE = { page_storage, "set_storage" };
+
+/* 点开关行的空白/名称区 = 进子页（点开关图案进不来，见 on_radio_switch_clicked） */
+static void on_switch_row_click(lv_event_t *e)
+{
+    const subpage_desc_t *sp = (const subpage_desc_t *)lv_event_get_user_data(e);
+    if (!sp || !sp->create) {
+        return;
+    }
+    page_desc_t p = {};
+    p.id      = sp->id;
+    p.create  = sp->create;
+    p.no_back = true;            /* 子页外壳自带返回钮，别再叠全局返回键 */
+    ui_router_push(&p);
+}
+
+/*
+ * 开关行（需求：开关与"进入子页"合并成一行，别再像以前那样
+ * "上面一行开关 + 下面一行同名条目"）：
+ *
+ *     [图标] [名称 / 状态]  [开关] [›]
+ *      └──────── 点这些进子页 ─────┘ └只切换┘
+ *
+ *   - 点**开关图案** → 只切开关，不跳页；
+ *   - 点行里其它任何地方（图标 / 名称 / 状态 / › / 空白）→ 进子页；
+ *   - 子页顶部放**同一个**开关（sub 传 NULL），两边状态由 radio_sw_sync() 对齐，
+ *     子页里改完返回主页立刻一致。
+ *
+ * 两个实现要点：
+ *   1) lv_switch 被点会发 CLICKED，而 LVGL 默认让事件**冒泡**到父对象 ——
+ *      不挡住的话"点开关"会连带触发行的"进子页"（见 on_radio_switch_clicked）；
+ *   2) 开关要能被各页的 tick 刷到，所以登记进 s_radio_sw[]，销毁时注销。
+ *
+ * @param sub        非 NULL = 点这一行进该子页；NULL = 只做开关（子页顶部用）
+ * @param status_out 状态文字 label（可为 NULL）；主页两行由 settings_tick 填摘要
+ */
 static lv_obj_t *make_switch_row(lv_obj_t *parent, const char *sym, uint32_t accent,
-                                 const char *name, int which, lv_obj_t **sw_out)
+                                 const char *name, int which,
+                                 const subpage_desc_t *sub, lv_obj_t **status_out)
 {
     lv_obj_t *row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
-    lv_obj_set_size(row, LV_PCT(100), UI_PX_H(56));
+    lv_obj_set_size(row, LV_PCT(100), UI_LIST_ROW_H);
     lv_obj_set_style_bg_color(row, UI_COLOR_SURFACE, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_radius(row, UI_PX_H(10), LV_PART_MAIN);
-    lv_obj_set_style_pad_hor(row, UI_PX_W(10), LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(row, UI_PX_W(12), LV_PART_MAIN);
+    lv_obj_set_style_pad_column(row, UI_PX_W(10), LV_PART_MAIN);
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
 
     lv_obj_t *icon = lv_obj_create(row);
     lv_obj_remove_style_all(icon);
     lv_obj_set_size(icon, UI_PX_H(36), UI_PX_H(36));
-    lv_obj_align(icon, LV_ALIGN_LEFT_MID, 0, 0);
     lv_obj_set_style_radius(icon, UI_PX_H(9), LV_PART_MAIN);
     lv_obj_set_style_bg_color(icon, lv_color_hex(accent), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(icon, LV_OPA_COVER, LV_PART_MAIN);
+    /* 不可点：点图标要落到行上（= 进子页），和名称区域一致 */
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_t *is = lv_label_create(icon);
     lv_obj_set_style_text_font(is, UI_FONT_TEXT, LV_PART_MAIN);
@@ -329,22 +465,52 @@ static lv_obj_t *make_switch_row(lv_obj_t *parent, const char *sym, uint32_t acc
     lv_label_set_text(is, sym);
     lv_obj_center(is);
 
-    lv_obj_t *nm = lv_label_create(row);
+    /* 名称 + 状态两行；状态那行由 tick 填摘要（"已连接 xx · 192.168.x.x · -50 dBm"） */
+    lv_obj_t *col = lv_obj_create(row);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_height(col, LV_SIZE_CONTENT);
+    lv_obj_set_flex_grow(col, 1);
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_row(col, UI_PX_H(2), LV_PART_MAIN);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(col, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *nm = lv_label_create(col);
     lv_obj_set_style_text_font(nm, UI_FONT_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_color(nm, UI_COLOR_FG, LV_PART_MAIN);
     lv_label_set_text(nm, name);
-    lv_obj_align(nm, LV_ALIGN_LEFT_MID, UI_PX_H(48), 0);
+    lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(nm, LV_PCT(100));
+
+    if (status_out) {
+        lv_obj_t *st = lv_label_create(col);
+        lv_obj_set_style_text_font(st, UI_FONT_SMALL, LV_PART_MAIN);
+        lv_obj_set_style_text_color(st, UI_COLOR_FG_DIM, LV_PART_MAIN);
+        lv_label_set_text(st, "…");
+        lv_label_set_long_mode(st, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(st, LV_PCT(100));
+        *status_out = st;
+    }
 
     lv_obj_t *sw = lv_switch_create(row);
     lv_obj_set_size(sw, UI_PX_W(52), UI_PX_H(28));
-    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, 0, 0);
     lv_obj_set_style_bg_color(sw, UI_COLOR_PILL, LV_PART_MAIN);
     lv_obj_set_style_bg_color(sw, UI_COLOR_ACCENT,
                               (lv_style_selector_t)LV_PART_INDICATOR |
                                   (lv_style_selector_t)LV_STATE_CHECKED);
     lv_obj_add_event_cb(sw, on_radio_switch, LV_EVENT_VALUE_CHANGED, (void *)(intptr_t)which);
-    if (sw_out) {
-        *sw_out = sw;
+    lv_obj_add_event_cb(sw, on_radio_switch_clicked, LV_EVENT_CLICKED, NULL);
+    radio_sw_register(which, sw);
+    lv_obj_add_event_cb(sw, radio_sw_deleted, LV_EVENT_DELETE, NULL);
+
+    if (sub && sub->create) {
+        lv_obj_t *chev = lv_label_create(row);
+        lv_obj_set_style_text_font(chev, UI_FONT_TEXT, LV_PART_MAIN);
+        lv_obj_set_style_text_color(chev, UI_COLOR_FG_DIM, LV_PART_MAIN);
+        lv_label_set_text(chev, LV_SYMBOL_RIGHT);
+        lv_obj_remove_flag(chev, LV_OBJ_FLAG_CLICKABLE);   /* 点它也是进子页 */
+        lv_obj_add_event_cb(row, on_switch_row_click, LV_EVENT_CLICKED, (void *)sub);
     }
     return row;
 }
@@ -373,26 +539,12 @@ static void label_set_if_changed(lv_obj_t *label, const char *text)
 static void settings_tick(lv_timer_t *t)
 {
     (void)t;
+    /* 总开关位置跟服务真实状态对齐（主页与子页的所有实例一起刷） */
+    radio_sw_sync();
     if (!s_sum[SET_WIFI]) {
         return;
     }
     char buf[72];
-
-    /* 总开关位置跟真实状态对齐（切换过程中先不刷） */
-    if (s_sw_wifi && !s_radio_busy) {
-        if (wifi_service_is_enabled()) {
-            lv_obj_add_state(s_sw_wifi, LV_STATE_CHECKED);
-        } else {
-            lv_obj_remove_state(s_sw_wifi, LV_STATE_CHECKED);
-        }
-    }
-    if (s_sw_bt && !s_radio_busy) {
-        if (bt_service_is_enabled()) {
-            lv_obj_add_state(s_sw_bt, LV_STATE_CHECKED);
-        } else {
-            lv_obj_remove_state(s_sw_bt, LV_STATE_CHECKED);
-        }
-    }
 
     if (!wifi_service_is_enabled()) {
         label_set_if_changed(s_sum[SET_WIFI], "已关闭");
@@ -435,7 +587,36 @@ static void settings_tick(lv_timer_t *t)
     label_set_if_changed(s_sum[SET_OUT], buf);
 
     label_set_if_changed(s_sum[SET_DISPLAY], bsp_backlight_get() >= 0 ? "无软件背光" : "—");
-    label_set_if_changed(s_sum[SET_STORAGE], bsp_sdcard_is_mounted() ? "SD 已挂载" : "无 SD 卡");
+    /*
+     * 存储行摘要：把"已用百分比 + 可用容量"直接摆在设置主页上（用户点进去之前就能看到）。
+     * ⚠ esp_vfs_fat_info() 每次都走一遍 FATFS（f_getfree），不能每 500 ms 调一次 ——
+     *   这里自己节流到 5 s（容量变化本来就慢，看不出来）。
+     */
+    {
+        static uint32_t s_storage_tick;
+        /* 64 字节：`%u` GCC 按最多 10 位算、"已用/·/可用" 是中文（3 字节/字），
+         * 40 字节时 -Wformat-truncation 会报"可能被截断" —— 别改小 */
+        static char     s_storage_txt[64];
+        if (lv_tick_elaps(s_storage_tick) >= 5000) {
+            s_storage_tick = lv_tick_get();
+            if (!bsp_sdcard_is_mounted()) {
+                snprintf(s_storage_txt, sizeof(s_storage_txt), "无 SD 卡");
+            } else {
+                uint32_t total_kb = 0, free_kb = 0;
+                if (bsp_sdcard_capacity_kb(&total_kb, &free_kb) == ESP_OK && total_kb > 0) {
+                    const uint32_t used_pct =
+                        (uint32_t)(((uint64_t)(total_kb - free_kb) * 100u) / total_kb);
+                    char freebuf[24];
+                    storage_fmt_size_kb(free_kb, freebuf, sizeof(freebuf));
+                    snprintf(s_storage_txt, sizeof(s_storage_txt), "已用 %u%% · 可用 %.20s",
+                             (unsigned)used_pct, freebuf);
+                } else {
+                    snprintf(s_storage_txt, sizeof(s_storage_txt), "SD 已挂载");
+                }
+            }
+        }
+        label_set_if_changed(s_sum[SET_STORAGE], s_storage_txt);
+    }
     label_set_if_changed(s_sum[SET_ABOUT], esp_app_get_description()->version);
 }
 
@@ -446,14 +627,10 @@ static void on_setting_row(lv_event_t *e)
     /* 二级页外壳 make_page_shell 自带返回钮：no_back 置位，避免全局返回键重复 */
     p.no_back = true;
     switch (id) {
-    case SET_WIFI:
-        p.id = "set_wifi";
-        p.create = page_wifi;
-        break;
-    case SET_BT:
-        p.id = "set_bt";
-        p.create = page_bt;
-        break;
+    /*
+     * Wi-Fi / 蓝牙不在这里：它们现在走 make_switch_row 自带的行回调
+     * （点名称区进子页、点开关只切换），见 on_switch_row_click。
+     */
     case SET_OUT:
         p.id = "set_out";
         p.create = page_output;
@@ -462,8 +639,10 @@ static void on_setting_row(lv_event_t *e)
         ui_toast("本板板级配置没有背光器件，软件无法调亮度", 2000);
         return;
     case SET_STORAGE:
-        ui_toast(bsp_sdcard_is_mounted() ? "microSD 已挂载：/sdcard" : "未检测到 SD 卡", 1800);
-        return;
+        /* 存储现在有详情页：容量 / 可用 / 占用条 / 卡的物理信息（见 page_storage） */
+        p.id     = SUB_STORAGE.id;
+        p.create = SUB_STORAGE.create;
+        break;
     default:
         ui_toast("ESP32-S31-Korvo-1 · ESP-IDF 6.1 · LVGL 9.5", 2200);
         return;
@@ -476,9 +655,14 @@ static lv_obj_t *page_settings(void)
     lv_obj_t *scr  = make_screen();
     lv_obj_t *body = make_page_shell(scr, "设置", NULL, NULL);
 
-    /* 无线总开关：关掉会真正释放驱动/协议栈资源（状态记在 NVS，开机恢复） */
-    make_switch_row(body, LV_SYMBOL_WIFI, 0x3E9E86, "Wi-Fi", 1, &s_sw_wifi);
-    make_switch_row(body, LV_SYMBOL_BLUETOOTH, 0x4A6FA5, "蓝牙", 2, &s_sw_bt);
+    /*
+     * 无线总开关 + 进入子页：**合成一行**（需求）。
+     * 关掉会真正释放驱动/协议栈资源，状态记在 NVS，开机恢复。
+     */
+    make_switch_row(body, LV_SYMBOL_WIFI, 0x3E9E86, "Wi-Fi", RADIO_WIFI,
+                    &SUB_WIFI, &s_sum[SET_WIFI]);
+    make_switch_row(body, LV_SYMBOL_BLUETOOTH, 0x4A6FA5, "蓝牙", RADIO_BT,
+                    &SUB_BT, &s_sum[SET_BT]);
 
     static const struct {
         const char *sym;
@@ -486,8 +670,6 @@ static lv_obj_t *page_settings(void)
         const char *name;
         int         id;
     } rows[] = {
-        { LV_SYMBOL_WIFI,       0x3E9E86, "Wi-Fi",        SET_WIFI },
-        { LV_SYMBOL_BLUETOOTH,  0x4A6FA5, "蓝牙",         SET_BT },
         { LV_SYMBOL_VOLUME_MAX, 0xE8973A, "声音与输出",   SET_OUT },
         { LV_SYMBOL_EYE_OPEN,   0x6E6E78, "显示与亮度",   SET_DISPLAY },
         { LV_SYMBOL_SD_CARD,    0x5B6FB5, "存储",         SET_STORAGE },
@@ -545,6 +727,7 @@ static void on_wifi_forget(lv_event_t *e)
 /* ---- 密码输入浮层（用 LVGL 自带键盘，ASCII 就够密码用） ---- */
 
 static lv_obj_t *s_pw_overlay;
+static ui_ba_dialog_t s_pw_dlg;     /* BA 对话框句柄（与 s_pw_overlay 同生共死） */
 static lv_obj_t *s_pw_ta;
 /*
  * 浮层要连的 SSID 自带一份。
@@ -565,8 +748,10 @@ static void pw_close(void)
          * 关键：这个函数是在**键盘的事件回调**里被调的，而键盘正是这个浮层的
          * 子对象。同步 lv_obj_delete 会在事件派发器还在遍历这棵子树时把它删掉
          * → hard fault（工程规范 F4 的经典坑）。必须异步删。
+         * ui_ba_close() → ui_popup_out() 内部就是 lv_obj_delete_async()，
+         * 顺带还有"下滑 + 淡出"的退场动画，所以这里直接用它。
          */
-        lv_obj_delete_async(s_pw_overlay);
+        ui_ba_close(&s_pw_dlg);
         s_pw_overlay = NULL;               /* 指针先清，DELETE 回调里会再清一次 */
     }
     s_pw_ta = NULL;
@@ -614,30 +799,30 @@ static void wifi_open_pw(const char *ssid)
     /* 自己存一份 SSID（原因见 s_pw_ssid 的注释）：后面 tip 与 READY 回调都用它 */
     snprintf(s_pw_ssid, sizeof(s_pw_ssid), "%s", ssid);
 
+    /*
+     * ★ 浮层挂在**当前页面 screen** 上（ui_ba_open_in 的第一个参数），不是
+     *   lv_layer_top()：设置页是可以被 pop 掉的，挂在 layer_top 上的浮层会跟着
+     *   用户跑到别的页面去，而它的回调还指着本页的状态。
+     * 卡片停在上半屏，下半屏留给 LVGL 自带键盘。
+     */
     lv_obj_t *scr = lv_screen_active();
-    s_pw_overlay = lv_obj_create(scr);
-    lv_obj_remove_style_all(s_pw_overlay);
-    lv_obj_set_size(s_pw_overlay, LV_PCT(100), LV_PCT(100));
-    lv_obj_center(s_pw_overlay);
-    lv_obj_set_style_bg_color(s_pw_overlay, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_pw_overlay, LV_OPA_70, LV_PART_MAIN);
-    lv_obj_remove_flag(s_pw_overlay, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_pw_overlay, LV_OBJ_FLAG_CLICKABLE);
+    s_pw_dlg = ui_ba_open_in(scr, "连接 Wi-Fi", 64, LV_ALIGN_TOP_MID, UI_PX_H(8));
+    s_pw_overlay = s_pw_dlg.scrim;
     lv_obj_add_event_cb(s_pw_overlay, on_pw_overlay_deleted, LV_EVENT_DELETE, NULL);
+    ui_ba_on_close(&s_pw_dlg, [](void *user) { (void)user; pw_close(); }, NULL);
 
-    lv_obj_t *tip = lv_label_create(s_pw_overlay);
-    lv_obj_set_style_text_font(tip, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(tip, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text_fmt(tip, "输入 %s 的密码", s_pw_ssid);
-    lv_obj_align(tip, LV_ALIGN_TOP_MID, 0, UI_PX_H(8));
+    char tip[WIFI_SSID_MAX + 32];
+    snprintf(tip, sizeof(tip), "请输入 %.32s 的密码", s_pw_ssid);
+    ui_ba_text(s_pw_dlg.body, tip);
 
-    s_pw_ta = lv_textarea_create(s_pw_overlay);
-    lv_obj_set_size(s_pw_ta, UI_PCT_X(70), UI_PX_H(44));
-    lv_obj_align(s_pw_ta, LV_ALIGN_TOP_MID, 0, UI_PX_H(32));
-    lv_textarea_set_one_line(s_pw_ta, true);
+    s_pw_ta = ui_ba_input(s_pw_dlg.body, "密码（留空 = 用已保存的密码连接）", NULL);
     lv_textarea_set_password_mode(s_pw_ta, true);
     lv_textarea_set_max_length(s_pw_ta, 63);
-    lv_obj_set_style_text_font(s_pw_ta, UI_FONT_TEXT, LV_PART_MAIN);
+
+    ui_ba_hint(s_pw_dlg.body, "※按键盘上的 ✓ 直接连接，留空则用已保存的密码重连。");
+
+    ui_ba_btn(s_pw_dlg.btn_row, "取消", false, NULL, on_pw_cancel, NULL);
+    ui_ba_btn(s_pw_dlg.btn_row, "连接", true, NULL, on_pw_ready, s_pw_ssid);
 
     lv_obj_t *kb = lv_keyboard_create(s_pw_overlay);
     lv_obj_set_size(kb, LV_PCT(100), UI_PCT_Y(52));
@@ -739,6 +924,7 @@ static void wifi_rebuild_list(void)
 static void wifi_tick(lv_timer_t *t)
 {
     (void)t;
+    radio_sw_sync();          /* 本页顶部的总开关也要跟着服务状态走 */
     if (!s_wifi_status) {
         return;
     }
@@ -796,6 +982,13 @@ static lv_obj_t *page_wifi(void)
 {
     lv_obj_t *scr  = make_screen();
     lv_obj_t *body = make_page_shell(scr, "Wi-Fi", "扫描", on_wifi_scan);
+
+    /*
+     * 顶部放**同一个**总开关（sub 传 NULL：已经在子页里，这行只负责开关）。
+     * 它就是设置主页那一行的另一个实例，由 radio_sw_sync() 对齐 ——
+     * 在这一页关掉 Wi-Fi，返回主页那个开关立刻也是关的。
+     */
+    make_switch_row(body, LV_SYMBOL_WIFI, 0x3E9E86, "Wi-Fi", RADIO_WIFI, NULL, NULL);
 
     s_wifi_status = lv_label_create(body);
     lv_obj_set_style_text_font(s_wifi_status, UI_FONT_TEXT, LV_PART_MAIN);
@@ -968,6 +1161,7 @@ static void bt_rebuild_list(void)
 static void bt_tick(lv_timer_t *t)
 {
     (void)t;
+    radio_sw_sync();          /* 本页顶部的总开关也要跟着服务状态走 */
     if (!s_bt_status) {
         return;
     }
@@ -1010,6 +1204,9 @@ static lv_obj_t *page_bt(void)
 {
     lv_obj_t *scr  = make_screen();
     lv_obj_t *body = make_page_shell(scr, "蓝牙", "搜索", on_bt_scan);
+
+    /* 顶部同一个总开关（与设置主页那行共享状态，见 page_wifi 里的说明） */
+    make_switch_row(body, LV_SYMBOL_BLUETOOTH, 0x4A6FA5, "蓝牙", RADIO_BT, NULL, NULL);
 
     s_bt_status = lv_label_create(body);
     lv_obj_set_style_text_font(s_bt_status, UI_FONT_TEXT, LV_PART_MAIN);
@@ -1074,7 +1271,7 @@ static void out_rebuild(void)
             const audio_out_t o = (audio_out_t)(intptr_t)lv_event_get_user_data(e);
             esp_err_t ret = audio_service_set_output(o);
             if (ret == ESP_ERR_INVALID_STATE) {
-                ui_toast("先在「蓝牙」里连接设备再切输出", 2200);
+                ui_toast("请先在「蓝牙」里连接设备后再切输出", 2200);
                 return;
             }
             if (ret != ESP_OK) {
@@ -1160,7 +1357,236 @@ static lv_obj_t *page_output(void)
     return scr;
 }
 
+/*
+ * 存储详情页（用户需求："存储需要设置为可点开，点击后显示 SD 卡的全部详细信息，
+ * 包括总容量、可用容量，并绘制一个存储状态占用条"）。
+ *
+ * 构成：
+ *   - 状态行：已挂载 / 未检测到；挂载点；文件系统
+ *   - **容量卡**：`已用 x / 共 y` + **占用条** + `可用 z`（lv_bar；用了 90% 以上
+ *     换成红色提醒快满）
+ *   - 明细行：总容量 / 已用 / 可用 / 卡类型 / 数据线宽度 / 工作频率 / 卡容量 /
+ *     卡片名称 / 序列号
+ *   - 右上角"重新检测"：板子只在启动时 mount 一次，**开机后才插卡**就必须再挂一次
+ *     （bsp_sdcard_mount() 是幂等的）
+ *
+ * 页面是**一次性**读取：进来读一次，不挂常驻定时器 —— 容量变化很慢，要看新的点
+ * "重新检测"即可。
+ */
+static lv_obj_t *s_storage_body;
+
+/* KB → 人看的字符串。整数运算，不碰浮点（-Werror 下 %f 还牵扯 newlib 配置） */
+static void storage_fmt_size_kb(uint32_t kb, char *out, size_t cap)
+{
+    if (!out || cap == 0) {
+        return;
+    }
+    if (kb >= 1024u * 1024u) {                      /* ≥ 1 GB：保留 1 位小数 */
+        const uint32_t t = (uint32_t)(((uint64_t)kb * 10u) / (1024u * 1024u));
+        snprintf(out, cap, "%u.%u GB", (unsigned)(t / 10u), (unsigned)(t % 10u));
+    } else if (kb >= 1024u) {                       /* ≥ 1 MB */
+        const uint32_t t = (uint32_t)(((uint64_t)kb * 10u) / 1024u);
+        snprintf(out, cap, "%u.%u MB", (unsigned)(t / 10u), (unsigned)(t % 10u));
+    } else {
+        snprintf(out, cap, "%u KB", (unsigned)kb);
+    }
+}
+
+/* 一行"图标 + 名称 + 右侧值"：直接复用 make_row（它自带右对齐的 value label） */
+static void storage_add_info(const char *sym, uint32_t accent, const char *name, const char *value)
+{
+    lv_obj_t *val = NULL;
+    make_row(s_storage_body, sym, accent, name, &val);
+    if (val) {
+        lv_label_set_text(val, value);
+    }
+}
+
+/* 一句提示（未插卡 / 读容量失败时用），占满行的宽度、可换行 */
+static void storage_add_hint(const char *text)
+{
+    lv_obj_t *h = lv_label_create(s_storage_body);
+    lv_obj_set_style_text_font(h, UI_FONT_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_text_color(h, UI_COLOR_FG_DIM, LV_PART_MAIN);
+    lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(h, LV_PCT(100));
+    lv_label_set_text(h, text);
+}
+
+/* 容量卡：占用条 + 已用/总数 + 可用 */
+static void storage_add_gauge(uint32_t total_kb, uint32_t free_kb)
+{
+    const uint32_t used_kb = (total_kb > free_kb) ? (total_kb - free_kb) : 0;
+    const uint32_t pct     = total_kb ? (uint32_t)(((uint64_t)used_kb * 100u) / total_kb) : 0;
+    /* ⚠ LVGL 9 的 lv_color_t 是**结构体**，不能用 uint32_t 存（老代码里 lv_color_hex()
+     *   返回的就是 lv_color_t）—— 类型写 lv_color_t，后面直接传，别再套一次 lv_color_hex() */
+    const lv_color_t tint = (pct >= 90u) ? lv_color_hex(0xB5504E) : UI_COLOR_ACCENT;
+
+    lv_obj_t *card = lv_obj_create(s_storage_body);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_width(card, LV_PCT(100));
+    lv_obj_set_height(card, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_color(card, UI_COLOR_SURFACE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(card, UI_PX_H(12), LV_PART_MAIN);
+    lv_obj_set_style_pad_all(card, UI_PX_H(14), LV_PART_MAIN);
+    lv_obj_set_style_pad_row(card, UI_PX_H(10), LV_PART_MAIN);
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 第一行：左边"已用 x / 共 y"，右边大号百分比。
+     * ⚠ 高度给常量、不要 LV_SIZE_CONTENT：这一行里的两个 label 是 lv_obj_align()
+     *   按父容器尺寸定位的，而 LV_SIZE_CONTENT 的高度又要反过来由子对象算 ——
+     *   这种"互相依赖"在 LVGL 里会算出 0 高（经典坑），直接给一个行高最省事。 */    lv_obj_t *line = lv_obj_create(card);
+    lv_obj_remove_style_all(line);
+    lv_obj_set_width(line, LV_PCT(100));
+    lv_obj_set_height(line, UI_PX_H(32));
+    lv_obj_remove_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+
+    char used[24];
+    char total[24];
+    char buf[72];
+    storage_fmt_size_kb(used_kb, used, sizeof(used));
+    storage_fmt_size_kb(total_kb, total, sizeof(total));
+    snprintf(buf, sizeof(buf), "已用 %.16s / 共 %.16s", used, total);
+
+    lv_obj_t *used_l = lv_label_create(line);
+    lv_obj_set_style_text_font(used_l, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(used_l, UI_COLOR_FG, LV_PART_MAIN);
+    lv_label_set_text(used_l, buf);
+    lv_obj_align(used_l, LV_ALIGN_LEFT_MID, 0, 0);
+
+    lv_obj_t *pct_l = lv_label_create(line);
+    lv_obj_set_style_text_font(pct_l, UI_FONT_TITLE, LV_PART_MAIN);
+    lv_obj_set_style_text_color(pct_l, tint, LV_PART_MAIN);
+    lv_label_set_text_fmt(pct_l, "%u%%", (unsigned)pct);
+    lv_obj_align(pct_l, LV_ALIGN_RIGHT_MID, 0, 0);
+
+    /* 占用条：背景是"底槽"（PART_MAIN），填充是"已用"（PART_INDICATOR） */
+    lv_obj_t *bar = lv_bar_create(card);
+    lv_obj_set_size(bar, LV_PCT(100), UI_PX_H(16));
+    lv_bar_set_range(bar, 0, 100);
+    lv_bar_set_value(bar, (int32_t)pct, LV_ANIM_OFF);
+    lv_obj_set_style_radius(bar, UI_PX_H(8), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(bar, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(bar, UI_PX_H(8), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(bar, tint, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
+
+    char freebuf[24];
+    storage_fmt_size_kb(free_kb, freebuf, sizeof(freebuf));
+    lv_obj_t *free_l = lv_label_create(card);
+    lv_obj_set_style_text_font(free_l, UI_FONT_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_text_color(free_l, UI_COLOR_FG_DIM, LV_PART_MAIN);
+    lv_label_set_text_fmt(free_l, "可用 %.20s", freebuf);
+}
+
+static void storage_rebuild(void)
+{
+    if (!s_storage_body) {
+        return;
+    }
+    lv_obj_clean(s_storage_body);      /* 旧的容量卡/行都在这里被删掉 */
+
+    if (!bsp_sdcard_is_mounted()) {
+        storage_add_info(LV_SYMBOL_SD_CARD, 0x5B6FB5, "SD 卡", "未检测到");
+        storage_add_hint("没插卡，或者卡接触不良。\n插好卡后点右上角「重新检测」。");
+        return;
+    }
+
+    uint32_t total_kb = 0, free_kb = 0;
+    if (bsp_sdcard_capacity_kb(&total_kb, &free_kb) != ESP_OK || total_kb == 0) {
+        storage_add_info(LV_SYMBOL_SD_CARD, 0x5B6FB5, "SD 卡", "已挂载");
+        storage_add_hint("读文件系统容量失败（卡可能已被拔出）。点右上角「重新检测」再试。");
+        return;
+    }
+
+    char buf[40];
+    storage_add_info(LV_SYMBOL_SD_CARD, 0x3E9E86, "状态", "已挂载");
+    storage_add_info(LV_SYMBOL_DIRECTORY, 0x5B6FB5, "挂载点", bsp_sdcard_mount_point());
+    storage_add_info(LV_SYMBOL_FILE, 0x6E6E78, "文件系统", "FATFS");
+
+    storage_add_gauge(total_kb, free_kb);
+
+    storage_fmt_size_kb(total_kb, buf, sizeof(buf));
+    storage_add_info(LV_SYMBOL_DRIVE, 0x3E9E86, "总容量", buf);
+    storage_fmt_size_kb(total_kb - free_kb, buf, sizeof(buf));
+    storage_add_info(LV_SYMBOL_BARS, 0xE8973A, "已用容量", buf);
+    storage_fmt_size_kb(free_kb, buf, sizeof(buf));
+    storage_add_info(LV_SYMBOL_SAVE, 0x5B6FB5, "可用容量", buf);
+
+    /* 卡的物理信息（BSP 里照抄 IDF 的解码口径，取不到就少显示几行） */
+    bsp_sd_card_info_t ci;
+    if (bsp_sdcard_card_info(&ci) == ESP_OK) {
+        if (ci.type[0]) {
+            storage_add_info(LV_SYMBOL_SD_CARD, 0x6E6E78, "卡类型", ci.type);
+        }
+        if (ci.bus_width > 0) {
+            snprintf(buf, sizeof(buf), "%d-bit%s", ci.bus_width, ci.ddr ? " DDR" : "");
+            storage_add_info(LV_SYMBOL_LIST, 0x6E6E78, "数据线宽度", buf);
+        }
+        if (ci.freq_khz > 0) {
+            snprintf(buf, sizeof(buf), "%d.%d MHz", ci.freq_khz / 1000,
+                     (ci.freq_khz % 1000) / 100);
+            storage_add_info(LV_SYMBOL_LOOP, 0x6E6E78, "工作频率", buf);
+        }
+        if (ci.card_bytes > 0) {
+            storage_fmt_size_kb((uint32_t)(ci.card_bytes / 1024u), buf, sizeof(buf));
+            storage_add_info(LV_SYMBOL_DRIVE, 0x6E6E78, "卡容量（CSD）", buf);
+        }
+        if (ci.name[0]) {
+            storage_add_info(LV_SYMBOL_EDIT, 0x6E6E78, "卡片名称", ci.name);
+        }
+        if (ci.serial) {
+            snprintf(buf, sizeof(buf), "0x%08X", (unsigned)ci.serial);
+            storage_add_info(LV_SYMBOL_BARS, 0x6E6E78, "序列号", buf);
+        }
+    }
+}
+
+static void storage_on_rescan(lv_event_t *e)
+{
+    (void)e;
+    /* 幂等：已经挂上就直接返回 ESP_OK；没挂上再试一次（开机后才插卡的场景） */
+    const esp_err_t ret = bsp_sdcard_mount();
+    storage_rebuild();
+    ui_toast(ret == ESP_OK ? "已检测到 SD 卡" : "还是没检测到 SD 卡", 1800);
+}
+
+static void storage_on_delete(lv_event_t *e)
+{
+    (void)e;
+    s_storage_body = NULL;
+}
+
+static lv_obj_t *page_storage(void)
+{
+    lv_obj_t *scr  = make_screen();
+    lv_obj_t *body = make_page_shell(scr, "存储", "重新检测", storage_on_rescan);
+    s_storage_body = body;
+    storage_rebuild();
+    lv_obj_add_event_cb(scr, storage_on_delete, LV_EVENT_DELETE, NULL);
+    ESP_LOGI(TAG, "storage page created (mounted=%d)", (int)bsp_sdcard_is_mounted());
+    return scr;
+}
+
 /* ================================================================== 注册 */
+
+/*
+ * 从别处（音乐页长按输出设备）直接跳到"设置的蓝牙页"。
+ *
+ * 直接 push 蓝牙子页而不是先 push 设置主页：用户的目标就是蓝牙，多一层
+ * 主页只是让他多按一次返回。子页外壳自带返回钮，返回即回到来处。
+ */
+esp_err_t app_settings_open_bt(void)
+{
+    page_desc_t p = {};
+    p.id      = SUB_BT.id;
+    p.create  = SUB_BT.create;
+    p.no_back = true;            /* make_page_shell 自带返回钮 */
+    return ui_router_push(&p);
+}
 
 static void on_settings_enter(void) {}
 static void on_settings_exit(void) {}

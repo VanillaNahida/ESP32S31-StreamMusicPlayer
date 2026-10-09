@@ -16,6 +16,7 @@
 #include "ui_internal.h"
 #include "ui_metrics.h"
 #include "ui_app_registry.h"
+#include "ui_home_bg.h"
 
 #include <time.h>
 #include <string.h>
@@ -128,6 +129,24 @@ static void clock_timer_cb(lv_timer_t *t)
 
 /* ------------------------------------------------------------------ 首页 */
 
+static lv_obj_t *s_home_scr;      /* 当前首页 screen（解码任务要往它身上贴背景图） */
+
+static void home_deleted(lv_event_t *e)
+{
+    (void)e;
+    s_home_scr = NULL;
+    /* 首页没了：把解码任务那边的目标也清掉，免得它往已销毁的对象上抹背景图 */
+    ui_home_bg_bind(NULL);
+    /* 时钟/日期的 label 也跟着 screen 一起没了：不清指针的话下一个 tick 会写到
+     * 已释放的对象上（use-after-free）。timer 一并销毁，重建首页时会重新建。 */
+    s_big_clock = NULL;
+    s_date_row  = NULL;
+    if (s_clock_timer) {
+        lv_timer_delete(s_clock_timer);
+        s_clock_timer = NULL;
+    }
+}
+
 lv_obj_t *ui_home_create(void)
 {
     static bool s_registered;
@@ -151,10 +170,22 @@ lv_obj_t *ui_home_create(void)
     lv_label_set_text(s_big_clock, "--:--");
     lv_obj_align(s_big_clock, LV_ALIGN_TOP_MID, 0, UI_STATUSBAR_H + UI_PX_H(6));
 
-    /* 日期 + 星期 */
+    /* 日期 + 星期
+     *
+     * ★ 必须给**满宽 + 文字居中**，不能只靠下面那句 align_to() 居中 ——
+     *   `lv_obj_align_to()` 是**一次性**定位：它内部先
+     *   `lv_obj_set_style_align(obj, LV_ALIGN_TOP_LEFT)` 再 `lv_obj_set_pos(x, y)`，
+     *   x/y 只按**调用那一刻**的宽高算一次，之后文字再变长就只会往**右**长
+     *   （label 默认宽度是"内容宽"）——于是"等待校时"换成"10月8日 · 星期三"之后
+     *   整行看起来就偏右了（2026-10 用户报）。
+     *   给满宽 + LV_TEXT_ALIGN_CENTER 后，位置只跟屏幕有关，与文字长短无关。
+     *   （align_to 内部会自己 update_layout，所以 LV_PCT 宽度在这里已经生效。）
+     */
     s_date_row = lv_label_create(scr);
     lv_obj_set_style_text_font(s_date_row, UI_FONT_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_date_row, UI_COLOR_ACCENT, LV_PART_MAIN);
+    lv_obj_set_style_text_align(s_date_row, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_width(s_date_row, LV_PCT(100));
     lv_label_set_text(s_date_row, "等待校时");
     lv_obj_align_to(s_date_row, s_big_clock, LV_ALIGN_OUT_BOTTOM_MID, 0, UI_PX_H(4));
 
@@ -227,6 +258,15 @@ lv_obj_t *ui_home_create(void)
         s_clock_timer = lv_timer_create(clock_timer_cb, 1000, NULL);
     }
     clock_timer_cb(NULL);
+
+    /*
+     * 背景图（assets/background.jpg）：图已解好就立刻贴上（它是 screen 自己的
+     * bg_image，不占子对象、也不会挡住时钟与图标网格）；还没解好则由解码任务
+     * 完成后补上。首页被销毁时 home_deleted() 会把目标清掉。
+     */
+    s_home_scr = scr;
+    lv_obj_add_event_cb(scr, home_deleted, LV_EVENT_DELETE, NULL);
+    ui_home_bg_bind(scr);
 
     ESP_LOGI(TAG, "home created (%u apps)", (unsigned)n);
     return scr;

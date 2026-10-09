@@ -7,6 +7,7 @@ idf_component_register(
         app_music
         audio_service
         online_service
+        media_meta
         wifi_service
         lvgl_pinyin_ime
 )

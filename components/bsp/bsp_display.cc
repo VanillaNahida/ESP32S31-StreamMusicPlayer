@@ -27,7 +27,16 @@ static esp_lv_adapter_rotation_t lcd_rotation(const dev_display_lcd_config_t *c)
     return (c->mirror_x || c->mirror_y) ? ESP_LV_ADAPTER_ROTATE_180 : ESP_LV_ADAPTER_ROTATE_0;
 }
 
-/* 由 framebuffer 数量推导 tear-avoid 模式（本板 num_fbs = 1 → NONE） */
+/*
+ * 由 framebuffer 数量推导 tear-avoid 模式。
+ *
+ * ⚠ 2026-10 试过把板级 num_fbs 从 1 改成 2（想消撕裂）+ pclk 18→27 MHz（想提帧率），
+ *   结果：启动日志刷满 `E lcd.rgb: LCD underrun`，紧接着 Wi-Fi `init nvs: failed,
+ *   ret=101`(NO_MEM)、蓝牙控制器 `orca_ems_env_init malloc pool failed` 并在错误路径
+ *   里 panic（`r_olc_deinit`）。**两条都已回退**（见 gen_board_device_config.c 里的说明）。
+ *   要再动这个方向，必须先量启动期的 `heap_caps_get_free_size(MALLOC_CAP_INTERNAL)`
+ *   与面板 underrun 计数 —— main.cc 里已经打了 heap 遥测。
+ */
 static esp_lv_adapter_tear_avoid_mode_t lcd_tear_mode(uint8_t num_fbs)
 {
     if (num_fbs >= 3) return ESP_LV_ADAPTER_TEAR_AVOID_MODE_TRIPLE_PARTIAL;

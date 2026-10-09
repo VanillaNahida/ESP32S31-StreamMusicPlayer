@@ -1,0 +1,48 @@
+menu "Online music account (网易云账号)"
+
+    config ONLINE_NETEASE_API_BASE
+        string "网易云 API 服务地址 (NeteaseCloudMusicApi)"
+        default "http://localhost:3000"
+        help
+            自建 API 服务的根地址，二维码登录 / 账号歌单 / 每日推荐都发给它
+            （参考工程 D:\Codes\ESP32S31-StreamMusicPlayer\NeteaseCloudMusicApi，
+             即 @neteasecloudmusicapienhanced/api，默认监听 3000 端口）。
+
+            ⚠ 注意：**ESP32 上的 localhost 指的是设备自己**，不是你的电脑。
+            服务跑在 PC 上时要填 PC 的局域网地址，例如 http://192.168.1.5:3000；
+            部署在公网就填公网地址（带端口）。
+
+            这里的值只是**默认值**：运行期可以用 online_netease_api_base_set()
+            （NVS 键 'online'/'nb'）临时覆盖，用于不重新烧固件就换地址。
+
+    config ONLINE_NETEASE_API_TOKEN
+        string "API 访问令牌 (Authorization: Bearer)"
+        default ""
+        help
+            服务端开启了访问鉴权时填这里（对应 NeteaseCloudMusicApi 的 .env 里
+            AUTH_TOKEN，调用方式是请求头 Authorization: Bearer <Token>）。
+            留空 = 不加鉴权头（服务端没开鉴权时用）。
+
+            ⚠ Token 会编进固件（sdkconfig 里是明文），注意别把带敏感权限的
+            token 提交到公开仓库。
+
+    config ONLINE_NETEASE_CK_FILE
+        string "内置网易云 cookie 文件 (相对工程根目录, 留空 = 不启用)"
+        default "assets/ncm-ck.txt"
+        help
+            把一份网易云网页版 cookie 烘进固件，设备开机即为已登录，不用扫码。
+
+            填**相对工程根目录**的路径（默认 assets/ncm-ck.txt）。文件内容是浏览器里
+            document.cookie 的那一串：`NAME=VALUE; NAME=VALUE; ...`。
+            构建时该文件以 EMBED 方式编入固件，设备端只用其中的
+            MUSIC_U / __csrf 两项（浏览器导出的串有二十多项，其余是统计用的垃圾）。
+
+            Kconfig 留空、或路径指向的文件不存在 -> **不嵌入、也不启用**，
+            行为与没有这个功能时一模一样（仍然可以扫码登录）。
+            另外：SD 卡上已扫码登录过（/sdcard/online/netease_cookie.txt）时
+            **以 SD 上的为准** —— 那才是账号最新的登录态。
+
+            注意：cookie 等于账号凭证，会明文编进固件（也明文躺在工程目录里），
+                  别把它一起提交到公开仓库。
+
+endmenu

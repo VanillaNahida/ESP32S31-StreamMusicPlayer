@@ -64,6 +64,26 @@ static const char *TAG = "bt_svc";
 #define NVS_NS          "bt_cfg"
 #define NVS_KEY_ON      "on"
 #define NVS_KEY_LAST    "last"
+
+/*
+ * 设备名缓存（MAC → 名字）。
+ *
+ * 为什么要持久化：名字**只能**从 ESP_BT_AUDIO_EVENT_DEVICE_DISCOVERED 里拿到 ——
+ * esp_bt_audio_event_connection_st_t 根本没有名字字段，组件也没给
+ * read_remote_name 之类的接口（见 esp_bt_audio_classic.h）。于是
+ * "开机自动连上次那台设备"这条路**永远**拿不到名字，s_peer_name 只能退回 MAC，
+ * 用户看到的就是"设备名变成 MAC 地址"。把扫描时拿到的名字按 MAC 存起来，
+ * 连接/重启后再按 MAC 反查即可。
+ */
+#define NVS_NS_NAME      "bt_name"
+/*
+ * NVS 键名上限 15 个字符（NVS_KEY_NAME_MAX_SIZE = 16，含结尾 0），
+ * 而 "AA:BB:CC:DD:EE:FF" 有 17 个字符 —— 拿它当键会直接
+ * ESP_ERR_NVS_KEY_TOO_LONG。所以键用去掉冒号的 12 位大写十六进制（如 "A1B2C3D4E5F6"）。
+ */
+#define BT_NAME_KEY_LEN  13
+/* 名字缓存条数上限：满了淘汰最早写进去的那条，别让 NVS 被无限撑大 */
+#define BT_NAME_KEEP_MAX 16
 /* 开机自动连延时：控制器 + 协议栈起来后还要让 A2DP 侧稳定一下 */
 #define AUTO_CONNECT_MS (3000)
 
@@ -165,10 +185,181 @@ static bt_dev_t *dev_find(const uint8_t *bda, bool create)
     return d;
 }
 
+/* ------------------------------------------------------------ 设备名缓存（NVS） */
+
+/* MAC → NVS 键：去掉冒号的 12 位大写十六进制（原因见 BT_NAME_KEY_LEN 的注释） */
+static void bt_name_key(const uint8_t bda[6], char *out)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 0; i < 6; i++) {
+        out[i * 2]     = hex[(bda[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hex[bda[i] & 0x0F];
+    }
+    out[12] = '\0';
+}
+
+/*
+ * 这个"名字"是不是真名字。
+ *
+ * 扫描表里的 name 拿不到真名时会被填成 MAC 串（DEVICE_DISCOVERED 里的兜底），
+ * 那不是名字：既不该存进 NVS（会把真名覆盖掉），也不该当作已解析出的名字。
+ */
+static bool bt_name_is_real(const uint8_t bda[6], const char *name)
+{
+    if (!name || !name[0]) {
+        return false;
+    }
+    char addr[18];
+    bt_service_addr_str(bda, addr, sizeof(addr));
+    return strcmp(name, addr) != 0;
+}
+
+/*
+ * 枚举 bt_name 里的字符串键：返回实际拷进 keys 的条数（最多 cap 个），
+ * *more 为真表示还有没装下的。
+ *
+ * ⚠ 迭代器不保证看得到同一次事务里**尚未 commit** 的写入，所以"腾地方"必须在
+ * nvs_set_str **之前**做（见 bt_name_save 的顺序）。
+ */
+static size_t bt_name_enum(nvs_handle_t h, char keys[][BT_NAME_KEY_LEN],
+                           size_t cap, bool *more)
+{
+    if (more) {
+        *more = false;
+    }
+    nvs_iterator_t it = NULL;
+    if (nvs_entry_find_in_handle(h, NVS_TYPE_STR, &it) != ESP_OK || !it) {
+        nvs_release_iterator(it);          /* 允许传 NULL */
+        return 0;
+    }
+    size_t n = 0;
+    nvs_entry_info_t info;
+    while (nvs_entry_info(it, &info) == ESP_OK) {
+        if (n < cap) {
+            /*
+             * ⚠ 必须显式给出精度：`info.key` 是 `char[NVS_KEY_NAME_MAX_SIZE]`（16 字节，
+             *   NVS 键名上限 15 字符），而 keys[] 的每个元素只有 BT_NAME_KEY_LEN(13)。
+             *   直接 "%s" 会被 GCC 证明"最多写 16 字节进 13 字节"，在 -Werror 下直接
+             *   编译失败（真机踩过）。本命名空间里的键**只有我们自己写的 12 位十六进制**，
+             *   按 12 字节截断既安全又能让编译器证得出来。
+             */
+            snprintf(keys[n], BT_NAME_KEY_LEN, "%.*s", BT_NAME_KEY_LEN - 1, info.key);
+            n++;
+        } else if (more) {
+            *more = true;
+        }
+        if (nvs_entry_next(&it) != ESP_OK) {
+            break;
+        }
+    }
+    nvs_release_iterator(it);
+    return n;
+}
+
+/* 为即将写入的 keep_key 腾位置：满了就删最早写进去的那条（FIFO 淘汰） */
+static void bt_name_make_room(nvs_handle_t h, const char *keep_key)
+{
+    for (int round = 0; round < 8; round++) {
+        char keys[BT_NAME_KEEP_MAX + 1][BT_NAME_KEY_LEN];
+        bool more = false;
+        const size_t n = bt_name_enum(h, keys, BT_NAME_KEEP_MAX + 1, &more);
+
+        bool have = false;
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(keys[i], keep_key) == 0) {
+                have = true;
+                break;
+            }
+        }
+        if (have) {
+            return;                        /* 覆盖写：不占新条目，不用腾 */
+        }
+        if (n < BT_NAME_KEEP_MAX && !more) {
+            return;                        /* 还有空位 */
+        }
+        /*
+         * NVS 按条目索引顺序枚举（实测先写的先出来），所以第一个非 keep_key
+         * 就是最旧的一条 —— 淘汰它。
+         */
+        size_t victim = n;                 /* n = 没找到可删的 */
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(keys[i], keep_key) != 0) {
+                victim = i;
+                break;
+            }
+        }
+        if (victim == n || nvs_erase_key(h, keys[victim]) != ESP_OK) {
+            return;                        /* 删不动就别在这儿死循环 */
+        }
+        ESP_LOGI(TAG, "bt name cache full: dropped '%s'", keys[victim]);
+    }
+}
+
+/* 记住一台设备的名字（传进来的不是真名字时什么都不做） */
+static void bt_name_save(const uint8_t bda[6], const char *name)
+{
+    if (!bt_name_is_real(bda, name)) {
+        return;
+    }
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_NAME, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    char key[BT_NAME_KEY_LEN];
+    bt_name_key(bda, key);
+
+    char cur[BT_NAME_MAX];
+    size_t len = sizeof(cur);
+    if (nvs_get_str(h, key, cur, &len) == ESP_OK && strcmp(cur, name) == 0) {
+        nvs_close(h);                      /* 名字没变：别反复擦写 flash */
+        return;
+    }
+    bt_name_make_room(h, key);
+    if (nvs_set_str(h, key, name) == ESP_OK && nvs_commit(h) == ESP_OK) {
+        ESP_LOGI(TAG, "bt name cached: %s = %s", key, name);
+    }
+    nvs_close(h);
+}
+
+/* 反查：MAC → 名字。命中返回 true（out 里是名字），否则 out 为空串 */
+static bool bt_name_load(const uint8_t bda[6], char *out, size_t cap)
+{
+    if (!out || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS_NAME, NVS_READONLY, &h) != ESP_OK) {
+        return false;                      /* 还没缓存过任何名字 */
+    }
+    char key[BT_NAME_KEY_LEN];
+    bt_name_key(bda, key);
+    size_t len = cap;
+    const bool ok = (nvs_get_str(h, key, out, &len) == ESP_OK) && out[0];
+    nvs_close(h);
+    if (!ok) {
+        out[0] = '\0';
+    }
+    return ok;
+}
+
+/*
+ * 对端显示名 + 地址。
+ *
+ * 三级回退：事件里带来的真名 → NVS 里缓存过的名字 → 地址。
+ * 中间那一级就是"名称变成 MAC"的修法：连接事件里从来没有名字，只有扫描才有。
+ */
 static void make_addr_18(const uint8_t *bda, const char *name)
 {
     bt_service_addr_str(bda, s_peer_addr, sizeof(s_peer_addr));
-    snprintf(s_peer_name, sizeof(s_peer_name), "%s", (name && name[0]) ? name : s_peer_addr);
+    if (bt_name_is_real(bda, name)) {
+        snprintf(s_peer_name, sizeof(s_peer_name), "%s", name);
+        return;
+    }
+    if (bt_name_load(bda, s_peer_name, sizeof(s_peer_name))) {
+        return;
+    }
+    snprintf(s_peer_name, sizeof(s_peer_name), "%s", s_peer_addr);
 }
 
 /* ---------------------------------------------------------------- 开关/记忆 */
@@ -638,8 +829,11 @@ static void bt_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void
              *   就会把已经拿到的好名字**覆盖成 MAC**（看起来"名字一会儿有一会儿没有"）。
              *   现在：有名字才写；仍然没名字（从没见过）才退回地址显示。
              */
-            if (d->name[0]) {
+            if (d->name[0] && strncmp(e->name, d->name, sizeof(e->name)) != 0) {
                 snprintf(e->name, sizeof(e->name), "%s", d->name);
+                /* 名字**只有**扫描里拿得到：立刻缓存到 NVS，否则下次开机自动连
+                 * 这台设备时（不扫描）界面上只会显示 MAC 地址。 */
+                bt_name_save(d->addr, e->name);
             }
             e->rssi     = (int8_t)d->rssi;
             e->is_audio = (((d->disc_data.classic.cod & ESP_BT_COD_MAJOR_DEV_BIT_MASK)
@@ -649,6 +843,10 @@ static void bt_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void
                     e->bonded = true;
                     break;
                 }
+            }
+            if (e->name[0] == '\0') {
+                /* 这一包还没带名字：先用 NVS 里缓存过的（"名字只增不减"的最后一道保险） */
+                bt_name_load(e->bda, e->name, sizeof(e->name));
             }
             if (e->name[0] == '\0') {
                 /* 从没见过名字的设备：退回地址显示（等后面的包带来真名） */
@@ -669,6 +867,8 @@ static void bt_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void
             bt_service_addr_str(st->addr, addr, sizeof(addr));
             const bt_dev_t *d = dev_find(st->addr, false);
             make_addr_18(st->addr, d ? d->name : NULL);
+            /* 名字可能来自扫描表或 NVS：顺手同步进缓存（是 MAC 兜底时函数内部会跳过） */
+            bt_name_save(st->addr, s_peer_name);
             memcpy(s_peer_bda, st->addr, 6);
             s_state = BT_ST_CONNECTED;
             ESP_LOGI(TAG, "a2dp connected: %s (%s)", s_peer_name, addr);
@@ -990,7 +1190,8 @@ esp_err_t bt_service_connect(const uint8_t bda[6])
     }
     esp_bd_addr_t addr;
     memcpy(addr, bda, 6);
-    make_addr_18(bda, dev_find(bda, false) ? dev_find(bda, false)->name : NULL);
+    const bt_dev_t *d = dev_find(bda, false);
+    make_addr_18(bda, d ? d->name : NULL);
     /* A2DP 源连接：没配对过的设备在这一步顺手完成配对（Just Works） */
     esp_err_t ret = esp_bt_audio_classic_connect(ESP_BT_AUDIO_CLASSIC_ROLE_A2DP_SRC, addr);
     if (ret != ESP_OK) {
@@ -1059,10 +1260,16 @@ esp_err_t bt_service_refresh_bonded(void)
         memcpy(b->bda, list[i], 6);
         b->bonded = true;
         const bt_dev_t *d = dev_find(list[i], false);
-        if (d) {
+        if (d && bt_name_is_real(list[i], d->name)) {
             snprintf(b->name, sizeof(b->name), "%s", d->name);
+        }
+        if (d) {
             b->is_audio = d->is_audio;
             b->rssi     = d->rssi;
+        }
+        if (b->name[0] == '\0') {
+            /* 本次没扫到 / 只扫到 MAC：查 NVS 缓存（开机直接看"已配对"也有名字） */
+            bt_name_load(b->bda, b->name, sizeof(b->name));
         }
         if (b->name[0] == '\0') {
             bt_service_addr_str(b->bda, b->name, sizeof(b->name));

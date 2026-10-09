@@ -4,3 +4,7 @@ build/
 sdkconfig
 venv/
 .skills/
+build_check/*
+assets/ncm-ck.txt
+libs/
+*zip

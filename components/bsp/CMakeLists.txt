@@ -14,6 +14,8 @@ idf_component_register(
         esp_codec_dev
         led_strip
         button
+        fatfs
+        sdmmc
 )
 
 # esp_board_manager / esp_lvgl_adapter 的配置宏使用部分聚合初始化（见 main/CMakeLists.txt）

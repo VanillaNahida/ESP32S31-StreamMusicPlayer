@@ -3,6 +3,11 @@
 本文件给在本仓库工作的 AI Agent / 开发者提供**必须遵守的事实与命令**。与
 `方屏流媒体音乐播放器 开发指南.md` 冲突时，以官方文档与本文件记录的实测事实为准。
 
+> ⚠ **本文件已超过 64 KB 的指令预算，载入时尾部会被截断**（近期丢的是 §15.3 之后的内容）。
+> 磁盘上的文件是**完整**的 —— 需要最新几节（§14.11 之后：账号歌单分页/懒加载、
+> 详情页返回行、开机图片 §16）时，**直接用 read 工具打开本文件**按行号读，
+> 不要以为"文件里没有"。长期解法是把深挖记录拆到 `docs/` 下分册、本文件只留索引。
+
 ---
 
 ## 1. 第一原则：官方文档优先
@@ -117,7 +122,7 @@ BEFORE_RESET / AFTER_RESET / **MONITOR_BAUD** / NO_STUB，整个 IDF 树里也�
 | 音频 Codec | **ES8389**，I2C0 SDA=0/SCL=1（地址 0x20）；I2S 端口0，bclk=3 / ws=4 / dout=5 / din=6，**MCLK=-1（无 MCLK）**；**DAC/ADC 都是 TDM 格式**，48 kHz 16 bit |
 | 功放 | **`PA_CTRL` = GPIO7，高电平使能**（板级 `active_level: 1`）；左右共用一个使能脚 |
 | microSD | **4-bit SDMMC slot0**：clk=24 / cmd=25 / d0=20 / d1=21 / d2=22 / d3=23；`SD_CTRL`=GPIO39 **低电平使能**（`active_level: 0`）；挂载点 `/sdcard` |
-| 按键 | `adc_button_group`，**GPIO42 / ADC1 ch0**。**以板级 YAML 为准**（`managed_components/espressif__esp_boards/esp32_s31_korvo_1/board_devices.yaml`）：`button_num: 6`、`max_voltage: 3000`、`voltage_range: [380, 820, 1180, 1570, 1980, 2410]`、`button_labels: ["VOLUME_UP","VOLUME_DOWN","SET","PLAY","Mode","REC"]` —— 即 **380 mV = VOLUME_UP、820 = VOLUME_DOWN、1180 = SET、1570 = PLAY、1980 = Mode、2410 = REC**。驱动按电压**升序**建句柄、窗口取相邻档位中点（`dev_button_sub_adc_multi.c`）。⚠ 旧文档里"SET=380/MODE=820/VOL-=1340/VOL+=1870"那套是错的，别再用（见 §14.10） |
+| 按键 | `adc_button_group`，**GPIO42 / ADC1 ch0**。**以板级 YAML 为准**（`managed_components/espressif__esp_boards/esp32_s31_korvo_1/board_devices.yaml`）：`button_num: 6`、`max_voltage: 3000`、`voltage_range: [380, 820, 1180, 1570, 1980, 2410]`、`button_labels: ["VOLUME_UP","VOLUME_DOWN","SET","PLAY","Mode","REC"]` —— 即 **380 mV = VOLUME_UP、820 = VOLUME_DOWN、1180 = SET、1570 = PLAY、1980 = Mode、2410 = REC**。驱动按电压**升序**建句柄、窗口取相邻档位中点（`dev_button_sub_adc_multi.c`）。⚠ 旧文档里"SET=380/MODE=820/VOL-=1340/VOL+=1870"那套是错的，别再用 |
 | RGB LED | WS2812，**GPIO37**，RMT |
 | Boot 键 | GPIO61（低有效） |
 | 供电 | USB 5 V 常供，**无电池、无电量计、无软关机**；状态栏禁止画电池 |
@@ -184,6 +189,10 @@ AMOLED、ES8311。
 - 改完必须 `idf.py build` 通过（贴出结果摘要，不只说"已完成"）
 - 涉及 UI 的改动要在模拟器 `simulator/index.html` 或真机截图确认
 - 纯逻辑（LRC / ID3 / JSON / 路径处理）抽成不依赖硬件的模块，便于 host 侧单测
+- 改完大文件（`app_online.cc` / `online_service.cc`）先跑一遍括号/引号配平自查
+  （跳过注释与字符串，抓"少写一个 `}`"这类低级错）：
+  `tools/font/venv/Scripts/python.exe tools/check_balance.py <文件...>`
+  —— 它不是编译器，只做配平，别当编译验证用
 
 ## 11. 在线音乐 / 无线开关 / 拼音输入法（2026-10 新增）
 
@@ -444,11 +453,33 @@ tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
     # 默认写到 components/ui_core/ui_icons.c
 ```
 
+**一次生成全部（2026-10 起，推荐）**：清单在 `assets/icons/icons.txt`（每行
+`路径 符号名 尺寸`），生成整份 `ui_icons.c`：
+
+```
+tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
+    --manifest assets/icons/icons.txt -o components/ui_core/ui_icons.c
+```
+
+**素材"扩展名撒谎"的先转一次**：`tools/icons/prepare_sources.ps1`（.NET
+System.Drawing，只做格式转换，不改内容）——
+
+| 源文件 | 真实格式 | 转成 |
+| --- | --- | --- |
+| `assets/default.png` | **JPEG** 404x456 | `assets/icons/momotalk_avatar.png`（居中裁方 192²） |
+| `assets/MomoIcon.png` | **ICO** 64x64 | `assets/icons/momotalk_icon.png` |
+| `MomoTalk.html` 里的 ✕ | 内联 **SVG** | `assets/icons/momotalk_close.png`（4 倍重绘，圆头白线） |
+
+⚠ `prepare_sources.ps1` 里全是中文注释，**文件必须带 UTF-8 BOM**：
+`powershell.exe`（5.1）默认按 ANSI 读 .ps1，没 BOM 会把注释当乱码、直接语法报错
+（踩过：`Unexpected token`）。
+
 - 只用标准库 `zlib` 手解 PNG（8 bit、非隔行的灰度/真彩/调色板/带 α 都支持），
   输出 **ARGB8888**（LVGL 的字节序是 **B,G,R,A**），缩放用面积平均（按 α 加权）。
 - **按显示尺寸烘**（`UI_HOME_ICON` = 96 px）：运行期缩放每帧都要重算，图标不值当。
-- 加新图标：用同一个脚本生成，`LV_IMAGE_DECLARE(...)` 加进
-  `components/ui_core/include/ui_icons.h`，再填到描述符的 `img`。
+- 加新图标：把源图加进 `assets/icons/icons.txt`，跑一次清单生成，
+  `LV_IMAGE_DECLARE(...)` 加进 `components/ui_core/include/ui_icons.h`，
+  再填到描述符的 `img`（或页面里 `lv_image_set_src`）。
 - 体积账：96×96 ARGB8888 = **36 KB 位图**（源码 ~200 KB，编译期解析完就不占）。
   app 分区很紧，加图标前先看 12.3 的余量。
 - ⚠ `-Werror=comment`：在注释里写通配路径别写成 `assets/icons/` 加 `*.png`，
@@ -490,11 +521,18 @@ tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
 ### 14.2 两份结果共用一个数组（别改成两份）
 
 `s_songs` / `s_song_n` 是**交给 app_music 的那一份**，用 `s_owner`
-（`OWNER_PL` / `OWNER_SRCH`）记住它属于谁。歌单详情只在 `s_owner == OWNER_PL` 时
-拿它画歌曲行，搜索页只在 `OWNER_SRCH` 时画 —— 两个列表**永不同时**引用同一个数组，
+（`OWNER_PL` / `OWNER_SRCH` / `OWNER_ACCT`）记住它属于谁，用 `s_cur_pl_id`
+记住"是哪个歌单的"（见 14.10）。歌单详情只在归属对得上时拿它画歌曲行，
+搜索页只在 `OWNER_SRCH` 时画 —— 两个列表**永不同时**引用同一个数组，
 也就不会出现"搜索结果被画进歌单详情"这种串台。
-`OREQ_REMOVE` 的结果处理里**绝不能** `free(s_songs)`：播放器可能正在放它，
-要等下一次 `online_install()` 把它挪进 `s_stale` 才是安全释放时机。
+`OREQ_REMOVE` 的结果处理里**绝不能** `free(s_songs)`。
+
+**旧队列的释放：交给播放器，不要在 app_online 里 free**（2026-10 修 use-after-free）。
+`s_stale` 只表示"被替换下来的那一份"，回收一律走
+`app_music_online_detach(s_stale)`：播放器还在拿它当队列（`s_on_songs == 它`，例如
+用户点歌之后又连着打开两个别的歌单）就由 app_music 接管，等它自己换队列/退回本地
+播放时再放；否则立刻放掉。以前 app_online 直接 `free(s_stale)`，那种序列会让
+**上下曲 / 自动续播读到已释放内存**（曲名乱码、串到别的歌、甚至整机 panic）。
 
 ### 14.3 搜索页的"历史 / 结果"切换规则（需求原文）
 
@@ -707,4 +745,357 @@ PNG 的整图缓冲、JPEG 的 `outbuf`、最终 RGB565 输出（`jpeg_calloc_al
 （`online_prepare_task` 先 `online_song_prepare_stream()` 抓封面+歌词，才置 ready）。
 封面晚几百毫秒出来没关系，但它拖慢了起播。要再快一档就把封面挪到 `app_music` 的
 封面工作线程按需下（`cover_kick` 那条路），让"解析到流地址"就能起播。
+
+### 14.10 详情页"这份歌是谁的" / 账号页转圈与重试 / 昵称持久化（2026-10 用户报）
+
+这一轮用户报了三件事，对应四个改动，**都别再改回去**：
+
+#### (1) 歌单详情必须先"认出自己那一份"，否则一直转到加载完成
+
+**症状**："播放列表的歌曲我挨个点开了怎么都是同样的" —— 点进第二个歌单，看到的、
+点到的仍然是**上一个歌单**的歌。
+
+**根因**：详情页原来只判 `s_owner == OWNER_PL && s_song_n > 0`。而点进第二个歌单时
+`s_songs` 里还是上一个歌单的数组（`s_owner` 也还是 `OWNER_PL`），于是列表**先把上一个
+歌单的歌顶上来**；那时点行播的就是老歌单里的歌。`s_cur_pl_id` 早就存在，但**从来没被
+读过**。
+
+**修法**：`online_install()` 把"这份数据属于谁"写进 `s_cur_pl_id`（歌单 ID /
+`DETAIL_KEY_DAILY` / 搜索时为空串），详情页用 `detail_owns_songs()` 比一次：
+对得上才 `fill_song_rows()`，对不上就画转圈（`detail_wait_rows()`）。
+于是行为变成用户要的"**点进去先转圈，加载好了再显示歌单**"。
+- 账号歌单/每日推荐走同一套（`DETAIL_KEY_DAILY` 是"每日推荐"的专用标记，
+  它没有歌单 ID）；
+- `s_songs` 里是别处（搜索/账号页）的结果时给一个"重新载入"行 —— **不要**在 rebuild 里
+  自动重发请求（结果回调会再触发 rebuild，容易形成循环）；
+- `detail_wait_rows()` 另有 `DETAIL_TIMEOUT_MS`(20 s) 兜底：超时就把转圈换成"重试"行。
+  请求万一没被工作线程收下（队列满），界面不会永远转下去。
+
+#### (2) 重启后账号歌单/昵称加载不出来：一次性标志改成节流重试
+
+**症状**："重启后进入在线播放页面，歌单什么的都没成功加载出来"。
+
+**根因**：`s_acct_pls_asked` / `s_acct_asked` 是**一次性**标志。开机后进页面时 Wi-Fi
+可能还没连上，那一次请求失败之后标志仍然是 true —— `poll_cb` 里"网络变了就重建页面"
+也拉不动它，整轮开机就停在"还没取到歌单/网易云账号"。
+
+**修法**：`acct_kick_if_needed()` / `acct_nick_kick_if_needed()`：
+- 没网就什么都不发（等网络事件触发重建，不给服务器空打）；
+- 没拉过就拉；失败过就重试，间隔从 `ACCT_RETRY_MS`(5 s) 起**翻倍**、上限
+  `ACCT_RETRY_MAX_MS`(60 s)（服务端一直不通 / cookie 失效时不至于每 5 秒打一次）；
+  `poll_cb` 每 200 ms 检查一次，进入 APP 时节奏复位；
+- **已经有列表（`s_acct_pls_n > 0`）就不再自动拉** —— 否则每次进页面都闪一下转圈；
+- 请求在路上的这段区间由 `s_acct_pls_busy` 表示，账号页列表区显示
+  `loading_rows()` 的转圈 + "正在加载歌单…"（用户要求：这里也要转圈）。
+- 结果处理里 `s_acct_pls_busy = false` 并把 `s_acct_pls_try_tick` 重置为"结束时刻"，
+  所以节流窗口从**失败那一刻**开始算。
+
+#### (3) 已登录昵称不再"重启就丢"
+
+`online_service` 新增 `online_netease_nickname()` / `online_netease_nickname_set()`：
+NVS `online`/`nick`，`online_netease_account()` 成功时自动写，`online_service_init()`
+和首次查询时懒加载，**退出登录时清掉**（换账号登录也不该看到上一个账号的名字）。
+`app_online` 侧 `s_login_name` 由 `login_name_sync()` 从 NVS 补齐 —— 重启后立刻显示
+"已登录：XX"，不用等 `/user/account` 的网络往返（没网时那个往返根本不会成功）。
+
+#### (4) 顺带修的两处"结果/内存"问题
+
+- **`s_page_alive`**：工作线程发布结果前看一眼页面还在不在。不在就直接把结果释放
+  （否则数组/二维码/歌单列表都会泄漏，而且下一轮要白等）；`online_on_delete()` 里也把
+  槽位清一次（那是"结果已发布、人走了"的情况）。
+- **工作线程的 3 秒闸门**：结果槽位只有一份，`online_work_task` 每次开始处理请求前
+  先等 LVGL 侧的 200 ms 轮询把上一份搬走（最多 3 秒）。否则两份结果会互相覆盖 ——
+  被覆盖的那个数组既没人用也没人 free，表现是偶发的"点歌单没反应 / 搜索卡在转圈"。
+- **`online_netease_cookie_reload()`**：cookie 存在 SD 上，而开机后马上进在线页时 SD
+  可能还没挂上；`net_cookie_load()` 一旦读到"没有"就会 latch，界面于是永远停在未登录
+  （用户看到的"重启后歌单全没了"也有这一份）。现在账号页重建时、以及每个账号类请求
+  发出前都会再读一次。
+
+⚠ 两个**编译期**坑（都真机踩过，-Werror 下直接不过）：
+
+- `#define DETAIL_KEY_DAILY "\x01daily"` 编译失败：`\x01d` 里的 `d` 是合法十六进制位，
+  会被并进同一个转义 → `error: hex escape sequence out of range`。
+  正确写法是拆字面量：`"\x01" "daily"`。凡是 `\xNN` 后面紧跟 `[0-9a-fA-F]` 都要拆。
+- NVS 键名拷贝（`bt_name_enum()` 里 `snprintf(keys[n], 13, "%s", info.key)`）会报
+  `-Werror=format-truncation`：`info.key` 是 `char[16]`（`NVS_KEY_NAME_MAX_SIZE`），
+  GCC 证得出"最多 16 字节进 13 字节"。改法：`"%.*s", BT_NAME_KEY_LEN - 1, info.key`
+  —— 显式精度既消警告又符合"这个命名空间里只有我们写的 12 位键"的事实。
+
+---
+
+### 14.11 账号歌单取歌**必须分页**（2026-10 修"歌单读取失败"）
+
+**症状**：点"每日推荐"能出来，点某些**账号歌单**报"歌单读取失败"（同一页面上有的歌单
+点得开、有的点不开）。
+
+**根因**：`online_netease_playlist_songs()` 原来是一次
+`/playlist/track/all?id=X&limit=<max>`（max = `ACCT_SONGS_MAX` = 300）。而服务端
+`module/playlist_track_all.js` 的实现是"取 playlist.trackIds → slice → 请求
+`/api/v3/song/detail`"，也就是说**每首歌都是完整的 song detail 对象**
+（ar/al/dt/h/m/l/privileges…），不是精简字段：
+
+| 口径 | 数值 |
+| --- | --- |
+| 每日推荐（真机日志实测） | 33 首 = **75,965 字节** → 约 **2.3 KB/首** |
+| `limit=300` 估算 | ≈ 700~900 KB |
+| 而 `NET_JSON_MAX`（`http_get_text` 的单响应上限） | **512 KB** |
+
+于是 `sink_reserve()` 置 `overflow` → 请求失败 → 界面报"歌单读取失败"。
+按 2.3 KB/首算，**超过 ~190~220 首的歌单必炸**；短歌单（≤100 首）一直正常，
+所以看起来像"随机失败"。`/playlist/detail` 那条兜底也一样（它一次返回整个歌单，更大）。
+
+**修法（第一步）**：服务层 `online_netease_playlist_page(pl_id, offset, out, max, out_n)`
+按 `limit=100&offset=N` 循环取（服务端 `playlist_track_all.js` 明确支持 `limit`/`offset`），
+每页 ≈250 KB 稳稳在限内；不足一页即到末尾。单页失败但已有数据时把已拿到的交出去，
+第一页就失败才走 `/playlist/detail` 兜底。
+
+**另外**：`OREQ_LOAD` / `OREQ_ACCT_SONGS` / `OREQ_DAILY` 的失败 Toast 现在带
+`online_last_error()`（"响应过大或内存不足(512 KB)" / "服务器返回 HTTP 400" / 网络错误…）
+—— 以前只报一句"歌单读取失败"，根本没法判断是哪一类。
+
+⚠ 分页只是第一步；**"一次把所有歌都拉回来"本身在 600+ 首的歌单上还是太重**
+（JSON 总量 ≈1.4 MB、解析峰值 + 一张 700 KB 的歌数组、再加上 600 行 × 5~6 个 LVGL 对象）。
+真正的做法是懒加载 + 按页渲染，见 §14.12。
+
+---
+
+### 14.12 在线列表**分页渲染 + 懒加载**（2026-10 需求："600 多首，别一次全加载"）
+
+用户原话："歌曲一共有 600 多个，建议你做懒加载和按需加载，不要一次把所有的列表内容
+加载出来。" 两件事都做了（宏定义在 `app_online.cc` 头部，工作线程也要用）：
+
+| 常量 | 值 | 作用 |
+| --- | --- | --- |
+| `ONLINE_PAGE_ROWS` | 100 | **屏幕上一页**画多少首（+ 2 行"上一页/下一页"） |
+| `ONLINE_SONGS_MAX` | 1000 | 单个账号歌单最多载入多少首（≈1.2 MB PSRAM） |
+| `ACCT_FETCH_MAX` | 200 | **单次补页**最多取多少首（= 2 个 HTTP 分页） |
+| `ONLINE_PL_PAGE_SONGS` | 100 | 服务侧一个 HTTP 请求取多少首（响应 ≈250 KB） |
+
+**1) 渲染分页**：`fill_song_rows_range(list, first, count)` 只画当前页；
+`page_rows()` 负责"上一页/下一页"，`page_row_clicked()` 用
+`user_data = (which << 1) | dir` 区分三个列表（账号歌单 / 我添加的歌单 / 搜索结果）。
+为什么必须分页：每行 5~6 个 LVGL 对象，600 首 = 3000+ 对象，滚动每帧都要遍历
+—— 同本地列表 §12.2 的结论。搜索（≤200 首）也一起分页了。
+
+**2) 网络懒加载（只对账号歌单）**：
+
+- 打开歌单时 `acct_lazy_begin(pl_id, trackCount)`：**按歌单总首数一次性分配好缓冲**
+  （cap = min(trackCount, ONLINE_SONGS_MAX)，trackCount 缺失时按 ONLINE_SONGS_MAX），
+  `s_song_n = 0`，**一首都不取**。
+- `acct_detail_fetch_if_needed()` 是唯一入口：算"当前页要显示到第几首"（`need`），
+  只补 `need - s_song_n`、且一次不超过 `ACCT_FETCH_MAX`，用
+  `work_submit_ex(OREQ_ACCT_SONGS, id, off = s_song_n, cnt)` 下单。
+  翻到第 N 页才取到第 N 页需要的那一段；翻页时如果数据没到，列表里显示转圈并自动补。
+- 结果在 `OREQ_ACCT_SONGS` 分支里走 **`acct_lazy_append(off, page, n)`**
+  （用 `memcpy` 追加到已载入末尾）。`oreq_t` 因此多了 `off`/`cnt` 两个字段，
+  `work_publish` 配套的 `s_res_off`/`s_res_want` 也必须在发布前写好。
+- **指针从头到尾不变**（缓冲一次分配好、只往里追加），所以播放器（app_music 存的是
+  同一个指针）永远有效 —— 不需要任何 realloc/换指针的危险操作。这也是为什么
+  歌单详情只画"已载入的连续前缀"：队列语义要求连续，跳页会按顺序把中间那些页补齐。
+- 取不满一页 = 到歌单末尾：把 `s_songs_total` 按实际修正，列表就不会一直显示"还有下一页"。
+- 取页失败 → `s_fetch_fail` + 一行"这一页没取到：<原因>" + "重试"（重试只补页，
+  **不重建缓冲**，免得把前面几页重下一遍）；首次（一首都没载入）就失败才退回歌单列表。
+
+⚠ 两个要留意的点：
+
+- **播放队列 = 已载入的那一段**。用户点某一行时 `app_music_play_online(s_songs, s_song_n, idx)`
+  会把当时的 `s_song_n` 交给播放器；之后即使又载入了更多页，也要等用户再点一次才会
+  更新播放器的队列长度（`s_on_count`）。这是刻意的取舍：不动 app_music 的队列结构，
+  就不会引入新的 use-after-free 面。
+- **`trackCount` 为 0 的退化情况**：按 `ONLINE_SONGS_MAX` 分配（宁可多占点 PSRAM，
+  也不能让用户只能看到前 100 首），真实总数由"取不满一页"修正。
+
+---
+
+### 14.13 详情页的"返回上一级"行**必须固定在列表之外**（2026-10 用户报）
+
+**症状**："歌单的返回按钮为什么会跟着滑动？导致无法快速地返回上一级菜单" —— 进歌单详情后
+往下翻歌，返回入口跟着滚出屏幕，只能滑回顶部才能点。
+
+**根因**：返回行（账号歌单的 `返回` 标签、我添加的歌单的 `‹ 歌单列表` 行）原来是
+**可滚动列表容器**（`s_acct_list` / `s_pl_list`，都是 `flex_grow` + `LV_DIR_VER`）的
+子对象，属于列表内容，自然跟着滚。
+
+**修法**：把它提升成**页容器**（`s_page_acct` / `s_page_pl`）的**第一个** flex 子对象：
+
+- `make_back_label(parent, text, cb)` 建一行"‹ 返回 / ‹ 歌单列表"，默认 `HIDDEN`，
+  进详情时 `remove_flag(HIDDEN)`，退回列表时 `add_flag(HIDDEN)`；
+- **隐藏时 flex 会自动跳过它**（`lv_flex.c:341/478` 里
+  `LV_OBJ_FLAG_HIDDEN` 的对象不参与布局），所以列表状态下不会留一条空白；
+- 创建顺序 = flex 布局顺序，所以必须在 `*_hint` **之前**建（`page_online()` 里）；
+- 换页/关页时 `online_on_delete()` 要把 `s_acct_back` / `s_pl_back` 一起置 NULL
+  （它们随 screen 销毁，留着就是悬垂指针）。
+
+**顺带**：内容整段重建之后要 `list_scroll_top(list)` 归零滚动位置 ——
+`lv_obj_clean()` + 重画不会重置滚动偏移，进详情/翻页后新内容会从**中间**开始显示
+（看起来像"漏了前几首"）。三处入口（`pl_row_clicked`、`acct_pl_clicked`、
+`acct_daily_clicked`）与 `page_row_clicked()` 都调了。
+
+**教训**：凡是"必须一直看得见"的操作入口（返回、标题、页签、翻页），都要挂在
+**不滚动的容器**上；只有"列表内容"才放进可滚动列表。
+
+---
+
+## 15. 设置页无线开关行 / 蓝牙名缓存 / 长按输出设备跳蓝牙（2026-10）
+
+### 15.1 设置页：开关与"进入子页"合并成**一行**
+
+以前 Wi-Fi / 蓝牙各有**两行**（一行 `lv_switch`、下面一行同名条目用来进子页）。现在合成一行：
+
+```
+[图标] [名称 / 状态]  [开关] [›]
+ └──────── 点这些进子页 ─────┘ └只切换┘
+```
+
+- 点**开关图案** → 只切开关；点行里其它任何地方（图标 / 名称 / 状态 / › / 空白）→ 进子页；
+- 实现只有一处：`app_settings.cc` 的 `make_switch_row()`，三处共用（设置主页 Wi-Fi 行、
+  设置主页蓝牙行、子页顶部那行）。`sub` 参数传 `NULL` = "只做开关"（子页里已经在子页，
+  不再需要"进入"），`status_out` 传 `NULL` = 不建状态行；
+- Wi-Fi / 蓝牙的 `s_sum[]` 摘要 label 现在就是那一行里的状态 label，`settings_tick` 照旧写它。
+
+**两个必须守住的点：**
+
+1. **`lv_switch` 被点会发 `CLICKED`，而 LVGL 默认让事件冒泡到父对象** —— 不挡的话
+   "点开关"会连带触发行的"进子页"。挡法：给开关自己挂一个 `LV_EVENT_CLICKED` 回调，
+   里面 `lv_event_stop_bubbling()`（值变化那条 `VALUE_CHANGED` 也顺手挡了）。
+   顺带记一条 LVGL 9.5 的实现：`LV_OBJ_FLAG_CHECKABLE` 的控件是在 **`LV_EVENT_RELEASED`**
+   里改状态、再补发 `VALUE_CHANGED`（`lv_obj.c` 的 `lv_obj_event()`），所以
+   `stop_bubbling()` **不会**影响开关自己切换 —— 别被"挡住了事件"误导。
+2. **开关实例表 `s_radio_sw[]`**：主页一行 + 子页顶部一行是**两个 `lv_switch`、一个逻辑开关**，
+   由 `radio_sw_sync()` 按服务真实状态一起拉齐；三个页面的 500 ms tick
+   （`settings_tick` / `wifi_tick` / `bt_tick`）都会调它一次 —— 所以"子页里改、返回主页立刻一致"
+   不依赖哪个页面活着。子页会被反复 push/pop，**`LV_EVENT_DELETE` 里必须注销**，
+   否则 tick 会拿已释放的对象 `add/remove_state`（use-after-free）。
+
+### 15.2 蓝牙设备名缓存（NVS `bt_name`）—— 修"名称变成 MAC 地址"
+
+**根因**：设备名**只能**从 `ESP_BT_AUDIO_EVENT_DEVICE_DISCOVERED` 里拿到。
+`esp_bt_audio_event_connection_st_t`（`esp_bt_audio_event.h`）**没有名字字段**，
+组件也没给 `read_remote_name` 之类的接口（`esp_bt_audio_classic.h` 只有
+discovery_start/stop、connect/disconnect、set_scan_mode）。于是"开机自动连上次那台设备"
+这条路（`bt_cfg/last`）**永远**拿不到名字，`make_addr_18()` 只能退回 MAC。
+
+**做法**（`bt_service.cc`）：
+
+- 扫描拿到真名（`d->name[0]` 且不等于 MAC 兜底串）→ 写 NVS `bt_name/<键>`（`bt_name_save()`）；
+- 反查三级回退：事件里的真名 → NVS → MAC（`make_addr_18()`）；
+  `DEVICE_DISCOVERED` 里"这一包还没带名字"、`bt_service_refresh_bonded()` 里
+  "已配对但本次没扫到"也各查一次 NVS —— 后者让开机没扫描时"已配对"列表也有名字；
+- **键名不能直接用 `AA:BB:CC:DD:EE:FF`**：NVS 键名上限是 **15 个字符**
+  （`NVS_KEY_NAME_MAX_SIZE=16`，含结尾 0，见 `nvs.h`），17 字符的 MAC 串会
+  `ESP_ERR_NVS_KEY_TOO_LONG`。所以键是**去掉冒号的 12 位大写十六进制**（`A1B2C3D4E5F6`）。
+- **条数上限 `BT_NAME_KEEP_MAX`(16)**：写之前 `bt_name_make_room()` ——
+  用 `nvs_entry_find_in_handle(h, NVS_TYPE_STR, &it)` 数条数，满了就 `nvs_erase_key()`
+  删枚举到的第一条（NVS 按条目索引顺序枚举，先写的先出来 = FIFO 淘汰最旧的）。
+  ⚠ "腾地方"必须在 `nvs_set_str` **之前**做：**迭代器不保证看得到同一次事务里尚未 commit
+  的写入**，写在后面会少数一条、上限形同虚设。
+- 名字没变就不写（先 `nvs_get_str` 比一次），避免同一次扫描反复上报时擦写 flash。
+
+### 15.3 长按输出设备 → 设置蓝牙页
+
+- `app_settings` 对外新增 `app_settings_open_bt()`（`app_settings.h`）：直接
+  `ui_router_push()` 蓝牙子页（**不先 push 设置主页** —— 目标就是蓝牙，多一层主页只是
+  让用户多按一次返回）。`app_music` 因此要在 `CMakeLists.txt` 里 `REQUIRES app_settings`。
+- ⚠ **短按必须挂 `LV_EVENT_SHORT_CLICKED`，不能挂 `CLICKED`**：`indev_proc_release()` 里
+  SHORT_CLICKED 只在 `long_pr_sent == 0` 时才发，而 CLICKED 是**无条件**发的 —— 用 CLICKED
+  的话"长按之后松手"会**既跳设置页、又开出输出选择弹窗**（同 §14.6 的结论）。
+  所以 `make_round_btn_ex()` 多了一个 `code` 参数，只有输出按钮传 `LV_EVENT_SHORT_CLICKED`。
+- ⚠ **长按回调里不能直接 push 页面**：按压期间 LVGL 会不断重新命中手指下的对象
+  （`lv_indev.c` 的 `pointer_search_obj`），松手补发的那个 CLICKED 会落到**新页面**里
+  手指位置的对象上 —— 蓝牙页那里正好可能是设备列表的一行，会莫名其妙去连一台设备。
+  所以长按只置 `s_open_bt_req` + `lv_async_call`，等
+  `lv_indev_get_state(lv_indev_active()) != LV_INDEV_STATE_PRESSED` 再 push
+  （与 `app_online` 的 `pl_menu_deferred` 是同一套手法）。
+
+### 15.4 存储详情页（`page_storage`，2026-10 需求）
+
+需求："存储需要设置为可点开，点击后显示 SD 卡的全部详细信息，包括总容量、可用容量，
+并绘制一个存储状态占用条。"
+
+- 设置主页那一行（`on_setting_row` 的 `SET_STORAGE`）从"弹个 Toast"改成 push 子页
+  （`SUB_STORAGE`，`no_back = true` 由 `make_page_shell` 自带返回钮）；
+- 页内：状态 / 挂载点 / 文件系统 + **容量卡**（`已用 x / 共 y` + `lv_bar` 占用条 +
+  大号百分比 + `可用 z`）+ 明细（总容量 / 已用 / 可用 / 卡类型 / 数据线宽度 / 工作频率 /
+  卡容量(CSD) / 卡片名称 / 序列号）。占用 ≥90% 时占用条与百分比变红（0xB5504E）。
+- **容量卡第一行的高度必须给常量**，不能用 `LV_SIZE_CONTENT`：行内两个 label 是
+  `lv_obj_align()` 按父容器尺寸定位的，而 `LV_SIZE_CONTENT` 又要反过来由子对象算 ——
+  互相依赖会算出 0 高（LVGL 经典坑）。
+- 卡信息来自 BSP 新增的 `bsp_sdcard_card_info()`（`bsp_storage.cc`）。**解码口径照抄
+  IDF 的 `sdmmc_card_print_info()`**（`sdmmc/sdmmc_common.c:314-361`）：容量 =
+  `csd.capacity × csd.sector_size`，类型靠 `ocr` 的 CCS/S18R 位，数据线宽度取
+  `ssr.cur_bus_width`（**当前**宽度）。CID 的 `name` 是 8 字节**空格填充**，要截 + 去尾空格。
+- 右上角"重新检测"：`bsp_sdcard_mount()` 幂等，**板子只在启动时 mount 一次**，
+  开机后才插卡必须再挂一次才认（否则永远显示"未检测到"）。
+- 设置主页那行的摘要是"已用 38% · 可用 18.3 GB"，**自己节流到 5 s** ——
+  `esp_vfs_fat_info()` 每次都走一遍 FATFS（`f_getfree`），不能每 500 ms 调一次。
+- ⚠ LVGL 9 的 `lv_color_t` 是**结构体**，别用 `uint32_t` 存颜色（`UI_COLOR_ACCENT` 这类
+  宏就是 `lv_color_hex(...)`）；要动态选色就声明 `lv_color_t tint = cond ? lv_color_hex(a)
+  : UI_COLOR_ACCENT;`，别套 `uint32_t` + 再 `lv_color_hex()` 一次。
+
+---
+
+## 16. 开机图片：启动图 + 首页背景图（2026-10 需求）
+
+### 16.1 开机启动图（`assets/init.jpg` + Toast，main/splash.cc）
+
+需求原文："使用 assets/init.jpg 图片作为启动加载初始化图，开机后初始化完屏幕就显示
+这个图片和 Toast，Toast 内容为：正在初始化... 初始化完成后，经过一个过渡动画，加载首页。"
+
+实现：`main/splash.cc`（+ `main/splash.h`），时序：
+
+| 时刻 | 动作 |
+| --- | --- |
+| `app_main` 第一件事（`bsp_init()` 之后） | `boot_splash_decode_start()`：后台任务把 JPEG 软解成 RGB565（≈770 KB PSRAM），**与后面的初始化并行**，钉 core 0（core 1 是 LVGL） |
+| 显示链路 ready 且 `ui_core_init()` 之后（**同一个 LVGL 锁里**） | `boot_splash_show()`：在 `lv_layer_top()` 最上层盖全屏图 + `ui_toast("正在初始化...")` |
+| `radio_init_task` 结束（WiFi + 蓝牙初始化完） | `boot_splash_init_done()` 只置一个标志 |
+| LVGL 定时器每 100 ms 检查 | `(init_done && 已显示 ≥ 900 ms) \|\| 已显示 ≥ 8000 ms` → 淡出（opa）+ 上滑 28 px，360 ms → 删对象、还回 PSRAM，露出首页 |
+
+几个**别改回去**的点：
+
+1. **图片用 BINARY EMBED 进 app**（`main/CMakeLists.txt` 的 `target_add_binary_data ...
+   BINARY RENAME_TO boot_splash_jpg`）。别用 TEXT（JPEG 里随便一个 `0x00` 会被当字符串
+   结尾）；也别编译期烘成 C 数组（没有图片编码工具，且 355 KB → ~6 MB 源码）。
+   IDF 6.1 的 `data_file_embed_asm.cmake` 会生成三个符号：
+   `_binary_boot_splash_jpg_start/_end` 与 `boot_splash_jpg_length` ✓ 可预测。
+2. **运行时解码走 `media_meta_image_mem_rgb565(data, len, UI_W, ...)`** —— 与在线封面
+   同一套解码器（JPEG/PNG 按魔数分派，输出 RGB565 + PSRAM）。`max_dim` 传 `UI_W`：
+   图正好 800×480，解码器在 `long_side <= max_dim` 时**不缩放**（`media_meta.cc` 的判定）。
+   像素用 `media_meta_cover_free()` 释放（内部 `jpeg_free_align`），描述符用堆上的
+   `lv_image_dsc_t`（照抄 `app_music` 的 `cover_show()`）。
+3. **Toast 必须在启动图之后弹**：`ui_toast()` 内部 `lv_obj_move_foreground()` 把 Toast
+   提到最前，于是"图盖住状态栏/返回键/首页、Toast 盖住图"。顺序反了 Toast 就被图盖住。
+4. **启动图与 Toast 之间不能松 LVGL 锁**（`main.cc` 里与 `ui_core_init()` 同一个锁）：
+   松锁会让 LVGL 先渲染一帧首页，用户看到"首页闪一下再被盖住"。
+5. 启动图容器设 `CLICKABLE` + 全屏：开机那几秒的触摸不该点到底下的首页。
+6. **释放顺序**（`splash_out_done_cb`）：`lv_image_set_src(img, NULL)` →
+   `lv_obj_delete_async(scr)` → `lv_async_call(free)`。`lv_obj_delete_async` 与
+   `lv_async_call` 是**同一条 FIFO 异步队列**（前者就是后者包的），所以这样写能保证
+   "对象真删掉之后"才 free 描述符与像素。
+7. 新增 `ui_toast_hide()`（`ui_core.h`）：过渡一开始就收掉"正在初始化..."，
+   不让它飘在首页上；`ui_core_init()` 里原来那句 `ui_toast("系统就绪")` 已删
+   —— 开场时机现在由 app 层（启动图）决定。
+
+⚠ 由此带来的体积：app 从 7.23 MB → ≈7.59 MB。分区表当前是**单个 14.61 MB 的
+`factory` 槽**（`partitions.csv`，见那里的注释：为了给后续功能腾地方，砍掉了 ota_1、
+放弃了 A/B OTA），所以完全放得下 —— §11.1 里"两个 7.5 MB app 槽"那段是**旧布局**，
+已过时。
+
+### 16.2 首页背景图（`assets/background.jpg`，ui_core/ui_home_bg.cc）
+
+- 资源**嵌在 ui_core**（`components/ui_core/CMakeLists.txt` 的 `target_add_binary_data`
+  → `_binary_home_bg_jpg_start/_end`）：画首页的组件自己带首页的图，换壁纸只改图片文件。
+- **直接当 screen 的 `bg_image` 用**（不建铺满屏幕的子对象）：LVGL 在
+  `bg_image_tiled = false` 时按原尺寸居中画在对象自己的区域上（`lv_draw_rect.c` 的
+  `draw_bg_img`），图正好 800×480 = 整屏；也就避开了 screen 的 `pad_top` 让子对象
+  坐标偏移那件事。
+- **必须压暗**：这张壁纸是亮色天空，而首页时钟（0xEDE6D8）与图标名（`UI_COLOR_FG`）
+  都是浅色 —— 用 `bg_image_recolor` = 黑 + `bg_image_recolor_opa = HOME_BG_DIM_OPA`
+  (120/255 ≈ 47%) 做一层暗色滤镜，一个常量调浓淡。
+- **后台解码**：`ui_core_init()` 里 `ui_home_bg_start()` 先把解码任务发出去（800×480
+  JPEG，几百毫秒），再建首页；解完在任务里按 AGENTS §6 **加 `esp_lv_adapter_lock()`
+  贴图**（首页可能还没建/已销毁，两种顺序都兜住：`ui_home_bg_bind()` 双向绑定）。
+  像素（≈770 KB PSRAM）常驻不释放。
+- 首页 `LV_EVENT_DELETE` 里除了解除绑定，还要**清掉时钟 label 指针并删掉 1 s 定时器**：
+  否则下一个 tick 会写到已释放的对象上（use-after-free，见 `home_deleted()`）。
+
 

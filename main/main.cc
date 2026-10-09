@@ -6,6 +6,7 @@
  */
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -14,10 +15,12 @@
 
 #include "bsp.h"
 #include "ui_core.h"
+#include "splash.h"
 #include "audio_service.h"
 #include "app_music.h"
 #include "app_settings.h"
 #include "app_online.h"
+#include "app_momotalk.h"
 #include "wifi_service.h"
 #include "bt_service.h"
 #include "play_state.h"
@@ -69,20 +72,91 @@ static void on_bt_media_ctrl(int cmd, void *user)
     app_music_on_media_ctrl(cmd);
 }
 
+/*
+ * 开机期内存遥测。
+ *
+ * 为什么必须打：2026-10 启动崩溃（Wi-Fi `init nvs: failed, ret=101` = NO_MEM，
+ * 蓝牙控制器 `orca_ems_env_init malloc pool failed` 之后在错误路径里 panic）
+ * 根因是**内部 RAM 不够**，但没有数字就只能在改动之间猜。这行日志把
+ * "内部 RAM 当前/历史最低 + PSRAM 当前"摊开，下一次任何内存相关的现象都能当场定位。
+ *   内部 RAM 是关键：Wi-Fi / 蓝牙的协议栈与控制器的内存池**只能放内部 RAM**
+ *   （只有 >16 KB 的普通 malloc 才会落 PSRAM，见 CONFIG_SPIRAM_USE_MALLOC 的
+ *   ALWAYSINTERNAL 阈值）。
+ */
+static void log_heap(const char *where)
+{
+    ESP_LOGI(TAG, "heap[%s]: internal free=%u min=%u | psram free=%u", where,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/* 起射频前要求的最低内部 RAM（实测 Wi-Fi 协议栈 + 蓝牙控制器池子要几十 KB） */
+#define RADIO_MIN_INTERNAL (32 * 1024)
+
 /* Wi-Fi / 蓝牙后台初始化（设置页会轮询状态，这里失败也不致命）。
  * 两者的总开关状态存在各自服务的 NVS 里：关着时 init 直接返回
- * ESP_ERR_INVALID_STATE 且不做任何初始化（射频/内存都不占）。 */
+ * ESP_ERR_INVALID_STATE 且不做任何初始化（射频/内存都不占）。
+ *
+ * ★ 这一步结束 = "开机初始化完成"：main() 里的启动图（assets/init.jpg）就是等这个
+ *   信号才淡出、露出首页的（见 splash.h）。所以**两个 init 无论成功失败都要走到底**，
+ *   最后一行必须调 boot_splash_init_done()，否则启动图要等到 SPLASH_MAX_MS 才消失。
+ *
+ * ★★ 开跑之前先看内部 RAM（2026-10 加）：射频初始化在内部 RAM 不足时**不是干净地
+ *   返回错误，而是会把控制器搞崩** —— 实测日志是
+ *     `[E] EMS: r_orca_ems_env_init malloc pool failed` → `[E] CTRL: orca_ems_env_init failed`
+ *     → `Guru Meditation ... olc_if_page_scan_deinit / r_olc_deinit`（蓝牙栈在初始化
+ *     失败的错误路径里解引用空指针），整机重启。
+ *   宁可不启动射频（本地曲库/播放不受影响），也不能让开机变成重启循环。
+ */
 static void radio_init_task(void *arg)
 {
     (void)arg;
-    if (wifi_service_init() != ESP_OK) {
+    log_heap("radio:before");
+
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < RADIO_MIN_INTERNAL) {
+        ESP_LOGE(TAG, "内部 RAM 不足（< %u B）：跳过 Wi-Fi / 蓝牙初始化，"
+                      "避免射频控制器在错误路径里崩溃", (unsigned)RADIO_MIN_INTERNAL);
+        boot_splash_init_done();
+        vTaskDelete(NULL);
+        return;
+    }
+
+    const esp_err_t wret = wifi_service_init();
+    if (wret != ESP_OK) {
         ESP_LOGI(TAG, "wifi not started (switch off or init failed)");
     }
+    log_heap("radio:wifi");
+
+    /*
+     * ★ 2026-10 实测的崩溃顺序就是这两步连着的：
+     *     `esp_wifi_init: ESP_ERR_NO_MEM` → `wifi_init: Failed to deinit Wi-Fi`
+     *     → `[E] EMS: r_orca_ems_env_init malloc pool failed`
+     *     → `Guru Meditation ... r_olc_deinit`（蓝牙栈在初始化失败的错误路径里空指针）
+     *   Wi-Fi 初始化失败时它自己的 deinit 也可能失败（上面那条日志），失败的协议栈
+     *   未必把内部 RAM 还干净 —— 这时候再拉蓝牙控制器，等于把最后一点内存也赌上去。
+     *   所以：**Wi-Fi 因内存失败 / 此刻内部 RAM 已经很低，就不要再试蓝牙**。
+     *   代价只是没有蓝牙（本地与在线播放都不依赖它），换来的是不会整机重启。
+     */
+    if ((wret == ESP_ERR_NO_MEM ||
+         heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < RADIO_MIN_INTERNAL) &&
+        bt_service_is_enabled()) {
+        ESP_LOGE(TAG, "跳过蓝牙初始化避免控制器崩溃：wifi_ret=%s, internal free=%u B",
+                 esp_err_to_name(wret),
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+        boot_splash_init_done();
+        vTaskDelete(NULL);
+        return;
+    }
+
     if (bt_service_init() == ESP_OK) {
         bt_service_set_media_ctrl_cb(on_bt_media_ctrl, NULL);
     } else {
         ESP_LOGI(TAG, "bt not started (switch off or init failed)");
     }
+    log_heap("radio:bt");
+
+    boot_splash_init_done();          /* 初始化完成 -> 启动图开始淡出 */
     vTaskDelete(NULL);
 }
 
@@ -119,6 +193,15 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "=== ESP32-S31 stream music player boot ===");
 
     ESP_ERROR_CHECK(bsp_init());
+    log_heap("after bsp_init");      /* 基线：后面每一步吃多少内部 RAM 都有参照 */
+
+    /*
+     * 开机启动图：**先把解码任务发出去**（assets/init.jpg，800x480 JPEG 软解成
+     * RGB565 要几百毫秒），让它与下面这一串初始化并行跑 —— 等屏幕起来时图通常
+     * 已经就绪，于是"屏幕一亮就是这张图"（见 splash.cc）。
+     */
+    boot_splash_decode_start();
+    log_heap("splash decode kicked");
 
     /*
      * 播放状态记忆（音量 / 曲目 / 进度，存 NVS）：必须在 audio_service_init()
@@ -158,24 +241,39 @@ extern "C" void app_main(void)
     app_music_register_apps();
     app_settings_register_apps();
     app_online_register_apps();
+    app_momotalk_register_apps();
 
-    /* UI 框架：状态栏 / 控制中心 / 手势 / 首页（全部在 LVGL 任务上下文建） */
+    /*
+     * UI 框架：状态栏 / 控制中心 / 手势 / 首页（全部在 LVGL 任务上下文建）。
+     *
+     * 建完**在同一个锁里**立刻盖上启动图（assets/init.jpg）+ Toast "正在初始化..."：
+     * 两件事之间不能松锁，否则 LVGL 会先渲染一帧首页 —— 用户看到的就是"首页闪一下
+     * 再被盖住"。启动图在最上层（状态栏/返回键/首页都在它下面）；Toast 对象是
+     * ui_core_init() 建的，而 ui_toast() 靠 lv_obj_move_foreground() 把自己提到启动图
+     * 之上，所以"图盖住一切、Toast 盖住图"（顺序反了就看不见 Toast）。
+     * 后台初始化（WiFi/蓝牙）报完成时，启动图淡出 + 上滑，露出已经建好的首页。
+     */
     if (esp_lv_adapter_lock(-1) == ESP_OK) {
         esp_err_t ret = ui_core_init();
-        esp_lv_adapter_unlock();
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "ui_core_init failed: %s", esp_err_to_name(ret));
         }
+        boot_splash_show();
+        esp_lv_adapter_unlock();
     }
 
     /* 硬件按键：必须在 ui_core_init() 之后，音量条的 LVGL 定时器才已经建好 */
     if (bsp_button_init(on_board_key, NULL) != ESP_OK) {
         ESP_LOGW(TAG, "bsp_button_init failed (音量按键不可用)");
     }
+    /* UI + 启动图 + 两张 800x480 图（PSRAM）之后的内部 RAM 余额 —— 射频启动就靠它 */
+    log_heap("after ui+splash");
 
     /*
-     * Wi-Fi / 蓝牙：初始化要几百毫秒（蓝牙更久），放后台任务里做，
-     * 首页照常先出来；设置页轮询就绪状态，期间显示"初始化中…"。
+     * Wi-Fi / 蓝牙：初始化要几百毫秒（蓝牙更久），放后台任务里做。
+     * 这一步**就是"开机初始化完成"的判据**：main/splash.cc 的启动图一直盖在首页上，
+     * 等这个任务最后调 boot_splash_init_done() 才淡出（见 splash.h）。
+     * 设置页另有自己的"初始化中…"轮询显示，与此无关。
      *
      * ⚠ 这个任务**必须钉在蓝牙协议栈任务（BTC）所在的那个核上**，而且优先级
      *   要低于它（BTC = configMAX_PRIORITIES - 6 ≈ 19，这里只用 3）。
