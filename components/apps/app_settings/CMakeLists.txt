@@ -1,5 +1,16 @@
 idf_component_register(
-    SRCS "app_settings.cc"
+    SRCS
+        "app_settings.cc"        # 注册 + 对外入口（只剩外壳）
+        "as_widgets.cc"          # 通用控件工厂
+        "as_fmt.cc"              # 纯逻辑格式化（不依赖 LVGL）
+        "as_page_shell.cc"       # 二级页外壳 + 子页描述符
+        "as_radio.cc"            # 无线总开关（唯一的跨任务面）
+        "as_page_main.cc"        # 一级页：设置列表
+        "as_page_wifi.cc"        # Wi-Fi 子页 + 密码浮层
+        "as_page_bt.cc"          # 蓝牙子页
+        "as_page_output.cc"      # 声音与输出子页
+        "as_page_storage.cc"     # 存储子页
+        "as_page_about.cc"       # 关于本机 + 芯片温度
     INCLUDE_DIRS "include"
     REQUIRES
         lvgl

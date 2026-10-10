@@ -108,7 +108,16 @@ esp_err_t audio_service_set_volume(int percent);
 int       audio_service_get_volume(void);
 esp_err_t audio_service_set_mute(bool mute);
 
-/* 事件回调（在播放器任务上下文被调用，**不要在里面做重活**） */
+/*
+ * 事件回调（**不要在里面做重活，也不要碰 LVGL**）。
+ *
+ * ⚠ 回调可能在**多个上下文**里被调用，不要在回调里假设线程：
+ *   - 解码任务：STARTED / PAUSED / RESUMED / FINISHED（EOS 后输出播完）… ；
+ *   - **起播调用者自己的上下文**：`audio_service_play_path()` / `play_uri()` 里
+ *     库会同步派发一次 STARTED（也就是说可能在 LVGL 任务里）；
+ *   - HTTP 馈送任务：在线流出错时的 ERROR。
+ * 正确用法是"只置标志，由定时器/任务去处理"（app_music 就是这么做的）。
+ */
 void audio_service_set_event_cb(audio_event_cb_t cb, void *user);
 
 /* 当前曲目的流信息（由 ESP_ASP_EVENT_TYPE_MUSIC_INFO 事件填充，
@@ -153,12 +162,22 @@ bool audio_service_stream_speed(int *kbps);
 
 /*
  * 本首是否**已经真的出声**（有 PCM 写到 codec / 蓝牙）。
- * 起播与换曲时清零（见 play_uri_locked），由 out 回调置位。
+ * 起播与换曲时清零，由输出级在写出第一块 PCM 时置位；seek 后也会清零。
  *
  * UI 用它决定"缓冲中 xx%"什么时候换回歌词：只看 audio_service_is_playing()
- * 不行 —— pipeline 一 run() 状态就是 playing，那时还没声音。
+ * 不行 —— 会话一起来状态就是 playing，那时还没声音。
  */
 bool audio_service_output_active(void);
+
+/*
+ * 当前播放位置（毫秒）。口径是**送去硬件的 PCM 字节数 ÷ 192 B/ms**：
+ * 输出级把一切源统一成 48 kHz/16bit/2ch 才写硬件，所以这个换算恒成立。
+ *
+ * 与 audio_service_output_active() 配合使用：出声期间它按真实播放推进，
+ * 缓冲/暂停期间不涨。想自己累计时间也可以（app_music 就是自己累计的），
+ * 这里提供的是"服务侧的真实进度"，用于日志与偏差核对。
+ */
+uint32_t audio_service_position_ms(void);
 
 #ifdef __cplusplus
 }

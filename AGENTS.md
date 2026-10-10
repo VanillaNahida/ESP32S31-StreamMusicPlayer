@@ -10,6 +10,37 @@
 
 ---
 
+## 0. ⚠ 音频链路已在 2026-10 换成 libs/espaudiocore（先读这一节）
+
+**解码库不再是 `esp_audio_simple_player` / ESP-GMF**。`esp_audio_simple_player`、
+`gmf_audio`、`gmf_io`、`gmf_core` 都已退出构建；音频链路的当前架构、线程纪律、
+对外语义变化、我们对 vendored 库做的补丁、排查用日志，**全部在
+[`docs/audio-stack.md`](docs/audio-stack.md)**，改音频相关代码前必须读它。
+
+本文件 §11.4 及其之后关于 GMF 的记录（`esp_gmf_io_http` 的坑、`seek_byte_for` 码率换算、
+落点核对、`esp_gmf_obj_dupl` 的句柄身份、`Run timeout`……）现在是**历史记录**：
+现象与排查思路仍有参考价值，但**对应的代码已经不存在了**，别照着它改代码。
+
+三条最容易踩的现行约定，先记在这里：
+
+1. 本板 I2S 是 **TDM**，espaudiocore 的 I2S 输出模式（STD API 重配时钟）**不可用** ——
+   一律"解码到 ringbuf + 我们自己写 `esp_codec_dev_write()`"。
+2. 写硬件的 PCM **恒为 48kHz/16bit/2ch**（由 `audio_output.cc` 用 esp_asrc 统一），
+   所以时间轴只有一个口径：`ms = 字节数 ÷ 192`。
+3. 会话锁（`audio_core_lock()`）只保护"起播/停止/seek 重开"；**输出任务与事件回调绝不取锁**。
+
+构建入口也变了：本机 `idf.py` 会被 PowerShell 执行策略/沙箱挡住，统一用
+`& .\tools\idf.ps1 build`（封装了 EIM profile、代理与 bmgr 扩展）。
+
+**同一轮还做了大文件拆分**：`audio_service` / `app_music` / `online_service` /
+`app_online` / `media_meta` / `app_settings` / `bt_service` 七个组件已从单文件
+（1269~3619 行）拆成 5~17 个 `.cc`（都 ≤640 行）+ 各自的内部头，
+**对外头文件一个字没改**。拆分清单、验收方式、以及"增量绿而从零红"这类坑，
+见 [`docs/refactor/README.md`](docs/refactor/README.md)；
+拆分前每个文件的逐行审计报告在 `docs/refactor/01~07_*.md`（行号对应当初的旧文件）。
+
+---
+
 ## 1. 第一原则：官方文档优先
 
 编程开发**严格参考** [ESP-IDF 官方文档（ESP32-S31 版）](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s31/index.html)。

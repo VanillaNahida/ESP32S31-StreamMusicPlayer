@@ -1,6 +1,15 @@
 idf_component_register(
-    SRCS "bt_service.cc"
+    SRCS
+        "bt_service.cc"
+        "bts_state.cc"
+        "bts_name_cache.cc"
+        "bts_settings.cc"
+        "bts_audio.cc"
+        "bts_feed.cc"
+        "bts_events.cc"
+        "bts_scan_pair.cc"
     INCLUDE_DIRS "include"
+    PRIV_INCLUDE_DIRS "include/internal"
     REQUIRES
         bt
         esp_event

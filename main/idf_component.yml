@@ -28,11 +28,14 @@ dependencies:
   espressif/libpng: "^1.6.58"
 
   # ---- 音频管线 ----
-  # esp_audio_simple_player 是官方在 ESP-GMF 之上搭好的播放门面
-  # （依赖 gmf_audio + gmf_io），M2 本地/在线播放走它；M4 蓝牙再用
-  # gmf_core + esp_bt_audio 的 element 搭图。
-  # 注意：不要引入 gmf_loader，它会把 gmf_video + gmf_ai_audio 一起拖进来。
-  espressif/esp_audio_simple_player: "^1.1.0"
+  # 解码走 **libs/espaudiocore**（vendored 组件，根 CMakeLists 的 EXTRA_COMPONENT_DIRS
+  # 注册），不再是 ESP-GMF 的 esp_audio_simple_player —— 后者的依赖（gmf_audio /
+  # gmf_io / gmf_core）随 M2 迁移一并退出音频链路。
+  #
+  # esp_asrc：采样率/声道转换。espaudiocore 不做重采样，输出级用它把任意源
+  # （44.1k/32k/24k/16k/8k…、单声道）统一到 48 kHz/16bit/2ch。
+  # 之前它是被 esp_audio_simple_player 传递引入的，现在是**直接依赖**。
+  espressif/esp_asrc: "^1.1.0"
 
   # ---- 蓝牙音频（A2DP Source：本机推流给耳机/音箱）----
   # ESP-GMF 的蓝牙音频模块：经典蓝牙 A2DP/AVRCP + LE Audio。

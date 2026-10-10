@@ -1,5 +1,22 @@
 idf_component_register(
-    SRCS "online_service.cc"
+    SRCS
+        "online_service.cc"
+        "os_state.cc"
+        "os_util.cc"
+        "os_fs.cc"
+        "os_http_client.cc"
+        "os_json.cc"
+        "os_pl_format.cc"
+        "os_playlists.cc"
+        "os_search.cc"
+        "os_cache.cc"
+        "os_media_cache.cc"
+        "os_audio_cache.cc"
+        "os_stream_url.cc"
+        "os_history.cc"
+        "os_api.cc"
+        "os_login.cc"
+        "os_account.cc"
     INCLUDE_DIRS "include"
     REQUIRES
         esp_http_client
@@ -17,7 +34,7 @@ target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)
 # 内置网易云 cookie（免扫码登录）
 #
 # CONFIG_ONLINE_NETEASE_CK_FILE 是**相对工程根目录**的路径（见 main/Kconfig.projbuild），
-# 默认 assets/ncm-ck.txt。配置为空、或文件不存在 -> 什么都不做，online_service.cc 里
+# 默认 assets/ncm-ck.txt。配置为空、或文件不存在 -> 什么都不做，os_login.cc 里
 # 的 ONLINE_NCM_CK_BUILTIN 也就不会定义，行为与没有这个功能时完全一致。
 #
 # 三种嵌入方式里选 TEXT：它会在数据末尾补一个 '\0'，于是

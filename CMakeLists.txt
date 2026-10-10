@@ -24,6 +24,9 @@ set(EXTRA_COMPONENT_DIRS
     # 项目 components/ 的搜索只覆盖一层，故显式登记二级目录
     "${CMAKE_CURRENT_LIST_DIR}/components/services"
     "${CMAKE_CURRENT_LIST_DIR}/components/apps"
+    # 解码库 espaudiocore（vendored）：自成一体的组件，放在 libs/ 下
+    # 与管道的其它部分隔离。音频链路的解码全部走它，不再是 ESP-GMF。
+    "${CMAKE_CURRENT_LIST_DIR}/libs/espaudiocore"
 )
 
 # 词库放在独立的 dict 分区（见 partitions.csv），不把 1 MB 回退副本链进 app；
