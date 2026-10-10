@@ -567,6 +567,423 @@ free）当作键盘 READY 事件的 `user_data`。而 `wifi_tick` 每 500 ms 就
 现在浮层用**自己的** `s_pw_ssid[WIFI_SSID_MAX]`（生命周期与浮层一致）。
 凡是"把回调要用到的指针挂在别处、而那个 owner 可能被重建"的地方，都要这样copy 一份。
 
+#### 11.5.5 重试必须**轮询已保存的列表**，不能死磕一个（2026-10 用户报）
+
+**现象**（用户原话："为什么要一直对一个 wifi 重试？不能根据已保存的列表轮询检测吗？"）：
+
+```
+W wifi_svc: connect '蔚蓝档案千禧科技学院' failed: reason 201 (没找到这个 AP（信号弱/在 5G 频段？）)
+W wifi_svc: quick retries exhausted, retry '蔚蓝档案千禧科技学院' every 60 s from now on
+I wifi_svc: slow retry '蔚蓝档案千禧科技学院'      ← 每 60 秒刷一次，永远是同一个
+W wifi_svc: connect '...' failed: reason 201
+```
+
+**根因**：`wifi_retry_cb()` 里是 `store_find(s_conn_ssid)` —— 永远重连"当前目标"
+（开机取 `s_store.list[count-1]`，即**最近保存的那个**）。存了多个网络时，
+只有一个在范围内的情况下，它会把 60 秒一次的重试**全部**花在那个连不上的 SSID 上，
+另一个明明可用却永远轮不到。
+
+**修法**（都在 `wifi_service.cc`）：
+
+| 点 | 做法 |
+| --- | --- |
+| 轮询游标 | `s_cred_idx` = **下一次重试**要试的已保存凭据下标；`wifi_retry_cb()` 试完当前这个就 `(idx+1) % count` |
+| 发起连接 | `cred_cursor_next(ssid)` 把游标指向**目标的下一个**（开机自动连 / `wifi_service_connect()` / `connect_saved()` 三处都调）→ 它要是失败，下次重试自然换一个 |
+| 连上了 | `WIFI_EVENT_STA_CONNECTED` 里把游标**指回它自己** —— 掉线先重连刚刚还好用的那个，再往后面轮 |
+| 快速额度 | `wifi_retry_budget_refill()` 取 `max(WIFI_RETRY_MAX, s_store.count)` —— **每个已保存的网络至少被快速试一次**（否则存 8 个、额度 5，后面的永远轮不到） |
+| 日志 | `connect 'X' (try, N retry left, saved 2/3)` / `slow retry 'X' (saved 2/3)`，轮询到第几个一眼可见 |
+| forget 之后 | `s_cred_idx >= s_store.count` 时在 `wifi_retry_cb` 开头夹回 0（列表会变短，游标不能越界） |
+
+⚠ 注意区分"轮询"和"扫描"：`reason 201` = `WIFI_REASON_NO_AP_FOUND`，**那个 AP 此刻确实不在范围内**
+—— 所以**只有一个已保存网络时轮询也救不了**（那是环境问题，不是代码问题），日志里会一直刷。
+轮询解决的是"存了好几个网络、只有一个可用"的场景。
+更彻底的一步（**未做**）：重试前先 `esp_wifi_scan_start()`，只在**扫描可见**的已保存网络里挑，
+这样每个不在范围的 AP 能省掉一次 2~4 秒的失败连接，还能顺手在 UI 上提示
+"你保存的网络当前都不在范围内"。
+
+#### 11.5.6 ⚠ "放歌一卡一卡"的真凶是**蓝牙 A2DP 链路带宽**，不是 SD/解码（2026-10 真机定位）
+
+用户报"放一些歌曲会一卡一卡"，日志（**本地** FLAC → A2DP 耳机）：
+
+```
+I AUD_Dec_Parse: FLAC sample_rate 44100 duration:194931 max_frame:20323
+E AUD_Dec_Parse: Not found frame in max frame size 20323      ← 9 次后自己恢复了，与卡顿无关
+I media_meta: audio probe: 0 bps, 194931 ms, 44100 Hz, 2ch     ← ⚠ 见下面的码率 bug
+I bt_svc: a2dp tx: 8000 frames, 289 f/s (need 345 f/s), dropped 0 B    ← ★ 只发了需求的 84%
+I audio_svc: play stats: PCM 157 KB/s (820312 B in 5076 ms)            ← 满速应 192 KB/s
+E BT_L2CAP: l2cab is_cong_cback_context                                ← L2CAP 拥塞回调
+```
+
+**判读**（这套日志组合起来就把范围锁死了）：
+
+| 观测 | 含义 |
+| --- | --- |
+| `need 345 f/s` vs 实际 289 f/s | A2DP 每秒少发 16% 的编码帧 → 对端欠载 → **一卡一卡** |
+| `PCM 157 KB/s`（应 192） | 整条解码链被**拖慢到 82%**（不是它自己慢） |
+| `dropped 0 B` + 环形缓冲没满 | **不是我们丢帧**，是下游持续只吃得下这么多 |
+| `l2cab is_cong_cback_context` | L2CAP 缓冲被填满 = 链路/对端给不出更多发送缓冲 |
+| CPU 极低 | 任务都在等射频，不在算 |
+
+所以最初"CPU 低 → 是不是没在解码"的怀疑方向是错的：**解码是异步且跟得上，是蓝牙拖住了它**。
+`bt_service_write_pcm()` 的阻塞发送（上限 200 ms）本来就是**故意**把链路节拍交还给解码管线的，
+所以链路一慢，PCM 速率就跟着掉 —— 这是设计使然，不是 bug。
+
+**这一轮改的三件事**（都对症，但**根治要看下一次日志**）：
+
+1. **SBC bitpool 封顶**（`A2DP_SBC_BITPOOL_MAX = 40`）：码率需求由 bitpool 决定，
+   joint-stereo/16block/8subband 下 44.1 kHz 的 bitpool 53 ≈ 328 kbps、64 ≈ 400 kbps，
+   廉价耳机 + 2.4 GHz 共存时经常吃不下。压到 40（≈250 kbps）给链路留余量。
+   **合法性**：SBC 每帧帧头都带 bitpool 字段，对端按帧头解码，不需要重新协商
+   （各家"音质/稳定性"档位就是这么做的）。代价是听感略糊。恢复原样改成 250 即可。
+   ⚠ 必须**拷贝**协商结构体再改（`info.codec_cfg` 是协议栈的内存，不能就地改）。
+2. **馈送速率地板拆掉**：`feed_task` 原来"没数据就睡 5 ms"，等于给馈送速率设了
+   512 B/5 ms ≈ 100 KB/s 的地板（< 需要的 192 KB/s）—— 缓冲一旦被抽空就再也追不上。
+   现在无重采样路径改成**带超时的阻塞取**（有数据立刻返回），有重采样路径的等待从 5 ms 降到 1 ms。
+3. **诊断计数**（下次日志一眼定位）：`a2dp tx` 那行加了
+   `acq_retry N (M ms slept), rel_to N, enc N us/frame, idle N, ring N B` ——
+   - `acq_retry`/`ms slept` 大 ⇒ 卡在**协议栈/链路**（给不出发送缓冲）；
+   - `enc us/frame` 大 ⇒ 卡在我们自己的 SBC 编码；
+   - `ring B` 一直贴 0 ⇒ 上游（解码）供不上；一直满 ⇒ 下游（链路）吃不下。
+   另外启动时会打 `a2dp budget: 345 f/s x NNN B = NNN kbps`，一眼看出**链路得扛多少**。
+
+**顺带修的真 bug**：`media_meta` 对 FLAC 的码率算成了 `0 bps`（`audio probe: 0 bps`）——
+成因是元数据块链走完后的 `data_off` 偶尔算飞，`file_size - data_off` 不合法就**静默**不填码率
+（这个 FLAC 就是）→ 后果是这些文件**拖不动进度条**（报"定位失败：码率未知"）。
+现在加了兜底（`file_size - 42`）+ 一行 `flac: data_off N, audio N B, bitrate N bps (avg)`
+诊断日志，不会再悄悄变 0。
+
+**还没做但更根本的两件事**（按性价比排序）：
+
+1. **WiFi/BT 共存**：2.4 GHz 上 WiFi 与 BT 共享射频。用户那台机器当时 WiFi 正在
+   **每 60 秒重试一个连不上的 AP**（见 §11.5.5），每次连接尝试都会抢走射频时间。
+   最快的验证：**关掉 WiFi 再放同一首歌**；若明显好转，就该做成"BT 正在放音时不主动
+   scan/连接，只做轻量重试"。
+2. **重采样路径的取数改成"整段阻塞"**（`xStreamBufferReceive` 配 trigger level 或加一级
+   中间缓冲），彻底去掉轮询；现在是 1 ms 轮询，已经不是瓶颈。
+
+### 11.5.7 ⚠ 板载输出也卡 ⇒ 瓶颈在**解码链**，蓝牙只是又一个受害者（2026-10 用户追报）
+
+用户补充："这个音频文件不止蓝牙卡，**板载音频输出也卡**。" —— 这句话把上一节的结论修正了一半：
+
+- **板载 I2S 是硬件时钟**（DMA 按 48 kHz 精确取数），**不存在"带宽不够"**；出现卡顿
+  只有一个解释：**解码链产不出实时 PCM**（每 10 秒少 ~1.6 秒的音频）。
+- 所以蓝牙侧的 `289 f/s (need 345)` 很可能**不是链路带宽问题**，而是**上游本来就只喂了 84%**：
+  `bt_service_write_pcm()` 的阻塞发送只是把"上游慢"如实反映出来。
+  （bitpool 封顶与馈送地板那两个改动仍然合理 —— 它们各自是独立的问题 —— 但**不是**这个的根因。）
+
+**顺带排除的一个怀疑**（查过了，代码是对的）：选了扬声器输出时，PCM **不会**同时喂蓝牙 ——
+`out_write_cb()` 里是 if/else 分流（`AUDIO_OUT_BLUETOOTH` → BT；否则 → `esp_codec_dev_write`），
+所以"板载卡是蓝牙拖的"不成立。
+
+**这个文件的特征**（下一条线索）：`FLAC 44100 Hz 24 bit, max_frame 20323` ——
+位深 24 bit、`max_frame` 高达 20 KB（常见 FLAC 只有 3~7 KB）。整条链是
+`FLAC(24bit) 解码 → 44.1k→48k 重采样 → 24→16bit → 48k/2ch 输出`，
+其中**解码**与**重采样**都可能吃满 CPU（单核 320 MHz，且 LVGL/WiFi/蓝牙都在抢）。
+
+**这一轮加的分级耗时统计**（托管组件补丁，同 §11.7/§11.8 的补丁一起会丢）：
+`esp_gmf_audio_dec.c` 与 `esp_gmf_rate_cvt.c` 各加了一个 5 秒窗口的统计：
+
+```
+I ESP_GMF_ASMP_DEC: aud dec: 117 calls, 3200000 us cost, 4012 ms PCM out -> 79.8% of realtime
+I ESP_GMF_RATE_CVT: rate cvt: 117 calls, 890000 us cost, 4012 ms audio (src 44100 Hz) -> 22.2% of realtime
+```
+
+判读（`% of realtime` = 处理这段音频花掉了多少实时时间）：
+- **解码**那一行接近或超过 **100%** ⇒ FLAC 解码本身跟不上（24 bit + 大帧的字形，CPU 硬伤）；
+- **重采样**那一行占比很大（>40%）⇒ `44.1k→48k` 重采样是主因；
+- 两行都低（合计 <70%）⇒ 不在计算上，得往管线调度/IO 阻塞方向查。
+
+**要定位下一步，需要**（真机日志）：
+1. **板载输出**（设置里把输出切到扬声器）放这个文件 15 秒的日志，重点是：
+   `play stats: PCM x KB/s`、上面两行新的耗时统计、以及**播放中**是否还有
+   `AUD_Dec_Parse: Not found frame in max frame size ...`；
+2. 如果方便，**把这个 FLAC 拷到电脑上**发我 —— 有文件就能离线看它的 STREAMINFO /
+   元数据块链 / 帧结构，把"解不出帧"（§11.8 遗留）和这次的"跟不上"一起定死。
+   没有文件只能靠上面两行占比来二分。
+
+#### 11.5.8 CPU 假说被数据否掉：解码 7~13%、重采样 20%，整条链却只跑 73% ⇒ 在**等**（2026-10）
+
+用户提供了**分级耗时统计**的实机日志（本地 FLAC，板载/蓝牙都一样卡），关键几行：
+
+```
+I ESP_GMF_ASMP_DEC: aud dec: 1296 calls, 387611 us cost, 5248 ms PCM out -> 7.4% of realtime
+I ESP_GMF_RATE_CVT: rate cvt: 41 calls, 754673 us cost, 3808 ms audio (src 44100 Hz) -> 19.8% of realtime
+I audio_svc: play stats: PCM 139 KB/s (731152 B in 5106 ms), io=2610688 B, calls=41, flow=1
+```
+
+| 观测 | 结论 |
+| --- | --- |
+| 解码 **7.4%**、重采样 **19.8%** of realtime | **CPU 完全不是瓶颈**（合计 1/3 个核，还剩 2/3 空闲） |
+| 整条链 PCM **139~142 KB/s**（应 192）= 73% | 稳态就是**缺 27%**，且**很稳定**（不是偶发抖动） |
+| `io=` 每 5 s 涨 ~692 KB = 135 KB/s，而文件平均 199 KB/s | 连**读文件**的字节速率都只有 68% ⇒ 卡在"等"，不在"算" |
+| 解码 105%（5248 ms/5 s）而重采样 75%（3808 ms/5 s） | 两者的 5 s 窗口**不是同一段**（各自从首次调用起算），不能逐窗口对比；长期稳态两边必然相等 |
+
+**另一个更严重的现象**：`E ESP_GMF_TASK: Run timeout` + `audio_svc: run '...' failed: -3`
+—— 文件放到 ~5 s 被**整个掐死**（`esp_gmf_task_run()` 等 `GMF_TASK_RUN_BIT` 超过
+`api_sync_time` 就返回 `ESP_GMF_ERR_TIMEOUT`，见 `esp_gmf_task.c:684`）。
+首轮任务里有 FLAC 解析器**连续 9 次** `Not found frame in max frame size 20323`
+（每次都要扫最多 20 KB）＋ 24→16bit 输出缓冲重分配（`Not enough memory for out,
+need:27648, old: 24576`），首轮很容易超过同步超时 ⇒ 被当成致命错误、直接跳过这首。
+**这是"有些歌点进去放不出来/刚放就跳下一首"的直接原因之一。**
+
+**还有一条强线索**：`media_meta` 的块链遍历在这两个文件上**都算飞了**：
+
+```
+W media_meta: flac: bad data offset 94542957 (file 38834495), fall back to 38834453 B
+W media_meta: flac: bad data offset 138083655 (file 36897355), fall back to 36897313 B
+```
+
+数据偏移算到了 94 MB / 138 MB，而文件只有 38 MB / 36 MB —— 说明**这两个 FLAC 的元数据
+块链不正常**（某个块的长度字段被读成了巨大的值，或者块结构与常规不同）。
+同一个异常结构很可能就是 ESP 解析器**一直在 `Not found frame`** 的原因
+（它按 `max_frame` 分块找同步字，遇到非标准结构就找不到帧）。
+
+**这一轮加的"等待点"统计**（托管组件补丁）：
+
+| 位置 | 日志 | 判读 |
+| --- | --- | --- |
+| `esp_gmf_io_file.c` 的 `_file_acquire_read` | `ESP_GMF_FILE: file read: N calls, M ms cost, B B in W ms -> K KB/s, P% of the window spent reading` | `P%` 大 ⇒ **卡在读 SD**（这也是当初"给 io_file 加预读缓冲"那个方向，但**这次要先看数据再动手**，别再盲改） |
+| `audio_service.cc` 的 `out_write_cb` | `play stats: ... \| out M ms in codec, gap max G ms, audio A ms` | `gap max` 正常 ≈ 一个块的长度（~46 ms）；出现几百毫秒 ⇒ **被饿住**（解码/任务调度）；`out` 明显大于音频时长 ⇒ **codec/I2S 慢** |
+
+判读组合（下一次日志直接定位）：
+- `file read` 的 `P%` > 40% ⇒ SD 读是主因 ⇒ 才轮到做预读缓冲 / 换卡测试（用电脑读同一张卡对比速度）；
+- `gap max` 很大而 `file read` 很小 ⇒ 任务被抢占或上游没数据 ⇒ 查任务优先级/核心亲和；
+- `out` ≫ `audio` ⇒ codec 写阻塞异常 ⇒ 查 I2S/DMA 配置；
+- 三者都不高 ⇒ 时间花在 GMF 内部（端口/队列）或**解析器空转**（`Not found frame` 的代价）。
+
+#### 11.5.9 块链留证：那两个 FLAC 的元数据块链确实不正常（2026-10）
+
+§11.5.8 的 `bad data offset 94542957 (file 38834495)` 只说了"偏移算飞"，没说**是哪一块**。
+现在 `probe_flac()` 会把走到的每一块（type / len / pos，最多 16 块）留证，并在
+**块长度 > 文件大小**时立刻停下（继续加只会越飞越远，真机到过 138 MB）：
+
+```
+W media_meta: flac: block type 4 len 4294967295 exceeds file 38834495, stop walking
+W media_meta: flac: bad data offset 94542957 (file 38834495, 3 blocks seen:
+W media_meta: flac:   block[0] type 0, len 34, pos 4
+W media_meta: flac:   block[1] type 3, len ..., pos 42
+W media_meta: flac:   block[2] type 4, len 4294967295, pos ...
+W media_meta: flac: fall back to 38834453 B
+```
+
+判读：
+- `type 0` = STREAMINFO、`3` = SEEKTABLE、`4` = VORBIS_COMMENT、`6` = PICTURE ✓ 正常；
+- 某个块的 `len` 是 **0xFFFFFFFF / 几十 MB** ⇒ 块头被读错位了（前一块的长度算错、或
+  文件里嵌了非 FLAC 数据段）⇒ 与 ESP 解析器一直 `Not found frame` 高度相关；
+- 如果块链看起来**正常**而偏移仍算飞 ⇒ 是我们这边（`be24`/`ftell`）的问题，得改代码。
+
+⚠ 顺带说明：这条诊断只影响**码率/时长**（`media_meta` 自己算的），
+**不改变播放**——播放走的是 ESP 的解析器，它有自己的一套。
+
+#### 11.5.10 ✅ 用户给了文件：**文件完全合规**，"偏移算飞"是我们自己的 bug（2026-10 定案）
+
+用户把文件拷到 PC（`C:\Users\VanillaNahida\Videos\蔚蓝档案 RE Aoharu 电吉他版.flac`），
+离线解剖（`tools/font/venv` 里的 `build/flac_check.py` + ffprobe）：
+
+```
+block 0: pos=4        type=0 (STREAMINFO) len=34
+    STREAMINFO: 44100 Hz, 2 ch, 24 bit, 8,596,480 采样 (194.932 s), block size 4096..4096
+block 1: pos=42       type=4 (VORBIS_COMMENT) len=111
+block 2: pos=157      type=6 (PICTURE) len=423,169
+block 3: pos=423,330  type=1 (PADDING) len=4,096
+音频数据起点: 427,430        ← 设备端曾算出 94,542,957（差 94 MB）
+逐帧校验: 2099 帧，帧头 CRC-8 通过 2098 / 失败 1（仅最后一帧）、同步字错 0
+块大小码 12（= 4096 采样，固定值）、位深码 6（= 24 bit）全部一致
+```
+
+**结论**：
+
+1. **文件是标准的** —— ffprobe 与自写解析器都毫无困难，帧头 CRC-8 全过。
+   `Not found frame in max frame size 20323` 是 **ESP 侧解析器**的问题，不是文件坏了。
+2. **"bad data offset 94 MB" 是我们的 bug**（`probe_flac` 走块链时**没有 fseek 跳过块数据**，
+   于是下一轮把"上一块的数据"当成块头读 → 长度变垃圾 → 偏移越滚越大）。
+   这个 bug 的**唯一后果**是 `media_meta` 的**平均码率/时长**不准（→ 那些 FLAC 拖不动进度条），
+   **不影响播放**。修法已在工作区（每步都真的 `fseek(nlen, SEEK_CUR)`），
+   修好后算出来正好是 **427,430**，与 PC 完全一致。
+3. **`Not found frame` 只出现在起播那 ~900 ms 内**（9 次），稳态播放期间**没有**它 ——
+   所以它**不是**"只跑到 73%"的原因，别把它当主因。
+
+**三个文件是同一套参数**（都是 24-bit / 4096 采样块 / 大帧，应该是同一个压制工具出来的）：
+
+| 文件 | 采样率 | 位深 | 块大小 | 帧数 | 帧头 CRC-8 |
+| --- | --- | --- | --- | --- | --- |
+| 蔚蓝档案 RE Aoharu 电吉他版 | 44100 | 24 | 4096 | 2099 | 全过 |
+| 最孤独的音色——正弦波 | 48000 | 24 | 4096 | 3275 | 全过 |
+| …准备出发！ | 48000 | 24 | 4096 | 1067 | 全过 |
+
+⇒ 下一步的关键是**把"24-bit 特有环节"的耗时也量出来**：链上只有 `aud_bit_cvt`
+（24→16 bit 逐样本转换）是"只在 24-bit 文件里才真干活"的元件，而它一直没被统计。
+本轮给它和 `aud_ch_cvt` 都加了同样的 5 秒窗口统计（`ESP_GMF_BIT_CVT: stage: ...`）：
+
+- 若它的 `% of realtime` 很大 ⇒ **24→16bit 的软件转换**就是缺口 ⇒ 应当让解码器直接吐
+  16-bit（避免整条 24-bit 链路），或换更省的做法；
+- 若它也很小（各段加起来仍 ≪100%）⇒ 时间不在计算上 ⇒ 看 `file read`（SD）与
+  `play stats` 的 `gap max`（被饿住）那两行。
+
+#### 11.5.11 ✅ 拿到文件后的三处收尾（2026-10）
+
+**① 我们自己的 bug 修掉了**（§11.5.10 已定案：文件合规、是 `probe_flac` 走块链时漏了 fseek）。
+修好后同一份文件应打出与 PC 完全一致的数：
+
+```
+I media_meta: flac: data_off 427430, audio 38407065 B, bitrate 1576232 bps (avg)
+```
+
+（以前是 `bad data offset 94542957` + 兜底 38834453 B → 码率偏高 1.1%，
+seek 的时间→字节映射也跟着偏；现在准确了。）
+
+**② `Run timeout` 的真凶是 ASP 那一行，不是 GMF 的宏**。
+
+- `esp_gmf_task.c` 的 `DEFAULT_TASK_OPT_MAX_TIME_MS(2000)` 会被
+  **`esp_audio_simple_player.c:302` 的 `esp_gmf_task_set_timeout(player->work_task, 5000)` 覆盖**
+  —— 所以只改宏**没有任何效果**（我先改了宏，发现这个后又撤回）。
+- 真机 `Run timeout` 出现在文件打开后**正好 5.0 s**（1704260 → 1709295），
+  正是这 5000 ms：首轮要走过 423 KB 封面（含 9 次假同步字试探）＋24→16bit 输出缓冲
+  重分配＋重采样器首次分配，超时就被当成**致命错误**直接跳过这首。
+- 现在把**这一行**改成 **15000 ms**（只放宽 API 同步等待，不改变音频行为）。
+  ⚠ 要调就调这一行；`esp_gmf_task.c` 里的宏对本工程无效。
+
+**③ 四级阶段耗时统计齐了**，下一份日志可以**逐段相加**：
+
+| 段 | 日志 | 说明 |
+| --- | --- | --- |
+| FLAC 解码 | `ESP_GMF_ASMP_DEC: aud dec: ... -> x% of realtime` | 实测 7~13% |
+| 44.1k→48k | `ESP_GMF_RATE_CVT: rate cvt: ... -> x% of realtime` | 实测 ~20% |
+| **24→16bit** | `ESP_GMF_BIT_CVT: stage: ... -> x% of realtime` | ★ **只有 24-bit 文件才真干活**，之前从没量过 |
+| 声道转换 | `ESP_GMF_CH_CVT: stage: ... -> x% of realtime` | 2ch→2ch 基本是直通 |
+| 读文件 | `ESP_GMF_FILE: file read: ... P% of the window spent reading` | SD 等待 |
+| 写输出 | `play stats: ... \| out M ms in codec, gap max G ms, audio A ms` | codec 等待 / 被饿住 |
+
+判读总原则：**把各段 % 加起来**。
+- 合计 ≈ 100% ⇒ 就是计算/IO 本身慢，找占比最大的那段下手；
+- 合计 ≪ 100%（而整条链就是跑不满）⇒ 时间花在 GMF 的**端口/队列等待或任务调度**上，
+  重点看 `gap max`（几百毫秒 ⇒ 被饿住，查任务优先级/核心亲和）。
+
+#### 11.5.12 ES8389 支持 24-bit，**是我们按 16-bit 打开的**（2026-10，用户提示后核实）
+
+用户提示"板载的 DAC 是 ES8389"。核实结果：
+
+| 事实 | 位置 |
+| --- | --- |
+| ES8389 驱动支持 **16 / 18 / 20 / 24 / 32-bit** | `es8389_set_bits_per_sample()`（`case 24: ES8389_S24_LE` 等，寄存器位见 `es8389_reg.h`） |
+| 字长由 `fs->bits_per_sample` 决定，驱动自己会配寄存器 | `es8389_config_sample(codec, fs->sample_rate, fs->bits_per_sample)` |
+| **我们打开时写死 16-bit** | `bsp_audio_set_sample_rate()` 里 `.bits_per_sample = 16`（通用打开路径有 `bits` 参数，但目前传的就是 16） |
+
+⇒ 链路上那次 **24→16bit 转换是我们自己的选择**，不是 ES8389 的限制。
+（另一路蓝牙：SBC 本身就是 16-bit，天然要转。）
+
+**但这修不了"只跑到实时 73%"** —— 先把两件事分清：
+
+- **73% 是"等待"问题，不是算力问题**：实测解码 7~13% + 重采样 20% ≈ 1/3 个核，
+  而解码管线是**单线程**的 → 任务 27% 在算、**73% 在阻塞等待**。
+  `aud_bit_cvt`（24→16，纯逐样本运算）最多让 CPU 再多几个百分点，
+  **不会**把 73% 变成 100%。
+- 真正要抓的是那个**阻塞点**（读 SD / 写 codec / 端口等待）—— 也就是已经埋好的
+  `ESP_GMF_FILE: file read ... P%` 与 `play stats: ... out M ms, gap max G ms` 三行。
+
+**若日志确认 `ESP_GMF_BIT_CVT` 占比真的大**，这条 24-bit 路线的代价也要先摆清楚：
+
+1. **时间基要变成按格式计算**：现在是写死的 `192 B/ms`（48k/2ch/16bit）；
+   24-bit 是 **288 B/ms**。这个常量被进度条、seek 的时间→字节映射、看门狗、
+   `play stats` 的音频时长共用 —— 属于**易回归区**（上次 seek 的教训）。
+2. **蓝牙那一路仍是 16-bit**（SBC）⇒ 要么按输出设备建不同管线，要么在 BT 侧转换。
+**补充核实（同一轮，决定"要改的话改哪里"）**：
+
+| 事实 | 位置 / 含义 |
+| --- | --- |
+| codec **只在 init 打开一次**，此后不重开 | `bsp_audio_open_output(OUT_RATE_HZ, OUT_CHANNELS, OUT_BITS)`（`audio_service.cc:477`）；`bsp_audio_set_sample_rate()`（会 mute+重开）**全工程没有调用者** ⇒ 切歌不会有 codec 断音，格式改动也只影响这一处 |
+| 输出格式常量就三个 | `OUT_RATE_HZ 48000` / `OUT_CHANNELS 2` / `OUT_BITS 16`（`audio_service.cc:36-38`） |
+| 时间基只在**两处**用 | `OUT_PCM_BYTES_PER_MS (192)`（`audio_service.cc:83`）→ `timeline_now()`（191）与诊断日志（179）⇒ 改成"按格式算"是小改动 |
+| 24→16 那次转换的来源是 **Kconfig**，不是硬件 | `CONFIG_AUDIO_SIMPLE_PLAYER_BIT_CVT_DEST_BITS`（`audio_simple_player_pool.c` 建 `aud_bit_cvt` 用它）；同理 `CONFIG_AUDIO_SIMPLE_PLAYER_RESAMPLE_DEST_RATE`（48k）、`..._CH_CVT_DEST_CH` |
+| ⚠ 但**全局**改成 24-bit 会打断蓝牙 | `bt_service_write_pcm()` 把缓冲当 **int16** 处理（`A2DP_PCM_BITS 16`），24-bit 数据会被当作错位的 16-bit ⇒ 噪音。要 24-bit 就得**按输出设备建不同管线**（扬声器 24 / 蓝牙 16），这是这条路线真正的工作量 |
+
+⇒ 结论不变：**先看那 6 行日志**。若 `ESP_GMF_BIT_CVT` 占比确实大 *且* 卡顿被证明是算力问题
+（现有数据恰恰说明不是），再按"按输出设备分管线 + 时间基按格式算"来做。
+3. 既然 ES8389 也支持 44.1k/48k，**同样的取舍也适用于重采样那 20%**：
+   让板载输出跟随源采样率（44.1k）可以省掉重采样，但时间基变成 176.4 B/ms ——
+   和上面是同一类改动，同样要先有数据再决定。
+
+#### 11.5.13 ✅ 根因定案：**SD 每次只读 512 字节**，读卡限流到实时 71%（2026-10）
+
+板载输出 + 24-bit FLAC 的完整 `play stats` 日志（稳态六个窗口一致）：
+
+| 每 5 秒窗口 | 实测 | 占窗口 |
+| --- | --- | --- |
+| FLAC 解码 | 386 ms（**7.9% of realtime**） | 8% |
+| 44.1k→48k 重采样 | 695 ms（**19.7%**） | 14% |
+| **24→16bit** | 22 ms（**0.6%**） | 0.4% |
+| 声道转换 | 0.4 ms（**0.0%**） | ~0 |
+| **读文件（阻塞）** | **1207 ms / 1394 次调用** | **24%** |
+| 写 codec（阻塞） | 2548 ms | 51% |
+| 实际送出音频 | **3529 ms / 5000 ms = 71%** | — |
+
+**关键两点**：
+
+1. **`bit cvt` 只占 0.6%** ⇒ 24-bit 链路**实测排除**（解码+重采样+位深+声道合计 ~28% of realtime，
+   CPU 绝不是瓶颈）。ES8389 支持 24-bit 是真的，但没有必要为性能去动它。
+2. **`file read: 1394 calls, 713728 B` ⇒ 平均每次只读 512 字节** ⇒ 每秒 ~275 次读，
+   其中 **1.2 s 花在等 SD** 上；读卡只给到 **138 KB/s**，而文件平均 **199 KB/s** ⇒
+   整条链被读卡限流在 **71%**。这就是"卡"的唯一原因（与蓝牙、与 24-bit、与 CPU 都无关）。
+
+**修法**：给 `io_file` 加**预读环形缓冲**（`ensure_file_io()`）：
+`thread.stack = 4096` + `prio = 5` + `io_size = 8 KB` + `buffer_size = 64 KB`
+⇒ 每次读 8 KB（16 倍于 512 B）、每秒 ~25 次，等待时间应降到 ~0.12 s / 5 s。
+
+⚠ **上次翻车的地方**：只设了 `buffer_size`、漏了 `thread.stack` ⇒ `io->type` 不是 BLOCK、
+没有 IO 任务 ⇒ `esp_gmf_io_seek()` 的异步分支（abort data bus → IO 任务执行 seek）
+**永远没人执行** ⇒ 本地拖动失效。所以：
+
+- 两个字段**必须一起给**（§12.4.4 已记录）；
+- **烧录后第一件事就是验拖动定位**（`audio_svc: seek -> ...` + `seek landed: ... diff 0 ms`
+  这两行应正常出现）；
+- 顺带把 `file read` 日志改成显示 **B/read 与 µs/read**（旧版整数毫秒会把
+  1394 次共 1207 ms 显示成 `0 ms/call`，正是它把"512 字节/次"这条线索藏了起来）。
+
+**另外记两个这次日志顺带确认的事**：
+
+- **拖动定位已经好了**：`seek -> 21000ms (byte 4137609, 1576232 bps, average)` +
+  `resumed at 21000 ms` + `seek landed: byte 4137609 -> 21000 ms (diff 0 ms)`
+  —— 码率 1576232 正是 `probe_flac` 修好 `fseek` 之后的正确值（§11.5.10/11.5.11）。
+- **WiFi 轮询策略生效**：`connect ... (try, 3 retry left, saved 2/2)` → 失败后
+  `... (try, 2 retry left, saved 1/2)` → 连上了第二个 AP（`4B103-蒲公英X1-Pro-2.4G`，
+  `got ip 10.168.1.210`）⇒ §11.5.5 的轮询确实按预期工作。
+
+#### 11.5.14 ❌ 预读尝试导致整机 panic（已回退）+ 补上 GMF `_file_seek` 判空（2026-10）
+
+**先说结论**：§11.5.13 的预读（`ensure_file_io()`）**已回退**。它不是"慢"，而是**崩**。
+
+**崩溃现场**（真机，第一个 panic 的栈）：
+
+```
+Guru Meditation Error: Core 1 panic'ed (Load access fault)
+  fseek(stream=0x0)                                   ← NULL
+   _file_seek (esp_gmf_io_file.c:244)
+    esp_gmf_pipeline_seek
+     audio_service_seek_ms(pos_ms=0)
+```
+
+**触发链（两个 bug 叠加）**：
+
+1. **我们的 bug**：进度记忆里存的是 **197000 ms**，而这个文件只有 **194931 ms** →
+   恢复时按字节 seek 正好落到**文件尾** → 解码器立刻 EOF → 管线收尾关闭。
+2. **GMF 的 bug**：`_file_close()` 会把 `file_io->file` 置 **NULL**，而
+   **`_file_seek()` 没有判空**（同一个文件里的 `_file_reset()` 一直是有判空的）→
+   收尾逻辑再发一次 seek 就是 `fseek(NULL)` → 整机 panic。
+
+预读只是把 IO 变成"有自己的任务/数据总线"，让这条"关闭后再 seek"的路径更容易被走到
+（日志顺序：`ESP_GMF_FILE: CLose, pos = 38834495/38834495` → 紧接着 panic）。
+
+**本轮修的两处**：
+
+| 修哪 | 内容 |
+| --- | --- |
+| **GMF 判空**（托管组件补丁，同 §11.7/11.8 会随重装依赖丢失） | `esp_gmf_io_file.c` 的 `_file_seek()`：`file_io == NULL \|\| file_io->file == NULL` 时打一条 WARN 并返回 `ESP_GMF_ERR_INVALID_STATE`（`esp_gmf_pipeline_seek()` 会当普通失败上报，不再崩） |
+| **进度恢复越界夹取**（`app_music.cc`） | 新增 `RESUME_END_GUARD_MS (5000)`：恢复位置落在"离总长不到 5 秒"的范围内就**从头放**（`resume pos N ms is at the end of M ms track, start from 0`）。既堵住触发条件，听感上也更合理 |
+
+**教训（写给自己）**：这类"改了 IO 配置"的改动，**验证顺序必须是**
+① 拖进度条 → ② 放到底自然结束 → ③ **用一个"进度记忆超过总长"的曲子起播**（本轮就是第③条漏了）。
+第二条在改完之后要重跑一遍。
+
 ### 11.6 拼音搜索
 
 搜索浮层用 `lvgl_pinyin_ime`（`lv_pinyin_ime_create()` + `attach(textarea)`，
@@ -735,6 +1152,146 @@ lv_obj_add_flag(ovl, LV_OBJ_FLAG_IGNORE_LAYOUT); /* ← 以为这样就"不影�
 滚动每帧遍历它们。所以**列表按 120 行分页**（"‹ 上一页 / 下一页 ›"两行 + 顶部提示
 "第 x/y 页 · 共 N 项"），而**播放队列仍是整个目录** —— 完整性问题用分页解决，不用截断。
 翻页只重画（`local_render()`），不重读 SD 目录。
+
+### 12.2.2 本地目录扫描必须走工作线程（2026-10 需求："点了立刻进，用加载动画等"）
+
+**以前**：`page_local()` / 进目录 / 上一级都在 **LVGL 任务里同步**读 SD ——
+`local_rebuild()` 先 `storage_service_browse()`（列目录）再 `storage_service_load_dir()`
+（**又走一遍目录**建播放队列），两次 full walk；几百首的目录就是"卡一会才进去"，
+而且 `local_show_loading()` 里那个转圈**一动不动**（LVGL 任务被占住，动画没机会刷）。
+
+**现在**（`local_scan_task`：内核 8 KB 栈、优先级 2、一次性任务）：
+- 列目录 + 建播放队列**整个**搬到工作线程，UI 只铺加载态后**立刻返回** → 页面秒进、
+  转圈真的在转（不再需要 `lv_refr_now()` 去抢那一帧）；
+- 结果由 `local_sd_tick`（已有的 500 ms 定时器）轮询消费：`s_scan_done` 且
+  `s_scan_run_seq == s_scan_seq` 才 `local_apply_scan()`，否则丢弃并打一行日志；
+- 同一时刻**只允许一个扫描**（`s_scan_busy`）；期间来的请求记进 `s_scan_pend(_dir)`，
+  由 tick 补起 —— 两个线程同时写 `s_entries` 就完了；
+- 发布顺序必须是 **写数据 → 置 `done` → 清 `busy`**：反过来 tick 会在
+  "busy 已清、done 还没置"的缝里再起一个扫描；
+- ⚠ **`seq` 校验不是可选项**：页面销毁（`local_page_watch`）与新建（`page_local`）
+  都**必须** `s_scan_seq = s_scan_seq + 1`，否则上一次"在飞"的扫描结果会被画到新页面上
+  —— 列的是旧目录的文件名，点下去却按新的 `s_cur_dir` 拼路径，**放到别的文件去了**。
+  插卡/拔卡分支同理（拔卡时也要作废在飞的扫描）。
+- ⚠ `volatile` 计数器**不能写 `++`**（C++20 起 deprecated，本工程 `-Werror=volatile`）
+  → 一律写 `x = x + 1;`。
+
+**为什么敢在工作线程里调 `storage_service_load_dir()`**（服务内部是"先清 `s_count`
+再重建"，存在短暂的"空队列"窗口）：读曲目表的只有 `app_music`，而播放器页与本地列表页
+是路由上的**兄弟页**（不会同时存活），本地页扫描期间又只有加载态、没有任何行可点 ——
+那个窗口没人看得到。将来若有别的模块（状态栏等）也去读曲目表，这条前提就不成立，
+得改成"在服务内部加锁 + 末尾换指针"。
+
+### 12.4 三个 2026-10 用户报的问题（IME 收起 / 后台续播 / 本地文件卡顿）
+
+#### 12.4.1 虚拟键盘不会自动收起 + 光标是方块（组件侧修，`lvgl_pinyin_ime`）
+
+- **键盘不收起**：`lv_pinyin_ime_attach()` 原来只把 `ctx->ta` 记下来（外加设字体），
+  **没挂任何焦点事件**；各页面只在少数几个动作里显式 `hide()`，所以点别处键盘一直挂着。
+  ⚠ **不能用 textarea 的 `LV_EVENT_DEFOCUSED`**：LVGL 只在点到**另一个
+  `CLICK_FOCUSABLE` 对象**时才给旧对象发 DEFOCUSED（见 `lv_indev.c` 的
+  `indev_click_focus`），点普通行/遮罩根本不触发 —— 那正是用户遇到的场景
+  （顺带记一条：`lv_button` **不是** click-focusable，所以点键盘按键不会让输入框失焦，
+  这也是官方 keyboard 示例能安心用 READY/CANCEL 的原因）。
+  **修法**：在**屏幕**与 **`lv_layer_top()`**（模态框挂那儿）上挂一个 CLICKED 回调，
+  看这一击落在谁身上：落在键盘或绑定的输入框上（沿 `lv_obj_get_parent` 往上找）就算
+  "还在输入"，否则 `hide()`。
+  - ⚠ **冲突保护**：应用自己的点击回调可能顺手 `show()`（例如点搜索历史行会重跑搜索
+    并重新拉起键盘），冒泡到 dismiss 会立刻又收起来 → 刚 `show()` 过的
+    `IME_DISMISS_GRACE_MS`(100 ms) 内不理会（同本工程 `MENU_GRACE_MS` 的思路）。
+  - ⚠⚠ **销毁时必须摘回调**：屏幕/顶层 layer 比键盘活得久，不摘的话键盘销毁后回调还在，
+    一旦被点到就会用已释放的 ctx 去 `lv_obj_get_user_data()` → 悬垂指针崩溃。
+    `ime_root_delete_cb()` 里用 `lv_obj_remove_event_cb_with_user_data()` 摘掉（此时 ctx 还活着）。
+- **光标是方块**：LVGL 的 textarea 光标是 `LV_PART_CURSOR`，默认用**背景色填满整个字符格**
+  → 看起来就是实心方块。改成"背景透明 + 只留左边框 2px"就是细竖线光标；颜色取
+  `LV_PART_MAIN` 的文字色（深浅主题都不会看不见）。同样在 `attach()` 里做，一处修好
+  WiFi 密码 / 歌单输入 / MomoTalk / BA 弹窗全部输入框。
+
+#### 12.4.2 后台播完不续播：tick 必须常驻（`app_music.cc`）
+
+- **症状**：后台放歌，一首放完**什么都不发生**（像暂停了），**进一次播放页**才继续。
+- **根因**：`tick_cb`（消费 `s_advance_req`/`s_err_req`、跑循环模式、卡死看门狗、
+  断点续播、进度落盘）原来由 `page_player()` 创建、并在页面 `LV_EVENT_DELETE` 里**删除**
+  —— 不在播放器页时**没有任何人消费 `AUDIO_EVT_FINISHED` 置的那个标志**，于是歌放完就
+  挂在那里等用户进页面。错误处理 / 耳机按键（`media_cmd_tick`）同理全停摆。
+- **修法**：两个定时器改成**开机就建、永不删除**（在 `app_music_register_apps()` 里，
+  它跑在 `play_state_init` / `audio_service_init` 之后），`player_on_delete()` **不再删**，
+  页面里的 `if (!s_tick)` 创建退化成兜底。
+  - `tick_cb` 里所有碰 UI 的地方**本来就有空指针保护**（`s_p_seek` / `s_p_cur` / `s_p_tot` /
+    `s_p_btn` / `s_p_lyric_col`（`lyric_resync` / `update_lyric_highlight` 内部判）/
+    `s_p_cover_img`（`cover_show` 内部判）/ `s_out_btn_icon`（`out_btn_sync` 内部判）），
+    所以它可以脱离页面一直跑 —— **页面只负责显示，状态机跑在页面之外**。
+  - 附带好处：后台播放的进度记忆现在也会按时落盘（以前只在播放器页里存）。
+
+#### 12.4.3 部分 FLAC 卡顿但 CPU 极低：本地文件 IO **没有预读缓冲**（`audio_service.cc`）
+
+- **先回答"解码器在不在解码"**：GMF 管线跑在**独立任务**里（IO 任务 + 元件任务），
+  解码是异步的、不占 LVGL 任务；"卡顿 + CPU 极低"这个组合本身就说明
+  **任务在等 IO，不是在算**（解码在 CPU 上是有实打实开销的）。
+- **根因**：ASP 池子里默认的 `io_file` 是 `FILE_IO_CFG_DEFAULT()` ——
+  **`buffer_size = 0` / `io_size = 0`**，而 GMF 的 IO 基类在 `buffer_size == 0` 时
+  **根本不建 data bus**（`esp_gmf_io.c`：`if (io->data_bus == NULL && buffer_size > 0)`）。
+  没有 data bus 就没有 IO 任务预读，**解码器每要一块数据就同步读一次 SD**
+  （raw `acquire_read`）。对帧小帧多的文件（真机那个 FLAC `max_frame` 才 3635 字节）
+  就是"一帧一次读卡"，每次都等 FATFS —— 正是"断断续续 + CPU 很低"。
+- **修法（⚠ 第一版已撤回，见 §12.4.4）**：本想照抄 HTTP 那条路给 `io_file` 加预读缓冲，第一版**漏了 `thread.stack`**、把**本地拖动定位**搞死了 → 已撤回。要用就按 §12.4.4 的正确写法（两个字段一起给，真机先验拖动）：
+  注册一份 **ring 64 KB + 每次读 8 KB** 的 file io（在 `audio_service_play_uri()` 的
+  本地分支里调；失败就什么都不改，池子里的默认那份还在，本地播放照旧可用）。
+- **自证用的日志**（`audio_service.cc` 的 `audio_stats_log()`，每 5 s 一行）：
+  ```
+  I audio_svc: play stats: PCM 96 KB/s (480000 B in 5000 ms), io=1234567 B, calls=117, flow=1, br=128000/130000
+  ```
+  判读：满速是 **192 KB/s**（48 kHz/16bit/2ch）；`PCM` 明显低于 192 而 `io=` **几乎不动**
+  ⇒ 卡在读 SD/网络；`io=` 一直涨而 PCM 上不去 ⇒ 解码/转换环节的问题；`flow=0` ⇒ 当前没在出 PCM。
+
+#### 12.4.4 ⚠ 教训：给 `io_file` 加缓冲**必须同时给线程栈**，否则本地 seek 直接失效
+
+2026-10 踩的坑（自己引入又撤回）：为了治"部分 FLAC 卡顿"，照 HTTP 那条路注册了一份
+`buffer_size = 64 KB` 的 file io —— **本地拖动进度条随即完全失效**。
+
+**根因**（`esp_gmf_io.c`）：
+
+```c
+/* esp_gmf_io_init() */
+if ((io->io_cfg.thread.stack > 0) && (io->io_cfg.buffer_cfg.buffer_size > 0)) {
+    io->type = ESP_GMF_IO_TYPE_BLOCK;          /* ← 两个条件都要满足 */
+}
+...
+/* esp_gmf_io_open() */
+if (io->data_bus == NULL && io_cfg->buffer_cfg.buffer_size > 0) {
+    esp_gmf_db_new_block(1, buffer_size, &io->data_bus);   /* ← 只看 buffer_size */
+}
+```
+
+`FILE_IO_CFG_DEFAULT()` 给的是 **`thread.stack = 0`**，所以只设 `buffer_size` 的结果是：
+**建了 data bus，却没有 IO 任务、`type` 也不是 BLOCK** —— 半吊子状态：
+
+- **放音正常**：读路径判的是 `io->data_bus && io->task_hd`（`esp_gmf_io_acquire_read`），
+  task 为空 → 退回 **raw** 路径，照旧能读；
+- **seek 死掉**：`esp_gmf_io_seek()` 的异步分支是"abort data bus → **由 IO 任务执行
+  seek**"，没有任务就永远没人执行 → 拖动毫无反应。
+
+（HTTP 那份没事，是因为 `HTTP_STREAM_CFG_DEFAULT()` **自带非零 stack** ——
+照抄时只改了 buffer，把这点漏了。）
+
+**正确写法**（将来真要再做，两个字段一起给，且真机上**先验拖动**）：
+
+```c
+file_io_cfg_t cfg = FILE_IO_CFG_DEFAULT();
+cfg.dir = ESP_GMF_IO_DIR_READER;
+cfg.io_cfg.thread.stack           = 4096;        /* ★ 缺了它就不是 BLOCK IO */
+cfg.io_cfg.thread.prio            = 5;
+cfg.io_cfg.buffer_cfg.io_size     = 8 * 1024;
+cfg.io_cfg.buffer_cfg.buffer_size = 64 * 1024;
+```
+
+**同时补的一个防误伤**（`app_music.cc`）：`audio_service_seek_ms()` 会清掉出声标志，
+而**本地看门狗阈值只有 8 s** —— 一次慢一点的本地定位（大 FLAC 重新填缓冲）会被判成
+"这个文件解不出来"直接跳过。现在 `on_seek_release()` 会置 `s_seek_in_flight`，
+定位期间看门狗不介入；出声（`audio_service_output_active()`）就清标志，
+真卡死超过 `SEEK_STALL_MAX_TICKS`(20 s) 才放手交给看门狗兜底。
+顺带把本地 seek 也纳入落点核对（`s_seek_landing_wait` 不再 `streamed ? 10 : 0`——
+本地 `s_stream_io` 就是文件 IO，同样能按字节反推落点）。
 
 ### 12.2.1 SD 卡热插拔（2026-10 加）
 

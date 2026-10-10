@@ -1017,6 +1017,15 @@ static void probe_fill_bitrate(uint32_t audio_bytes, audio_probe_t *out)
  * 拿到总采样数就能算准时长；FLAC 没有码率字段，按文件大小估（见 probe_fill_bitrate）。
  * 音频起始偏移 = 元数据链走完的位置（**不去读封面**，只按长度跳过）。
  */
+/*
+ * FLAC 元数据块链的"留证"（2026-10）：见 probe_flac 里 data_off 算飞时的告警。
+ * 真机上两个 FLAC 的偏移分别飞到 94 MB / 138 MB（文件只有 38 / 36 MB），
+ * 需要知道是哪一块的长度字段异常，才能判断是文件本身不标准还是我们解析错了。
+ */
+#define FLAC_BLK_KEEP 16
+static struct { uint8_t type; long len; long pos; } s_flac_blk[FLAC_BLK_KEEP];
+static int s_flac_blk_seen;
+
 static esp_err_t probe_flac(FILE *f, long file_size, audio_probe_t *out)
 {
     uint8_t hdr[10];                    /* 够放 ID3v2 头（10 字节），也复用于 `fLaC`(4) */
@@ -1072,12 +1081,27 @@ static esp_err_t probe_flac(FILE *f, long file_size, audio_probe_t *out)
             }
             /* 音频数据的起点 = 当前位置（STREAMINFO 之后继续走完剩余块） */
             long data_off = ftell(f);
-            uint32_t rest = len - (uint32_t)sizeof(si);
+            /*
+             * ★ 走完剩余的元数据块，得到音频数据的起始偏移。
+             *
+             * ⚠⚠ 这里踩过一个坑（2026-10，靠用户给的文件离线解剖才定位到）：
+             *   原来"跳过一个块"只做了 data_off += nlen，**没有真的 fseek** ——
+             *   于是下一轮的 fread(nb,1,4,f) 是从**上一块的数据中间**读的，
+             *   读到的"长度"是垃圾 → 偏移越滚越大（真机飞到 94 MB / 138 MB，
+             *   而文件只有 38 MB），码率只能靠兜底估算。
+             *   那个文件的真实结构是：STREAMINFO(34) → VORBIS_COMMENT(111) →
+             *   PICTURE(423169) → PADDING(4096) → 音频在 427430 处，块链完全标准
+             *   —— 是**我们**读错了，不是文件不正常。
+             *   所以每一步都必须"改偏移 + 真的移文件位置"，两者缺一不可。
+             */
+            const int blk_cap = (int)(sizeof(s_flac_blk) / sizeof(s_flac_blk[0]));
+            s_flac_blk_seen = 0;
+            uint32_t rest = len - (uint32_t)sizeof(si);   /* STREAMINFO 里已经读掉的部分之外 */
+            if (rest > 0 && fseek(f, (long)rest, SEEK_CUR) != 0) {
+                return ESP_FAIL;
+            }
+            data_off += (long)rest;
             for (;;) {
-                if (rest > 0) {
-                    data_off += rest;
-                    rest = 0;
-                }
                 if (last) {
                     break;
                 }
@@ -1085,17 +1109,62 @@ static esp_err_t probe_flac(FILE *f, long file_size, audio_probe_t *out)
                 if (fread(nb, 1, 4, f) != 4) {
                     break;
                 }
+                const long blk_pos = data_off;
                 data_off += 4;                          /* 块头 */
                 const uint32_t nlen = be24(nb + 1);
-                if ((nb[0] & 0x80) != 0) {              /* 最后一块 */
-                    data_off += (long)nlen;
+                if (s_flac_blk_seen < blk_cap) {
+                    s_flac_blk[s_flac_blk_seen].type = (uint8_t)(nb[0] & 0x7F);
+                    s_flac_blk[s_flac_blk_seen].len  = (long)nlen;
+                    s_flac_blk[s_flac_blk_seen].pos  = blk_pos;
+                    s_flac_blk_seen++;
+                }
+                /* 长度离谱就直接停：继续走只会让偏移越飞越远 */
+                if (nlen > (uint32_t)file_size) {
+                    ESP_LOGW(TAG, "flac: block type %u len %lu exceeds file %ld, stop walking",
+                             (unsigned)(nb[0] & 0x7F), (unsigned long)nlen, file_size);
+                    break;
+                }
+                /* ★ 真的把文件位置移过去（这一步以前漏了，就是上面那个坑） */
+                if (nlen > 0 && fseek(f, (long)nlen, SEEK_CUR) != 0) {
                     break;
                 }
                 data_off += (long)nlen;
+                if ((nb[0] & 0x80) != 0) {              /* 最后一块 */
+                    break;
+                }
             }
+            /*
+             * 音频字节数：优先用"走完元数据块之后的位置"。
+             * ⚠ 真机踩过：这个位置偶尔会算飞（异常元数据块链），于是
+             *   `file_size - data_off` 不合法 → 码率一直是 0 → 这些 FLAC
+             *   **拖不动进度条**（报"定位失败：码率未知"），日志里是
+             *   `media_meta: audio probe: 0 bps, 194931 ms, ...`。
+             *   所以这里加兜底 + 一行诊断，别再让"算不出来"悄悄变成 0。
+             */
+            uint32_t audio_bytes = 0;
             if (data_off > 0 && data_off < file_size) {
-                probe_fill_bitrate((uint32_t)(file_size - data_off), out);
+                audio_bytes = (uint32_t)(file_size - data_off);
+            } else {
+                audio_bytes = (uint32_t)(file_size - (long)sizeof(si) - 8);   /* fLaC + 块头 */
+                /*
+                 * ⚠ 把**块链本身**打出来：真机上这两个 FLAC 的数据偏移分别算到 94 MB /
+                 *   138 MB，而文件只有 38 MB / 36 MB —— 说明某个块的"长度"字段被读成了
+                 *   巨大的值（或块结构与常规不同）。同一个异常结构极可能就是 ESP 解析器
+                 *   一直刷 `Not found frame in max frame size N` 的原因，所以这里要把
+                 *   每一步的 type/len 留证：块头 = [1B last<<7|type][3B 大端长度]。
+                 */
+                ESP_LOGW(TAG, "flac: bad data offset %ld (file %ld, %u blocks seen:",
+                         data_off, file_size, (unsigned)s_flac_blk_seen);
+                for (int k = 0; k < s_flac_blk_seen; k++) {
+                    ESP_LOGW(TAG, "flac:   block[%d] type %u, len %ld, pos %ld",
+                             k, (unsigned)s_flac_blk[k].type, s_flac_blk[k].len,
+                             s_flac_blk[k].pos);
+                }
+                ESP_LOGW(TAG, "flac: fall back to %u B", (unsigned)audio_bytes);
             }
+            probe_fill_bitrate(audio_bytes, out);
+            ESP_LOGI(TAG, "flac: data_off %ld, audio %u B, bitrate %u bps (avg)",
+                     data_off, (unsigned)audio_bytes, (unsigned)out->bitrate);
             return ESP_OK;
         }
         if (fseek(f, (long)len, SEEK_CUR) != 0) {       /* 只按长度跳，不读封面 */

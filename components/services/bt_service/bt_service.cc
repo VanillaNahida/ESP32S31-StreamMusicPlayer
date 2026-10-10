@@ -99,6 +99,36 @@ static const char *TAG = "bt_svc";
  * 真正的节拍已经由 bt_service_write_pcm() 的阻塞发送交给解码管线了 */
 #define TX_WAIT_MS      (50)
 
+/*
+ * ★ SBC bitpool 上限（2026-10 加，治"放歌一卡一卡"）。
+ *
+ * 真机日志（本地 FLAC，A2DP 到耳机）：
+ *   bt_svc: a2dp tx: 8000 frames, 289 f/s (need 345 f/s), dropped 0 B   ← 只发了需求的 84%
+ *   audio_svc: play stats: PCM 157 KB/s (满速应 192)                     ← 整条链按 82% 跑
+ *   E BT_L2CAP: l2cab is_cong_cback_context                              ← L2CAP 拥塞回调
+ * `dropped 0 B` 说明**不是我们丢帧**：环形缓冲从没溢出、acquire 也没超时，
+ * 而是链路（或对端）**持续**只吃得下约 84% 的量 → 解码管线被阻塞式发送拖慢 →
+ * 听感就是"一卡一卡"，而 CPU 很低（都在等射频）。
+ *
+ * bitpool 决定 SBC 的码率需求：joint-stereo / 16 block / 8 subband 下，
+ * 44.1 kHz 的 bitpool 53 ≈ 328 kbps、bitpool 64 ≈ 400 kbps 上下，
+ * 廉价耳机 + 2.4 GHz 与 WiFi 共存时经常吃不下。把 bitpool 压到 40（≈250 kbps）
+ * 给链路留出余量，是这类"链路带宽不够"的标准缓解手段。
+ *
+ * ⚠ 改 bitpool 是**合法**的：SBC 每一帧的帧头里都带 bitpool 字段，对端解码器按
+ *   帧头走，不需要重新协商（这也是各家用它做"音质/稳定性"档位的原理）。
+ *   代价是码率低一点、听感略糊；对"卡顿"来说这是划算的交换。
+ *   想恢复原样把这个宏改成 250（= 不限）即可。
+ */
+#define A2DP_SBC_BITPOOL_MAX (40)
+
+/* 馈送路径诊断计数（2026-10 加）：用来判断"发不够"到底卡在哪一段 */
+static volatile uint32_t s_acq_retry;      /* acquire_write 拿不到缓冲的次数 */
+static volatile uint32_t s_acq_sleep_ms;   /* 为此睡掉的总毫秒 */
+static volatile uint32_t s_rel_timeout;    /* release_write 超时（丢帧）次数 */
+static volatile uint64_t s_enc_us;         /* SBC 编码累计耗时（us） */
+static volatile uint32_t s_feed_idle;      /* feed_task 因"没数据"空转的次数 */
+
 static volatile bt_state_t s_state = BT_ST_UNINIT;
 static volatile bool       s_inited;
 static volatile bool       s_discovering;
@@ -550,8 +580,24 @@ static bool bt_enc_open(esp_bt_audio_stream_handle_t h)
 
     esp_audio_enc_config_t cfg = {};
     cfg.type   = ESP_AUDIO_TYPE_SBC;
-    cfg.cfg    = info.codec_cfg;      /* 组件按协商结果生成的 esp_sbc_enc_config_t */
-    cfg.cfg_sz = info.cfg_size;
+    /*
+     * ⚠ 这里必须用**拷贝**：`info.codec_cfg` 是组件内部协商结果的内存，
+     *   直接改它会污染协议栈自己的记录（也说不清谁拥有它）。
+     */
+    esp_sbc_enc_config_t sbc = {};
+    if (!info.codec_cfg || info.cfg_size < sizeof(sbc)) {
+        /* 协商结果拿不到就别硬编：零配置编出来的是噪音（旧代码直接把 cfg 指过去，
+         * 一样会失败，这里只是把话说明白） */
+        ESP_LOGE(TAG, "no negotiated SBC cfg (%u B)", (unsigned)info.cfg_size);
+        return false;
+    }
+    memcpy(&sbc, info.codec_cfg, sizeof(sbc));
+    const uint16_t bp_neg = sbc.bitpool;
+    if (sbc.bitpool > A2DP_SBC_BITPOOL_MAX) {
+        sbc.bitpool = A2DP_SBC_BITPOOL_MAX;
+    }
+    cfg.cfg    = &sbc;
+    cfg.cfg_sz = sizeof(sbc);
 
     esp_audio_err_t err = esp_audio_enc_open(&cfg, &s_enc);
     if (err != ESP_AUDIO_ERR_OK || !s_enc) {
@@ -579,8 +625,22 @@ static bool bt_enc_open(esp_bt_audio_stream_handle_t h)
     s_rate     = (int)info.sample_rate;
     s_channels = __builtin_popcount((unsigned)info.channels);
 
-    ESP_LOGI(TAG, "sbc enc ready: %d Hz, %d ch, PCM/frame %d B, SBC/frame %d B",
-             (int)s_rate, (int)s_channels, s_enc_in_bytes, s_enc_out_bytes);
+    ESP_LOGI(TAG, "sbc enc ready: %d Hz, %d ch, PCM/frame %d B, SBC/frame %d B, "
+             "bitpool %u->%u (max %u), blk %u, sub %u",
+             (int)s_rate, (int)s_channels, s_enc_in_bytes, s_enc_out_bytes,
+             (unsigned)bp_neg, (unsigned)sbc.bitpool, (unsigned)A2DP_SBC_BITPOOL_MAX,
+             (unsigned)sbc.block_length, (unsigned)sbc.sub_bands_num);
+    /* 期望码率 = 帧字节 × 每秒帧数（帧率 = 采样率 ÷ 每帧采样数）：链路吃不吃的下看这个数 */
+    {
+        const uint32_t per_frame = (uint32_t)(s_enc_in_bytes /
+                                    (s_channels > 0 ? s_channels * 2 : 2));
+        if (per_frame > 0) {
+            const uint32_t fps = (uint32_t)s_rate / per_frame;
+            ESP_LOGI(TAG, "a2dp budget: %u f/s x %d B = %u kbps (link must carry this)",
+                     (unsigned)fps, s_enc_out_bytes,
+                     (unsigned)((uint64_t)fps * (uint64_t)s_enc_out_bytes * 8ULL / 1000ULL));
+        }
+    }
 
     /*
      * 本地管线固定 48 kHz。对端采样率不是 48k 时必须重采样：
@@ -620,17 +680,25 @@ static void bt_send_one_frame(esp_bt_audio_stream_handle_t h)
     out.buffer = s_enc_frame;
     out.len    = (uint32_t)s_enc_out_bytes;
 
+    const int64_t t_enc0 = esp_timer_get_time();
     if (esp_audio_enc_process(s_enc, &in, &out) != ESP_AUDIO_ERR_OK || out.encoded_bytes == 0) {
         s_dropped = s_dropped + (uint32_t)s_enc_in_bytes;
     } else {
+        s_enc_us = s_enc_us + (uint64_t)(esp_timer_get_time() - t_enc0);
         /*
          * 发送池被占满时（NO_MEM）稍等重试；队列满（release 超时）就丢掉这一帧。
          * 都只等很短的时间 —— 在这里长时间等会把 48k→A2DP 的差速全部压到
          * 环形缓冲上，最终表现为大面积丢帧。
+         *
+         * ★ 重试次数与睡掉的毫秒都记账（s_acq_retry / s_acq_sleep_ms）：
+         *   "发不够帧率"时靠这两个数区分是**协议栈/链路**给不出缓冲，
+         *   还是我们自己算得慢（后者看 s_enc_us）。
          */
         for (int retry = 0; retry < 20; retry++) {
             esp_bt_audio_stream_packet_t pkt = {};
             if (esp_bt_audio_stream_acquire_write(h, &pkt, out.encoded_bytes) != ESP_OK || !pkt.data) {
+                s_acq_retry = s_acq_retry + 1;
+                s_acq_sleep_ms = s_acq_sleep_ms + 2;
                 vTaskDelay(pdMS_TO_TICKS(2));
                 continue;
             }
@@ -638,6 +706,7 @@ static void bt_send_one_frame(esp_bt_audio_stream_handle_t h)
             pkt.size = out.encoded_bytes;
             if (esp_bt_audio_stream_release_write(h, &pkt, TX_WAIT_MS) != ESP_OK) {
                 s_dropped = s_dropped + out.encoded_bytes;
+                s_rel_timeout = s_rel_timeout + 1;
             } else {
                 s_tx_frames++;
                 s_tx_bytes += out.encoded_bytes;
@@ -653,11 +722,22 @@ static void bt_send_one_frame(esp_bt_audio_stream_handle_t h)
                                               (s_channels > 0 ? s_channels * 2 : 2));
                     const double secs = (s_tx_t0 && now > s_tx_t0) ? (double)(now - s_tx_t0) / 1e6 : 0.0;
                     if (secs > 0.0) {
-                        ESP_LOGI(TAG, "a2dp tx: %u frames, %.0f f/s (need %.0f f/s), dropped %u B",
+                        const uint32_t ring = (uint32_t)xStreamBufferBytesAvailable(s_pcm);
+                        ESP_LOGI(TAG, "a2dp tx: %u frames, %.0f f/s (need %.0f f/s), dropped %u B | "
+                                 "acq_retry %u (%u ms slept), rel_to %u, enc %u us/frame, idle %u, ring %u B",
                                  (unsigned)s_tx_frames,
                                  (double)FEED_LOG_EVERY_FRAMES / secs,
                                  (double)s_rate / (double)(per_frame ? per_frame : 1),
-                                 (unsigned)s_dropped);
+                                 (unsigned)s_dropped,
+                                 (unsigned)s_acq_retry, (unsigned)s_acq_sleep_ms,
+                                 (unsigned)s_rel_timeout,
+                                 (unsigned)(s_enc_us / (FEED_LOG_EVERY_FRAMES ? FEED_LOG_EVERY_FRAMES : 1)),
+                                 (unsigned)s_feed_idle, (unsigned)ring);
+                        s_acq_retry    = 0;
+                        s_acq_sleep_ms = 0;
+                        s_rel_timeout  = 0;
+                        s_enc_us       = 0;
+                        s_feed_idle    = 0;
                     } else {
                         ESP_LOGI(TAG, "a2dp tx: %u frames, dropped %u B",
                                  (unsigned)s_tx_frames, (unsigned)s_dropped);
@@ -703,23 +783,28 @@ static void feed_task(void *arg)
             continue;
         }
 
-        /* 不需要重采样（对端就是 48 kHz）：直接按编码帧长度取 PCM */
+        /* 不需要重采样（对端就是 48 kHz）：直接按编码帧长度取 PCM。
+         * ★ 用**带超时的阻塞取**而不是"看一眼不够就睡 5 ms"：后者等于给馈送速率设了
+         *   一个地板（每次最多 512 B / 5 ms ≈ 100 KB/s < 需要的 192 KB/s），
+         *   缓冲一旦被抽空就再也追不上 —— 听感就是持续的"一卡一卡"。
+         *   阻塞取在有数据时**立刻**返回，没数据才等（最多 5 ms）。 */
         if (!s_asrc) {
-            if (xStreamBufferBytesAvailable(s_pcm) < (size_t)s_enc_in_bytes) {
-                vTaskDelay(pdMS_TO_TICKS(5));
+            const size_t got = xStreamBufferReceive(s_pcm, s_stage + s_stage_len,
+                                                    (size_t)s_enc_in_bytes, pdMS_TO_TICKS(5));
+            if (got == 0) {
+                s_feed_idle = s_feed_idle + 1;
                 continue;
             }
-            if (xStreamBufferReceive(s_pcm, s_stage + s_stage_len,
-                                     (size_t)s_enc_in_bytes, 0) != (size_t)s_enc_in_bytes) {
-                continue;
-            }
-            s_stage_len += (uint32_t)s_enc_in_bytes;
+            s_stage_len += (uint32_t)got;
             continue;
         }
 
-        /* 需要重采样：先取一段 48 kHz PCM，转成对端采样率再进暂存区 */
+        /* 需要重采样：先取一段 48 kHz PCM，转成对端采样率再进暂存区。
+         * ASRC 要的是**整段**，取不满就白取，所以这里只能"够不够"再取；
+         * 但等待改成 1 ms（原来 5 ms 同样是个速率地板）。 */
         if (xStreamBufferBytesAvailable(s_pcm) < (size_t)s_asrc_in_bytes) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            s_feed_idle = s_feed_idle + 1;
+            vTaskDelay(pdMS_TO_TICKS(1));
             continue;
         }
         if (xStreamBufferReceive(s_pcm, s_asrc_in, s_asrc_in_bytes, 0) != s_asrc_in_bytes) {

@@ -21,6 +21,8 @@
 #include "esp_audio_simple_player.h"
 #include "esp_audio_simple_player_advance.h"   /* get_pipeline / register_io */
 #include "esp_gmf_io_http.h"                   /* 自己注册 http IO：放大流缓冲 */
+#include "esp_gmf_io_file.h"                   /* 自己注册 file IO：本地加预读缓冲 */
+#include "esp_timer.h"                         /* 播放健康度日志的时间戳 */
 #include "esp_http_client.h"                   /* 事件钩子里读 Content-Length */
 #include "esp_crt_bundle.h"                    /* 音频流也做证书校验 */
 #include "esp_codec_dev.h"
@@ -89,6 +91,11 @@ static volatile uint32_t s_dur_hint_ms;
  */
 static volatile uint64_t s_pcm_bytes;
 static volatile uint32_t s_tl_base_ms;
+static volatile uint32_t s_stats_calls;    /* PCM 写入次数（播放健康度日志用） */
+/* 输出侧诊断（见 out_write_cb）：写 codec 的累计耗时、两次回调的最大间隔 */
+static volatile uint64_t s_stat_codec_us;
+static volatile uint32_t s_stat_last_ms;
+static volatile uint32_t s_stat_gap_max_ms;
 
 /*
  * 实测码率（bit/s）：把"解码器消费掉的字节"除以"这段时间真正放出来的音频"。
@@ -127,6 +134,57 @@ static volatile bool     s_seek_landing_pending;  /* 等"seek 之后第一块 PC
 static volatile bool     s_seek_landing_ready;    /* 落点已经算好，等上层取走 */
 static volatile uint32_t s_seek_landing_ms;       /* 按字节位置反推出来的时间点 */
 
+/*
+ * 每 5 秒打一行"播放健康度"（2026-10 加，用来回答"卡顿时解码器到底在不在解码"）。
+ *
+ * 判读方法（本地文件卡顿、CPU 却很低时看这一行就够）：
+ *   - `PCM xx KB/s`：真正写到 codec 的**音频吞吐**。48 kHz/16bit/2ch 满速是 192 KB/s；
+ *     断断续续时这个值会明显低于 192（例如 30~80），说明"没在出声"的时间占了大头；
+ *   - `io=…`：IO 已消费到的字节（本地是文件偏移，在线是流位置）——
+ *     它**几乎不动**但 PCM 也上不去 ⇒ 任务卡在**读 SD/网络**上（不是解码慢）；
+ *     它一直在涨、PCM 却上不去 ⇒ 解码/转换环节的问题。
+ *   - `flow=0`：当前这一刻没在出 PCM（缓冲/卡住）。
+ * 只打 INFO，5 s 一行，不会刷屏。
+ */
+static void audio_stats_log(void)
+{
+    static uint32_t last_ms;
+    static uint64_t last_pcm;
+    static uint32_t last_calls;
+
+    const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (last_ms == 0) {
+        last_ms    = now;
+        last_pcm   = s_pcm_bytes;
+        last_calls = s_stats_calls;
+        return;
+    }
+    if (now - last_ms < 5000) {
+        return;
+    }
+    const uint32_t dt_ms  = now - last_ms;
+    const uint64_t dpcm   = s_pcm_bytes - last_pcm;
+    const uint32_t dcalls = s_stats_calls - last_calls;
+    const uint32_t kbps   = (uint32_t)((dpcm * 1000ULL) / dt_ms / 1024ULL);   /* KB/s */
+
+    uint64_t io_pos = 0;
+    if (s_stream_io) {
+        esp_gmf_io_get_pos(s_stream_io, &io_pos);
+    }
+    ESP_LOGI(TAG, "play stats: PCM %u KB/s (%llu B in %u ms), io=%llu B, calls=%u, flow=%d, br=%d/%u | "
+             "out %llu ms in codec, gap max %u ms, audio %u ms",
+             (unsigned)kbps, (unsigned long long)dpcm, (unsigned)dt_ms,
+             (unsigned long long)io_pos, (unsigned)dcalls,
+             (int)s_out_flowing, s_info.bitrate, (unsigned)s_meas_bps,
+             (unsigned long long)(s_stat_codec_us / 1000ULL), (unsigned)s_stat_gap_max_ms,
+             (unsigned)(dpcm / 192ULL));
+    s_stat_codec_us  = 0;
+    s_stat_gap_max_ms = 0;
+    last_ms    = now;
+    last_pcm   = s_pcm_bytes;
+    last_calls = s_stats_calls;
+}
+
 /* ---------------------------------------------------------------- out 回调 */
 
 static uint32_t timeline_now(void)
@@ -144,6 +202,8 @@ static void audio_stream_measure(int data_size)
         return;
     }
     s_pcm_bytes += (uint64_t)data_size;
+    s_stats_calls = s_stats_calls + 1;   /* volatile 不能 ++（-Werror=volatile） */
+    audio_stats_log();
 
     /* 落点核对：seek 之后的第一块 PCM —— 这时 IO 位置就是"我们实际落到哪了"。
      * 用**同一个码率**把字节反推回时间，和请求值一比就知道落点准不准
@@ -231,6 +291,25 @@ static int out_write_cb(uint8_t *data, int data_size, void *ctx)
     s_out_flowing = true;
     /* 时间轴与实测码率（见 s_meas_bps 的注释）——很便宜，就几次整数运算 */
     audio_stream_measure(data_size);
+    /*
+     * ★ 输出侧耗时与"块间隔"统计（2026-10，治"本地音频一卡一卡、CPU 却很低"）。
+     *
+     * 解码/重采样实测只占实时时间的 7~13% / 20%，整条链却只跑到 73% —— 时间花在**等**
+     * 上。本地播放能等的地方只有两处：读文件（SD）与写输出（codec DMA）。
+     *   - `codec_ms`：这一窗口里写 codec 累计花掉多少毫秒（它按 DMA 节拍阻塞，正常
+     *     应该 ≈ 音频时长本身；明显更大就是 codec/I2S 慢）；
+     *   - `gap_max`：两次回调之间的**最大间隔**（正常 ≈ 一个块的时长 ≈ 46 ms；
+     *     出现几百毫秒的空档就是**被饿住了**——解码没跟上或任务被抢占）。
+     * 与 ESP_GMF_FILE 的 `file read:` 那行一对，就能定位到底在等谁。
+     */
+    const int64_t t_out0 = esp_timer_get_time();
+    if (s_stat_last_ms != 0) {
+        const uint32_t gap = (uint32_t)(t_out0 / 1000) - s_stat_last_ms;
+        if (gap > s_stat_gap_max_ms) {
+            s_stat_gap_max_ms = gap;
+        }
+    }
+    s_stat_last_ms = (uint32_t)(t_out0 / 1000);
     if (s_out == AUDIO_OUT_BLUETOOTH) {
         /*
          * ★ 蓝牙的音量必须在这里做**软件缩放**（2026-10 修"蓝牙设备音量调不动"）：
@@ -248,13 +327,16 @@ static int out_write_cb(uint8_t *data, int data_size, void *ctx)
             pcm16_scale((int16_t *)(void *)data, data_size / 2, vol);
         }
         (void)bt_service_write_pcm(data, (size_t)data_size);
+        s_stat_codec_us = s_stat_codec_us + (uint64_t)(esp_timer_get_time() - t_out0);
         return data_size;
     }
     esp_codec_dev_handle_t dev = (esp_codec_dev_handle_t)ctx;
     if (!dev) {
         return -1;
     }
-    return esp_codec_dev_write(dev, data, data_size);
+    const int ret = esp_codec_dev_write(dev, data, data_size);
+    s_stat_codec_us = s_stat_codec_us + (uint64_t)(esp_timer_get_time() - t_out0);
+    return ret;
 }
 
 /* ---------------------------------------------------------------- 事件 */
@@ -645,6 +727,43 @@ static void ensure_stream_io(void)
              (int)(cfg.io_cfg.buffer_cfg.buffer_size / 1024),
              (int)(cfg.io_cfg.buffer_cfg.io_size / 1024));
 }
+
+/*
+ * 本地文件给一份**带预读缓冲**的 io_file（2026-10，真机数据定案后重做）。
+ *
+ * 证据（板载输出、24-bit FLAC，`play stats` 每 5 秒一行，稳态六个窗口一致）：
+ *   - CPU 侧全都很小：解码 7.9% + 重采样 19.7% + 24→16bit 0.6% + 声道 0.0% ≈ 28% of realtime；
+ *   - 却只送出 3529 ms / 5000 ms 音频（71%）；
+ *   - `file read: 1394 calls, 713728 B in 5046 ms -> 138 KB/s, 24% of the window spent reading`
+ *     ⇒ **平均每次只读 512 字节**、每秒约 275 次，其中 1.2 s 花在等 SD。
+ *   文件平均码率 199 KB/s，而读卡只给到 138 KB/s ⇒ 整条链被读卡限流在 71%。
+ *
+ * 根因：ASP 池子里默认的 `io_file` 是 `FILE_IO_CFG_DEFAULT()` —— `buffer_size = 0` /
+ * `io_size = 0`，而 GMF 的 IO 基类在 `buffer_size == 0` 时**根本不建 data bus**
+ * （`esp_gmf_io.c`：`if (io->data_bus == NULL && buffer_size > 0)`），于是解码器每要一小块
+ * 就**同步 fread 一次**，per-call 开销吃掉三成时间。给它一个预读环形缓冲即可。
+ *
+ * ⚠⚠ **上次就是在这一步翻车的**：照 HTTP 那份抄，只设了 `buffer_size`、漏了 `thread.stack`
+ *   —— 结果是"建了 data bus 却没有 IO 任务"（`io->type` 也不是 BLOCK），
+ *   而 `esp_gmf_io_seek()` 的异步分支是"abort data bus → 由 IO 任务执行 seek"，
+ *   **没有任务就永远没人执行** ⇒ 本地拖动进度条直接失效，只能撤回。
+ *   所以这里 `thread.stack` 与 `buffer_size` **必须一起给**（见 AGENTS §12.4.4）。
+ *
+ * ❌ **2026-10 第二次尝试：真机崩溃，已回退（别再直接抄这一段）**。
+ *   加上之后立刻复现了另一个更隐蔽的坑：
+ *
+ *     播放到文件末尾（EOF）→ 管线走完 → `ESP_GMF_FILE: CLose` → `file_io->file = NULL`
+ *     → 上层（进度记忆恢复 / EOF 收尾）又发了一次 seek
+ *     → `_file_seek()` 里 **`fseek(file_io->file, …)` 没判空** → `fseek(NULL)`
+ *     → `Load access fault`（整机 panic）。
+ *
+ *   即：**预读不是问题，暴露的是 GMF `_file_seek` 缺空指针检查**（已在托管组件里补上，
+ *   见 AGENTS §11.5.14）。而且这次崩溃的**触发条件**本身也是我们的 bug：
+ *   恢复的进度 197 s **超过了文件总长 194.9 s** → seek 直接落到文件尾 → 立刻 EOF。
+ *
+ *   所以顺序是：① 补 GMF 判空 + ② 恢复进度按时长夹取（都在本轮做了）
+ *   → 之后才谈得上重新打开预读。**恢复预读前必须先放一个"位置超过总长"的曲子验证**。
+ */
 
 /*
  * 把 s_stream_io 指向**管道真正在用的那个输入 IO**。

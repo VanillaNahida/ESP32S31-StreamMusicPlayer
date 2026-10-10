@@ -67,6 +67,7 @@ static volatile bool        s_registered;   /* 事件处理器是否已注册 */
 static bool                 s_sntp_started;
 static int                  s_retry_left;   /* 还能自动重试几次 */
 static volatile bool        s_retry_slow;   /* true = 快速额度用完，转慢速重试 */
+static uint8_t              s_cred_idx;     /* 下一次重试要试的已保存凭据下标（轮询） */
 static volatile int         s_last_reason;  /* 最近一次断开/失败的原因码（UI 显示用） */
 static esp_timer_handle_t   s_retry_timer;
 static volatile bool        s_retry_pending; /* 重试定时器已装载（未触发） */
@@ -134,6 +135,20 @@ static const wifi_cred_t *store_find(const char *ssid)
         }
     }
     return NULL;
+}
+
+/* ssid 在已保存列表里的下标；-1 = 没保存过 */
+static int store_index_of(const char *ssid)
+{
+    if (!ssid) {
+        return -1;
+    }
+    for (uint8_t i = 0; i < s_store.count; i++) {
+        if (strcmp(s_store.list[i].ssid, ssid) == 0) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 static void store_put(const char *ssid, const char *pass)
@@ -300,12 +315,41 @@ static esp_err_t wifi_connect_raw(const char *ssid, const char *pass, bool save)
  */
 static void wifi_retry_budget_refill(void)
 {
-    s_retry_left = WIFI_RETRY_MAX;
+    /*
+     * 快速额度至少够把**每个已保存的网络各试一次**（轮询），
+     * 否则存了 8 个网络、额度只有 5 时，排在后面的永远轮不到快速重试。
+     */
+    s_retry_left = (s_store.count > WIFI_RETRY_MAX) ? (int)s_store.count : WIFI_RETRY_MAX;
     s_retry_slow = false;
 }
 
 /*
- * 连接失败/掉线后的自动重试（需求："wifi 连接失败后没有重试机制"）。
+ * 自动重试的轮询游标：`s_cred_idx` = **下一次重试**要试的那个已保存凭据的下标。
+ *
+ * 2026-10 需求（用户："为什么要一直对一个 wifi 重试？不能根据已保存的列表轮询检测吗？"）：
+ * 以前 `wifi_retry_cb` 永远重连 `s_conn_ssid` 那一个（开机取的是"最近保存的"），
+ * 于是两个网络里只有一个在范围内时，它会 60 秒一次地死磕那个连不上的
+ * （日志里刷满 `reason 201`），另一个明明可用却**永远不会被试到**。
+ *
+ * 现在的语义：
+ *   - 发起连接（开机自动连 / 用户点连接）→ `cred_cursor_next()`：游标指向"目标的下一个"，
+ *     这样万一它失败了，下一次重试就换一个已保存的；
+ *   - 试完一个就往后走一格（`wifi_retry_cb` 里），走完一轮从头再来；
+ *   - 连上了 → 游标**指回它自己**（掉线后先重连原来那个，再轮询）。
+ */
+static void cred_cursor_next(const char *ssid)
+{
+    if (s_store.count == 0) {
+        s_cred_idx = 0;
+        return;
+    }
+    const int idx = store_index_of(ssid);
+    /* 没保存过（手动连了别人的网）：从"最近保存的"那个开始轮 */
+    s_cred_idx = (idx >= 0) ? (uint8_t)((idx + 1) % s_store.count)
+                            : (uint8_t)(s_store.count - 1);
+}
+
+/* 连接失败/掉线后的自动重试（需求："wifi 连接失败后没有重试机制"）。
  * 用一次性 esp_timer 延时触发，最多 WIFI_RETRY_MAX 次；连上就补满。
  * 不用 vTaskDelay 阻塞：事件回调跑在 sys_evt 任务里，不能堵。
  */
@@ -328,15 +372,24 @@ static void wifi_retry_cb(void *arg)
     if (s_state == WIFI_ST_CONNECTED) {
         return;
     }
-    const wifi_cred_t *c = store_find(s_conn_ssid);
-    if (!c) {
-        return;                 /* 没存过密码，重试也没意义 */
+    if (s_store.count == 0) {
+        return;                 /* 一个都没存过，重试也没意义 */
     }
+    if (s_cred_idx >= s_store.count) {
+        s_cred_idx = 0;
+    }
+    /* ★ 轮询：本次试 s_cred_idx 这个，试完就往后挪一格给下一次重试用 */
+    const wifi_cred_t *c = &s_store.list[s_cred_idx];
+    const uint8_t      pos = s_cred_idx;
+    s_cred_idx = (uint8_t)((s_cred_idx + 1) % s_store.count);
+
     if (s_retry_slow) {
-        ESP_LOGI(TAG, "slow retry '%s'", s_conn_ssid);
+        ESP_LOGI(TAG, "slow retry '%s' (saved %u/%u)",
+                 c->ssid, (unsigned)(pos + 1), (unsigned)s_store.count);
     } else {
         s_retry_left--;
-        ESP_LOGI(TAG, "connect '%s' (try, %d retry left)", s_conn_ssid, s_retry_left);
+        ESP_LOGI(TAG, "connect '%s' (try, %d retry left, saved %u/%u)",
+                 c->ssid, s_retry_left, (unsigned)(pos + 1), (unsigned)s_store.count);
     }
     /*
      * ★ 必须走 wifi_connect_raw：以前这里调 wifi_service_connect_saved()，
@@ -371,8 +424,9 @@ static void wifi_retry_arm_ms(uint32_t ms)
 /*
  * 掉线/失败后排下一次重试。
  *
- * 两级节奏：前 WIFI_RETRY_MAX 次 4 秒一次（快速恢复），用完之后**不放弃**，
- * 转成 1 分钟一次的慢重试。
+ * 两级节奏：前几次 4 秒一次（快速恢复，次数 = max(WIFI_RETRY_MAX, 已保存网络数)，
+ * 保证每个已保存的网络都能被快速轮询到一次），用完之后**不放弃**，
+ * 转成 1 分钟一次的慢重试（继续轮询）。
  *   - 为什么不能无限快重试：密码错/企业级网络时就是每 4 秒一轮"连接→失败"，
  *     日志被刷满、射频一直忙（以前的实现就是这样：额度被 wifi_service_connect()
  *     反复补满，永远停在 "4 retry left"）。
@@ -383,8 +437,8 @@ static void wifi_retry_arm(void)
 {
     if (!s_retry_slow && s_retry_left <= 0) {
         s_retry_slow = true;
-        ESP_LOGW(TAG, "quick retries exhausted, retry '%s' every %d s from now on",
-                 s_conn_ssid, (int)(WIFI_RETRY_SLOW_MS / 1000));
+        ESP_LOGW(TAG, "quick retries exhausted, rotate %u saved AP every %d s from now on",
+                 (unsigned)s_store.count, (int)(WIFI_RETRY_SLOW_MS / 1000));
     }
     wifi_retry_arm_ms(s_retry_slow ? WIFI_RETRY_SLOW_MS : WIFI_RETRY_DELAY_MS);
 }
@@ -402,6 +456,16 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
         break;
     case WIFI_EVENT_STA_CONNECTED:
         s_state = WIFI_ST_CONNECTED;
+        /*
+         * 连上了：把轮询游标**指回它自己** —— 下次要是掉线，先重连原来这个
+         * （它刚刚还能用），再往后轮询别的已保存网络。
+         */
+        {
+            const int idx = store_index_of(s_conn_ssid);
+            if (idx >= 0) {
+                s_cred_idx = (uint8_t)idx;
+            }
+        }
         ESP_LOGI(TAG, "connected to '%s'", s_conn_ssid);
         break;
     case WIFI_EVENT_STA_DISCONNECTED: {
@@ -563,6 +627,8 @@ esp_err_t wifi_service_init(void)
         const wifi_cred_t *c = &s_store.list[s_store.count - 1];
         s_conn_ssid[0] = '\0';
         snprintf(s_conn_ssid, sizeof(s_conn_ssid), "%s", c->ssid);
+        /* 开机先连"最近保存的"，它要是连不上，重试就自动轮询到别的已保存网络 */
+        cred_cursor_next(c->ssid);
         wifi_retry_budget_refill();
         s_state = WIFI_ST_CONNECTING;
         wifi_retry_arm_ms(WIFI_FIRST_CONNECT_MS);
@@ -771,7 +837,10 @@ static esp_err_t wifi_connect_raw(const char *ssid, const char *pass, bool save)
 esp_err_t wifi_service_connect(const char *ssid, const char *pass, bool save)
 {
     wifi_retry_budget_refill();       /* 用户主动连一次 → 自动重试额度重新补满 */
-    return wifi_connect_raw(ssid, pass, save);
+    const esp_err_t ret = wifi_connect_raw(ssid, pass, save);
+    /* 这次连不上时，重试从"它的下一个已保存网络"开始轮询（别死磕一个） */
+    cred_cursor_next(ssid);
+    return ret;
 }
 
 esp_err_t wifi_service_connect_saved(const char *ssid)
@@ -781,7 +850,9 @@ esp_err_t wifi_service_connect_saved(const char *ssid)
         return ESP_ERR_NOT_FOUND;
     }
     wifi_retry_budget_refill();       /* 同上：用户点了"用已保存的密码连" */
-    return wifi_connect_raw(c->ssid, c->pass, false);
+    const esp_err_t ret = wifi_connect_raw(c->ssid, c->pass, false);
+    cred_cursor_next(c->ssid);
+    return ret;
 }
 
 esp_err_t wifi_service_disconnect(void)

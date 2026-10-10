@@ -55,6 +55,8 @@ static const char *TAG = "app_music";
 #define PROGRESS_SAVE_TICKS  10    /* 每 10 个 tick（5 秒）把播放进度记一次 */
 /* 续播最多等这么多个 tick（12 × 500 ms = 6 秒）还拿不到码率就放弃定位 */
 #define RESUME_WAIT_MAX_TICKS 12
+/* 恢复位置落在"离结尾不到这么久"的范围内就从头放（防越界落到文件尾，见 §11.5.14） */
+#define RESUME_END_GUARD_MS   5000
 /* 在线曲目下载任务的栈：HTTP + TLS 不浅。
  * 实测 6 KB 会在 TLS/证书校验里爆 "Stack protection fault"
  * （Guru 定位到 heap_caps_aligned_alloc ← mbedtls 握手），所以给 12 KB；
@@ -157,6 +159,9 @@ static volatile int s_cover_out_idx = -1;
 static const online_song_t *s_on_songs;
 static size_t  s_on_count;
 static bool    s_on_mode;                    /* 当前队列是否来自在线歌单 */
+/* seek 之后最多等这么久没 PCM 就交给看门狗兜底（别把标志一直挂着） */
+#define SEEK_STALL_MAX_TICKS (20000 / TICK_MS)
+
 /* 在线流式"卡死看门狗"状态（见 tick_cb 里的说明） */
 #define STALL_TICKS       (20000 / TICK_MS)  /* 在线：连续 20 s 没有 PCM 输出 = 卡住 */
 #define LOCAL_STALL_TICKS (8000 / TICK_MS)   /* 本地：8 s 足够（SD 读 + 解第一帧只要 2~3 s） */
@@ -335,6 +340,9 @@ static bool s_seek_buf_pending;
  * 对齐到真实落点，否则声音和进度条会一直差着一截。
  */
 static int  s_seek_landing_wait;
+/* "seek 进行中"（含本地）：定位期间不让看门狗误判成"文件解不出来" */
+static bool s_seek_in_flight;
+static int  s_seek_inflight_n;
 static void start_track_online_at(int idx, const char *uri);
 /* 在线切歌的"界面先行"：先把播放器页切成目标歌曲（见实现处的说明） */
 static void online_switch_ui_to(int idx);
@@ -851,8 +859,19 @@ static void on_seek_release(lv_event_t *e)
      * 落点核对：服务端少数情况下会忽略 Range（或按别的范围给），这时"实际听到的位置"
      * 和请求的时间点会差很多。服务在 seek 后第一块 PCM 出来时按字节反推真实位置，
      * 这里等它回报（最多 5 秒 ≈ 10 个 tick，超时就不管了）。
+     * 本地文件也开（`s_stream_io` 是文件 IO，同样能按字节反推），所以不再是 streamed ? 10 : 0。
      */
-    s_seek_landing_wait = streamed ? 10 : 0;
+    s_seek_landing_wait = 10;
+
+    /*
+     * ★ 标一个"seek 进行中"（2026-10 加，防止看门狗误伤）：
+     *   `audio_service_seek_ms()` 会把出声标志清零，于是 tick 看到
+     *   "声称在播但没 PCM" —— 而本地那条看门狗阈值只有 8 s，一次慢一点的本地
+     *   seek（大 FLAC 重新填缓冲）就会被判成"这个文件解不出来"直接跳过。
+     *   这个标志让看门狗在定位期间不介入；真卡死超过 SEEK_STALL_MAX_MS 才放手。
+     */
+    s_seek_in_flight  = true;
+    s_seek_inflight_n = 0;
 
     /*
      * 定位期间的两个"重新计数"：
@@ -1507,7 +1526,22 @@ static void tick_cb(lv_timer_t *t)
      * 8 s 没声音就是文件解不出来，早点跳过少让用户干等。
      */
     const int stall_limit = s_on_mode ? STALL_TICKS : LOCAL_STALL_TICKS;
-    if (audio_service_is_playing() && !audio_service_output_active()) {
+    /*
+     * ★ "seek 进行中"期间不介入：`audio_service_seek_ms()` 会清掉出声标志，
+     *   看门狗看到的就是"声称在播但没 PCM" —— 本地阈值只有 8 s，一次慢一点的定位
+     *   （大 FLAC 重新填缓冲）会被误判成"文件解不出来"直接跳过。
+     *   出声了就清标志；真卡死超过 SEEK_STALL_MAX_TICKS 才把标志放开交给看门狗兜底。
+     */
+    if (s_seek_in_flight) {
+        if (audio_service_output_active()) {
+            s_seek_in_flight = false;
+        } else if (++s_seek_inflight_n > SEEK_STALL_MAX_TICKS) {
+            ESP_LOGW(TAG, "seek produced no PCM for %u s, let the watchdog act",
+                     (unsigned)(SEEK_STALL_MAX_TICKS * TICK_MS / 1000));
+            s_seek_in_flight = false;
+        }
+    }
+    if (audio_service_is_playing() && !audio_service_output_active() && !s_seek_in_flight) {
         if (++s_stall_ticks >= stall_limit) {
             s_stall_ticks = 0;
             if (!s_on_mode) {
@@ -1660,7 +1694,22 @@ static void tick_cb(lv_timer_t *t)
                 ESP_LOGW(TAG, "no bitrate for resume, continue from wall clock");
             } else if (info_ok) {
                 s_resume_ms = 0;
-                if (audio_service_seek_ms(target) == ESP_OK) {
+                /*
+                 * ★ 到期保护（2026-10 真机崩溃之后加，务必保留）。
+                 *
+                 * 恢复的位置可能**超过文件总长**（进度记忆写的是"当时听到哪"，
+                 * 换过文件、文件被换掉、或上次是在末尾附近退出的，都会越界）。
+                 * 越界时按字节 seek 会正好落到文件尾 → 解码器立刻 EOF → 管线收尾关闭，
+                 * 而收尾逻辑还会再发一次 seek → 打到已关闭的 IO 上
+                 * （`_file_seek` 缺判空，见 AGENTS §11.5.14，历史上直接把整机打 panic）。
+                 * 所以：落在最后一小段里就直接从头放（听感上也更合理）。
+                 */
+                if (info.duration_ms > RESUME_END_GUARD_MS * 2 &&
+                    target + RESUME_END_GUARD_MS >= info.duration_ms) {
+                    s_elapsed_ms = 0;
+                    ESP_LOGI(TAG, "resume pos %u ms is at the end of %u ms track, start from 0",
+                             (unsigned)target, (unsigned)info.duration_ms);
+                } else if (audio_service_seek_ms(target) == ESP_OK) {
                     s_elapsed_ms = target;
                     /* 续播定位之后同样要"复位上一行 + 重新居中"（别清 s_lyric_cur，见 lyric_resync） */
                     lyric_resync();
@@ -1753,14 +1802,10 @@ static void player_on_delete(lv_event_t *e)
         save_progress(s_elapsed_ms);
         play_state_commit();
     }
-    if (s_tick) {
-        lv_timer_delete(s_tick);
-        s_tick = NULL;
-    }
-    if (s_media_timer) {
-        lv_timer_delete(s_media_timer);
-        s_media_timer = NULL;
-    }
+    /* ★ 这里**不要**删 s_tick / s_media_timer：它们是开机建的常驻定时器
+     *（见 app_music_register_apps 里的说明）——删掉就等于"离开播放器页就不再续播/
+     * 不再响应耳机按键"，正是 2026-10 那个"后台播完不继续"的 bug。 */
+    /* 页面控件指针清空：定时器与回调别再往已销毁对象里写（tick 常驻，必须清） */
     s_p_title = s_p_artist = s_p_cur = s_p_tot = NULL;
     s_p_seek = s_p_seek_hit = s_p_btn = NULL;
     s_p_cover_box = s_p_cover_img = NULL;
@@ -3002,74 +3047,17 @@ static void local_render(void)
     }
 }
 
-/* 换目录：重读条目 → 重建播放队列 → 重画第一页 */
-static void local_rebuild(void)
-{
-    if (!s_list_col) {
-        return;
-    }
-
-    /*
-     * 取目录条目：先按当前容量取一次，browse 返回的是**真实条数**（可能大于容量）。
-     * 装不下就扩容重来 —— 容量翻倍增长，所以最多几轮就够，任何规模的目录都能列全。
-     * （旧代码把容量写死 64 条且不看返回值，目录一大就静默只剩前 64 条。）
-     */
-    s_entry_n = -1;
-    for (int attempt = 0; attempt < 10; attempt++) {
-        if (!s_entries && !local_reserve_entries(64)) {
-            break;
-        }
-        const int got = storage_service_browse(s_cur_dir, s_entries, (int)s_entries_cap);
-        if (got < 0) {
-            s_entry_n = -1;
-            break;
-        }
-        s_entry_n = got;
-        if ((size_t)got <= s_entries_cap) {
-            break;                                  /* 全装下了 */
-        }
-        const size_t cap_before = s_entries_cap;
-        if (!local_reserve_entries((size_t)got)) {
-            break;                                  /* 分配失败：按现有容量列 */
-        }
-        if (s_entries_cap == cap_before) {
-            break;   /* 已到 LOCAL_ENTRIES_MAX，再扫一遍目录也是同样结果 */
-        }
-    }
-    if (s_entry_n < 0) {
-        s_entry_n = 0;
-        lv_obj_clean(s_list_col);
-        local_add_row("读取目录失败", false, false, 0, LOCAL_SEL_NONE);
-        return;
-    }
-    /*
-     * 不变量：s_entry_n 必须 ≤ 缓冲容量 —— 下面按页取 s_entries[i] 的下标，
-     * 一旦 n 大于容量就会越界读（目录条目超过 LOCAL_ENTRIES_MAX 时只列前
-     * LOCAL_ENTRIES_MAX 条，并留下日志）。
-     */
-    if ((size_t)s_entry_n > s_entries_cap) {
-        ESP_LOGW(TAG, "local: %d entries but buffer holds %u — listing the first %u",
-                 s_entry_n, (unsigned)s_entries_cap, (unsigned)s_entries_cap);
-        s_entry_n = (int)s_entries_cap;
-    }
-
-    /* 队列 = 当前目录这一层的**全部**音频（上一首/下一首在整目录里轮转，与翻页无关） */
-    storage_service_load_dir(s_cur_dir);
-
-    local_render();
-}
-
 /*
- * 进目录前的"加载态"：把列表换成转圈 + "载入中…"，并**立刻刷一帧**。
+ * 进目录/换目录前的"加载态"：把列表换成转圈 + "载入中…"。
  *
  * ★ 为什么需要（用户 2026-10 反馈"点进去卡在当前页面，加载完才进去"）：
- *   进目录走的是 local_rebuild() → storage_service_browse()，而它是**同步**读 SD
- *   （在 LVGL 任务里），大目录要几百毫秒甚至更久。这期间如果屏上还是**上一个目录**
- *   的内容，看起来就是"点了没反应/卡住"，然后新目录突然出现。
- *   所以先把加载态铺上屏、lv_refr_now() 强制送一帧，再去做那次阻塞读。
+ *   进目录要读 SD（列目录 + 建播放队列两遍 walk），大目录要几百毫秒到几秒。
+ *   这期间如果屏上还是**上一个目录**的内容，看起来就是"点了没反应/卡住"。
  *
- * ⚠ 转圈是**静止**的：读卡期间 LVGL 任务被占住，spinner 的动画转不起来。
- *   想让它真的转，得把目录读取挪到工作线程（见 AGENTS.md 里"下一步可做"那条）。
+ * ★ 2026-10 改：读目录已经搬到**工作线程**（见 local_scan_task），所以
+ *   - 页面/目录**立刻**切过来（不再等读卡）；
+ *   - 转圈是**真的在转**（以前 LVGL 任务被同步读卡占住，动画根本刷不出来）；
+ *   - 不再需要 lv_refr_now() 去"抢一帧"。
  */
 static void local_show_loading(void)
 {
@@ -3104,6 +3092,174 @@ static void local_show_loading(void)
     }
 }
 
+/* ------------------------------------------------- 本地目录扫描（工作线程）
+ *
+ * 需求（2026-10 用户）："点本地音乐要**立刻**进页面，用加载动画等"。
+ *
+ * 以前 page_local() / 进目录都是**在 LVGL 任务里同步**扫 SD：
+ *   local_rebuild() 先 storage_service_browse()（列目录），再
+ *   storage_service_load_dir()（再走一遍目录、建播放队列）—— 两次 full walk，
+ *   几百首的目录就是"卡一会才进去"，而且转圈一动不动（LVGL 任务被占住）。
+ *
+ * 现在整个扫描搬到工作线程，UI 只做两件事：
+ *   1) 铺加载态，**立刻返回**（页面秒进、转圈真的在转）；
+ *   2) local_sd_tick（500 ms）轮询结果，拿到就渲染列表。
+ *
+ * 与 online_prepare_task 同一套约定：
+ *   - 工作线程**绝不碰 LVGL**（只写 s_entries / s_scan_* 这些纯数据）；
+ *   - 请求带**序号**：期间用户又换了目录就把旧结果丢掉（run_seq != seq）；
+ *   - 同一时刻只有一个扫描在跑（s_scan_busy）；期间来的新请求记进 s_scan_pend*，
+ *     等这次结束由 tick 再起一个 —— 不能两个线程同时写 s_entries。
+ *
+ * ⚠ storage_service_load_dir() 内部是"先清 s_count 再重建"，存在一个短暂的
+ *   "队列为空"窗口。这里敢这么用，是因为**读曲目表的只有 app_music**，而播放器页
+ *   与本地列表页是路由上的**兄弟页**（不会同时存活），本地页扫描期间又只有加载态、
+ *   没有任何行可点 —— 那个窗口没人看得到。将来若有别的模块（状态栏等）也去读曲目表，
+ *   这条前提就不成立，得改成"在服务内部加锁 + 末尾换指针"。
+ */
+#define LOCAL_SCAN_STACK  (8 * 1024)
+
+typedef struct {
+    char     dir[STORAGE_PATH_MAX];
+    uint32_t seq;
+} local_scan_req_t;
+
+static volatile bool     s_scan_busy;       /* 工作线程正在扫 */
+static volatile bool     s_scan_done;       /* 有新结果等 UI 取 */
+static volatile bool     s_scan_fail;       /* 这次扫描失败（读目录出错/没内存） */
+static volatile uint32_t s_scan_seq;        /* UI 侧最新请求号 */
+static volatile uint32_t s_scan_run_seq;    /* 已完成结果的请求号 */
+static volatile int      s_scan_n;          /* 扫到的条目数（<0 = 失败） */
+static volatile bool     s_scan_pend;       /* 扫描期间又来了请求，等结束再起 */
+static char              s_scan_pend_dir[STORAGE_PATH_MAX];   /* 排队中的目录 */
+
+/* 工作线程：列目录 → 建播放队列 → 发布结果。**绝不碰 LVGL** */
+static void local_scan_task(void *arg)
+{
+    local_scan_req_t *req = (local_scan_req_t *)arg;
+
+    /*
+     * 1) 列目录：先按当前容量取一次，browse 返回的是**真实条数**（可能大于容量），
+     *    装不下就扩容重来 —— 容量翻倍增长，最多几轮就够，任何规模都能列全。
+     *    （旧代码把容量写死 64 条且不看返回值，目录一大就静默只剩前 64 条。）
+     */
+    int got = -1;
+    for (int attempt = 0; attempt < 10; attempt++) {
+        if (!s_entries && !local_reserve_entries(64)) {
+            break;
+        }
+        got = storage_service_browse(req->dir, s_entries, (int)s_entries_cap);
+        if (got < 0) {
+            break;
+        }
+        if ((size_t)got <= s_entries_cap) {
+            break;                                  /* 全装下了 */
+        }
+        const size_t cap_before = s_entries_cap;
+        if (!local_reserve_entries((size_t)got)) {
+            break;                                  /* 分配失败：按现有容量列 */
+        }
+        if (s_entries_cap == cap_before) {
+            break;   /* 已到 LOCAL_ENTRIES_MAX，再扫一遍目录也是同样结果 */
+        }
+    }
+
+    /* 2) 播放队列 = 当前目录这一层的全部音频（上一首/下一首在整目录里轮转，与翻页无关） */
+    if (got >= 0) {
+        storage_service_load_dir(req->dir);
+    }
+
+    /*
+     * 3) 发布。顺序要紧：**先写数据、再置 done、最后才清 busy** ——
+     *    反过来的话，tick 有可能在"busy 已清、done 还没置"的缝里又起一个扫描，
+     *    两个线程同时写 s_entries。
+     */
+    s_scan_n       = got;
+    s_scan_fail    = (got < 0);
+    s_scan_run_seq = req->seq;
+    s_scan_done    = true;
+    s_scan_busy    = false;
+
+    ESP_LOGI(TAG, "local scan: %d entries, queue %u, dir %s (seq %u)",
+             got, (unsigned)storage_service_count(), req->dir, (unsigned)req->seq);
+    free(req);
+    vTaskDelete(NULL);
+}
+
+/* 起一次扫描（LVGL 任务里调）。忙着就把请求排到 s_scan_pend*，由 tick 补起 */
+static void local_scan_start(const char *dir)
+{
+    if (!dir || !dir[0]) {
+        return;
+    }
+    s_scan_seq = s_scan_seq + 1;   /* volatile 不能用 ++（C++20 起 deprecated，-Werror） */
+    if (s_scan_busy) {
+        snprintf(s_scan_pend_dir, sizeof(s_scan_pend_dir), "%s", dir);
+        s_scan_pend = true;
+        return;
+    }
+    local_scan_req_t *req = (local_scan_req_t *)malloc(sizeof(local_scan_req_t));
+    if (!req) {
+        s_scan_n       = -1;
+        s_scan_fail    = true;
+        s_scan_run_seq = s_scan_seq;
+        s_scan_done    = true;
+        return;
+    }
+    snprintf(req->dir, sizeof(req->dir), "%s", dir);
+    req->seq    = s_scan_seq;
+    s_scan_busy = true;
+    s_scan_done = false;
+    if (xTaskCreate(local_scan_task, "loc_scan", LOCAL_SCAN_STACK, req, 2, NULL) != pdPASS) {
+        s_scan_busy    = false;
+        s_scan_n       = -1;
+        s_scan_fail    = true;
+        s_scan_run_seq = s_scan_seq;
+        s_scan_done    = true;
+        free(req);
+        ESP_LOGW(TAG, "local scan task create failed");
+    }
+}
+
+/* 消费扫描结果（LVGL 任务，由 local_sd_tick 调） */
+static void local_apply_scan(void)
+{
+    if (!s_list_col) {
+        return;
+    }
+    if (s_scan_fail) {
+        s_entry_n = 0;
+        lv_obj_clean(s_list_col);
+        local_add_row("读取目录失败", false, false, 0, LOCAL_SEL_NONE);
+        return;
+    }
+    /*
+     * 不变量：s_entry_n 必须 ≤ 缓冲容量 —— 下面按页取 s_entries[i] 的下标，
+     * 一旦 n 大于容量就会越界读（目录条目超过 LOCAL_ENTRIES_MAX 时只列前
+     * LOCAL_ENTRIES_MAX 条，并留下日志）。
+     */
+    s_entry_n = s_scan_n;
+    if ((size_t)s_entry_n > s_entries_cap) {
+        ESP_LOGW(TAG, "local: %d entries but buffer holds %u — listing the first %u",
+                 s_entry_n, (unsigned)s_entries_cap, (unsigned)s_entries_cap);
+        s_entry_n = (int)s_entries_cap;
+    }
+    local_render();
+}
+
+/*
+ * 换目录/插卡/重进页面都走它：铺加载态 + 起异步扫描，**立刻返回**。
+ * 渲染由 local_sd_tick 在看到 s_scan_done 时做（见 local_apply_scan）。
+ */
+static void local_rebuild(void)
+{
+    if (!s_list_col) {
+        return;
+    }
+    local_show_loading();
+    local_scan_start(s_cur_dir);
+}
+
 static void on_local_entry(lv_event_t *e)
 {
     const int sel = (int)(intptr_t)lv_event_get_user_data(e);
@@ -3118,8 +3274,7 @@ static void on_local_entry(lv_event_t *e)
             snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", LOCAL_ROOT);
         }
         s_page = 0;
-        local_show_loading();       /* 先把加载态铺上屏 */
-        lv_refr_now(NULL);          /* 强制送一帧：别让用户盯着旧目录发呆 */
+        /* 上一级：同样走异步扫描（见 local_rebuild） */
         local_rebuild();
         return;
     }
@@ -3146,10 +3301,8 @@ static void on_local_entry(lv_event_t *e)
     if (en->is_dir) {
         snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", full);
         s_page = 0;
-        /* ★ 先把加载态铺上屏并强制刷一帧，再去做同步的 SD 目录读取：
-         * 否则读卡这几百毫秒里屏上还是**上一个目录**，看起来就是"卡住" */
-        local_show_loading();
-        lv_refr_now(NULL);
+        /* 换目录：铺加载态 + 起**异步**扫描（工作线程读卡），页面立刻切过去、
+         * 转圈真的在转，结果由 local_sd_tick 取回后渲染。 */
         local_rebuild();
         return;
     }
@@ -3177,6 +3330,9 @@ static void local_page_watch(lv_event_t *e)
     (void)e;
     s_list_col  = NULL;
     s_list_hint = NULL;
+    s_scan_seq = s_scan_seq + 1;   /* volatile 不能用 ++（C++20 起 deprecated，-Werror） */                 /* 作废在飞的扫描：结果不该留给下一个页面 */
+    s_scan_done = false;
+    s_scan_pend = false;
     if (s_local_sd_timer) {
         lv_timer_delete(s_local_sd_timer);
         s_local_sd_timer = NULL;
@@ -3208,6 +3364,7 @@ static void local_sd_apply(void)
         }
         s_entry_n = 0;
         s_page    = 0;
+        s_scan_seq = s_scan_seq + 1;   /* volatile 不能用 ++（C++20 起 deprecated，-Werror） */              /* 作废在飞的扫描（拔卡了，旧结果不能再用） */
         snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", LOCAL_ROOT);
         if (s_list_hint) {
             lv_label_set_text(s_list_hint, "未检测到 SD 卡");
@@ -3229,6 +3386,27 @@ static void local_sd_apply(void)
 static void local_sd_tick(lv_timer_t *t)
 {
     (void)t;
+
+    /*
+     * ① 异步扫描的结果（见 local_scan_task）：seq 对得上才是"当前这个目录"的结果，
+     *    对不上说明期间用户又换了目录 → 直接丢掉，别把旧目录的列表画上去。
+     */
+    if (s_scan_done) {
+        s_scan_done = false;
+        if (s_scan_run_seq == s_scan_seq) {
+            local_apply_scan();
+        } else {
+            ESP_LOGI(TAG, "local scan result dropped (seq %u != %u)",
+                     (unsigned)s_scan_run_seq, (unsigned)s_scan_seq);
+        }
+    }
+    /* ② 扫描期间排队的新请求：等它结束了再起一个（同一时刻只允许一个扫描） */
+    if (s_scan_pend && !s_scan_busy) {
+        s_scan_pend = false;
+        local_scan_start(s_scan_pend_dir);
+        return;
+    }
+    /* ③ SD 热插拔代次 */
     const uint32_t gen = storage_service_sd_generation();
     if (gen == s_local_sd_gen) {
         return;
@@ -3287,6 +3465,17 @@ static lv_obj_t *page_local(void)
     if (!s_local_sd_timer) {
         s_local_sd_timer = lv_timer_create(local_sd_tick, LOCAL_SD_POLL_MS, NULL);
     }
+
+    /*
+     * 新页面：先把上一次留下的扫描状态作废。
+     * ⚠ 必须 **s_scan_seq++** —— 若上一次页面关掉时还有一个扫描在飞（同一个 seq），
+     *   它的结果会被 tick 认成"当前目录的结果"画到新页面上：列的是旧目录的文件名，
+     *   点下去却按新 s_cur_dir 拼路径 → 放到别的文件去了。
+     */
+    s_scan_seq = s_scan_seq + 1;   /* volatile 不能用 ++（C++20 起 deprecated，-Werror） */
+    s_scan_done = false;
+    s_scan_pend = false;
+    s_entry_n   = 0;
 
     if (!storage_service_sd_is_mounted()) {
         lv_label_set_text(s_list_hint, "未检测到 SD 卡");
@@ -3388,6 +3577,28 @@ void app_music_register_apps(void)
 
     /* 订阅播放事件：播完自动下一首，解码失败则报错并跳过 */
     audio_service_set_event_cb(on_audio_evt, NULL);
+
+    /*
+     * ★★ 播放状态的"心跳"定时器必须**开机就建、且不随页面销毁**（2026-10 用户报：
+     *    "后台播放时歌放完了没有按循环逻辑续播，要进播放页才继续"）。
+     *
+     * 根因：tick_cb 原先由 page_player() 创建、并在页面 LV_EVENT_DELETE 里删除 ——
+     * 于是**不在播放器页时根本没有人消费 s_advance_req**（AUDIO_EVT_FINISHED 只是
+     * 在工作线程里置了这个标志）。歌放完 → 标志挂着 → 一直等到用户进播放页才被处理，
+     * 表现就是"停住了"。错误处理、卡死看门狗、断点续播、进度记忆落盘同理，全都停摆。
+     *
+     * tick_cb 里所有碰 UI 的地方本来就有空指针保护（s_p_seek / s_p_cur / s_p_tot /
+     * s_p_btn / s_p_lyric_col / s_p_cover_img / s_out_btn_icon 都判了），
+     * 所以它可以脱离页面一直跑 —— 页面只是"显示"，状态机跑在页面之外。
+     */
+    if (!s_tick) {
+        s_tick = lv_timer_create(tick_cb, TICK_MS, NULL);
+    }
+    /* 蓝牙耳机按键（播放/暂停/上下曲）走的是这个 100 ms 定时器：同样必须常驻，
+     * 否则带着耳机在后台按"下一首"也没人理 */
+    if (!s_media_timer) {
+        s_media_timer = lv_timer_create(media_cmd_tick, 100, NULL);
+    }
 
     restore_last_session();
 }
