@@ -394,8 +394,8 @@ static void qr_open(void)
     lv_obj_set_style_text_color(s_qr_status, lv_color_hex(BA_TEXT_BODY), LV_PART_MAIN);
     lv_label_set_text(s_qr_status, "正在获取二维码…");
 
-    ui_ba_btn(s_qr_dlg.btn_row, "刷新二维码", false, NULL, qr_refresh_clicked, NULL);
-    ui_ba_btn(s_qr_dlg.btn_row, "取消", true, NULL, qr_cancel_clicked, NULL);
+    ui_ba_btn(s_qr_dlg.btn_row, "刷新二维码", false, qr_refresh_clicked, NULL);
+    ui_ba_btn(s_qr_dlg.btn_row, "取消", true, qr_cancel_clicked, NULL);
 
     work_submit(OREQ_QR_KEY, NULL);      /* 打开即取二维码（工作线程里两步合并） */
 }
@@ -2504,10 +2504,10 @@ static void modal_open(int kind)
 
     ui_ba_hint(s_modal_dlg.body, "※最多可以输入 60 个字。");
 
-    ui_ba_btn(s_modal_dlg.btn_row, "取消", false, "Esc",
+    ui_ba_btn(s_modal_dlg.btn_row, "取消", false,
               [](lv_event_t *e) { (void)e; modal_close(); }, NULL);
     ui_ba_btn(s_modal_dlg.btn_row, rename ? "保存" : (search ? "搜索" : "添加"),
-              true, "Enter", modal_submit, NULL);
+              true, modal_submit, NULL);
 
     /* 重命名可能起中文名 → 也要拼音键盘；只有"歌单 ID"用数字键盘 */
     modal_build_keyboards(ta, search || rename);

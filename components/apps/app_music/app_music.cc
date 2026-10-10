@@ -108,6 +108,8 @@ static lv_obj_t *s_p_cover_box;     /* 左栏封面容器 */
 static lv_obj_t *s_p_cover_img;     /* 真封面（没解出来时隐藏） */
 static lv_obj_t *s_p_lyric_box;     /* 右栏歌词区（封面右侧） */
 static lv_obj_t *s_p_lyric_hint;    /* 未展开时的提示 */
+static lv_obj_t *s_p_hint_row;      /* 提示行容器：[转圈][文字] */
+static lv_obj_t *s_p_buf_spin;      /* 缓冲转圈（只在缓冲时显示） */
 static lv_obj_t *s_p_lyric_col;
 static lv_obj_t *s_p_lyric_labels[LYRIC_VIEW_MAX_LINES];
 static size_t    s_p_lyric_n;
@@ -156,8 +158,9 @@ static const online_song_t *s_on_songs;
 static size_t  s_on_count;
 static bool    s_on_mode;                    /* 当前队列是否来自在线歌单 */
 /* 在线流式"卡死看门狗"状态（见 tick_cb 里的说明） */
-#define STALL_TICKS     (20000 / TICK_MS)    /* 连续 20 s 没有 PCM 输出 = 卡住 */
-#define STALL_KICK_MAX  3                    /* 每首最多踢 3 次 */
+#define STALL_TICKS       (20000 / TICK_MS)  /* 在线：连续 20 s 没有 PCM 输出 = 卡住 */
+#define LOCAL_STALL_TICKS (8000 / TICK_MS)   /* 本地：8 s 足够（SD 读 + 解第一帧只要 2~3 s） */
+#define STALL_KICK_MAX    3                  /* 在线每首最多踢 3 次 */
 static int     s_stall_ticks;
 static int     s_stall_kicks;
 /* 要播放的地址：流式是 https 地址，下载兜底是本地缓存路径
@@ -213,6 +216,45 @@ static bool    s_on_failed;                  /* 下载失败，等 LVGL 任务�
  * 以后想在"网络空闲/缓冲充足"时重新启用，把入口调用加回来即可。
  */
 static bool    s_on_prefetch;                /* 本次下载是预取（不起播） */
+
+/*
+ * 本首已经"重刷过几次播放地址"。
+ *
+ * 网易云给的播放地址是**带时间戳 + 签名**的（`.../20261010132238/...mp3?vuutv=...`），
+ * 过一阵就失效：GMF 打开流时拿到 403（日志 `Invalid HTTP stream, status code = 403`
+ * → `esp_gmf_io_open failed` → `player error state`）。这种失败**不该跳歌**，
+ * 重新解析一次地址就能接着放 —— 见 online_url_refresh()。
+ * 起播成功或换了歌就清零；每首最多重刷 ONLINE_URL_RETRY_MAX 次，防止死循环。
+ */
+#define ONLINE_URL_RETRY_MAX  2
+static int     s_url_retry;
+
+/*
+ * 在线"断点续播"的目标位置（ms）。
+ *
+ * 起因（2026-10 用户报：CDN 把长连接 reset 之后**卡住、甚至没声音**）：
+ * 在线流中断后我们的补课手段是 online_url_refresh()（重新解析地址再放），
+ * 但以前它是**从头放**的 —— 用户听了 40 秒的歌，一出错就回到 0 秒重来。
+ * 现在刷新前把当前位置记在这里，起播后由 tick 调 audio_service_seek_ms()
+ * 定位回去（走的是同一套"时间 → 字节"机制，见 §11.4 的 seek 表）。
+ *
+ * 生命周期：点歌 / 切歌 / 切回本地时清零（那是真的换曲，不该续播）；
+ * 刷新链路（online_url_refresh → s_on_ready → start_track_online_at）**保留**它。
+ */
+static uint32_t s_on_resume_ms;
+static int      s_on_resume_wait;     /* 等"总长 + 时长"就绪的 tick 计数，超时放弃 */
+
+/*
+ * "提前结束"的续播次数（每首最多 EARLY_EOF_RETRY_MAX 次）。
+ *
+ * 为什么需要它：TCP 被 reset 后 GMF 有可能把"读不到数据"当成整体结束
+ * （IO 报 is_done），于是 done 会在歌只放了一小半时就到 —— 这不是正常放完。
+ * 此时应该重刷地址 + 断点续播，而不是跳下一首。但要防"每次都断在同一处"的死循环，
+ * 所以单独计数、且**只在真的换曲时清零**（不能跟着 s_url_retry 一起在"放了 3 秒"后清零，
+ * 否则每轮都会把额度补满，等于没有上限）。
+ */
+#define EARLY_EOF_RETRY_MAX   3
+static int      s_eof_retry;
 
 /*
  * 丢弃"已下载好、还没起播"的在线结果（封面/歌词缓冲也一并释放）。
@@ -281,13 +323,59 @@ static void cover_reap(void);
 static void cover_kick(void);
 static void online_prepare_kick(void);
 static void set_buffering_hint(void);
+/* 把提示行刷成"缓冲中 <速度> · <pct>%"（速度来自 GMF 的下载统计） */
+static void buf_hint_text(void);
 /* 正在显示"缓冲中"提示（tick_cb 里刷百分比、出声后撤掉） */
 static bool s_buf_show;
+/* 这次"缓冲中"是拖动定位引起的（出声后打一行落点日志，便于核对 seek 准不准） */
+static bool s_seek_buf_pending;
+/*
+ * 拖动定位之后等"落点核对"回报的重试计数（0 = 不等）。
+ * 见 audio_service_seek_landing_ms()：服务端没按我们要的 Range 给数据时，要把进度/歌词
+ * 对齐到真实落点，否则声音和进度条会一直差着一截。
+ */
+static int  s_seek_landing_wait;
 static void start_track_online_at(int idx, const char *uri);
 /* 在线切歌的"界面先行"：先把播放器页切成目标歌曲（见实现处的说明） */
 static void online_switch_ui_to(int idx);
+/* 播放地址过期（403）→ 重新解析一次再放（定义在在线曲目那一段） */
+static bool online_url_refresh(void);
 
 /* ------------------------------------------------------------------ 播放模式 */
+
+/*
+ * 播放来源徽标（需求：播放器页要**显式**说明现在放的是本地还是在线）。
+ *
+ * 在线曲目和本地曲目的体验差别很大（在线要缓冲、地址会过期、拖动定位受限），
+ * 光看标题看不出来源。这里在标题**上方**放一个小药丸：
+ *   在线播放 → 强调色底 + 深色字（显眼）
+ *   本地播放 → 灰底 + 暗字（安静）
+ *
+ * 为什么单独一行而不是挤进标题行：标题是整宽的 LONG_SCROLL_CIRCULAR label，
+ * 同一行放别的对象会把它的滚动宽度吃掉。
+ */
+static lv_obj_t *s_p_src_badge;      /* 来源药丸 */
+static int       s_src_badge_state = -1;   /* 上次画的状态（-1=还没画过，见 apply_src_badge） */
+
+static void apply_src_badge(void)
+{
+    if (!s_p_src_badge) {
+        return;
+    }
+    if (s_src_badge_state == (int)s_on_mode) {
+        return;                      /* 没变就别每 tick 重设样式 */
+    }
+    s_src_badge_state = (int)s_on_mode;
+    if (s_on_mode) {
+        lv_label_set_text(s_p_src_badge, "在线播放");
+        lv_obj_set_style_bg_color(s_p_src_badge, UI_COLOR_ACCENT, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_p_src_badge, lv_color_hex(0x14141A), LV_PART_MAIN);
+    } else {
+        lv_label_set_text(s_p_src_badge, "本地播放");
+        lv_obj_set_style_bg_color(s_p_src_badge, UI_COLOR_PILL, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_p_src_badge, UI_COLOR_FG_DIM, LV_PART_MAIN);
+    }
+}
 
 typedef enum {
     PLAY_MODE_LIST = 0,   /* 列表循环（默认）：顺序放完一轮再从第一首开始 */
@@ -336,14 +424,31 @@ static void apply_play_mode_ui(void)
     }
 }
 
-/* 点击循环模式按钮：列表循环 → 单曲循环 → 随机循环 → 列表循环 */
+/* 点击循环模式按钮：列表循环 → 单曲循环 → 随机循环 → 列表循环
+ * ★ 在线队列**不允许随机循环**：在线每换一首都要重新解析地址（还会重新缓冲），
+ *   随机在在线歌单上没有意义，而且用户报过"在线循环模式失效"（见 tick 里换曲那段）。
+ *   所以在线时这个按钮只在 列表循环 ↔ 单曲循环 之间切；想切到随机就挡下来并说明原因，
+ *   别让按钮"看着能切、切了没反应"。 */
 static void on_mode_click(lv_event_t *e)
 {
     (void)e;
     switch (s_play_mode) {
-    case PLAY_MODE_LIST:    s_play_mode = PLAY_MODE_ONE;     break;
-    case PLAY_MODE_ONE:     s_play_mode = PLAY_MODE_SHUFFLE; break;
-    default:                s_play_mode = PLAY_MODE_LIST;    break;
+    case PLAY_MODE_LIST:
+        s_play_mode = PLAY_MODE_ONE;
+        break;
+    case PLAY_MODE_ONE:
+        if (s_on_mode) {
+            s_play_mode = PLAY_MODE_LIST;
+            apply_play_mode_ui();
+            ui_toast("在线播放不支持随机循环", 1500);
+            ESP_LOGI(TAG, "play mode: shuffle blocked on online queue -> %s", play_mode_name());
+            return;
+        }
+        s_play_mode = PLAY_MODE_SHUFFLE;
+        break;
+    default:                        /* SHUFFLE（只可能来自本地）→ 回到列表循环 */
+        s_play_mode = PLAY_MODE_LIST;
+        break;
     }
     apply_play_mode_ui();
     ui_toast(play_mode_name(), 1200);
@@ -400,6 +505,11 @@ static void start_track_at(int idx, uint32_t resume_ms)
      * s_on_songs 置空 + 把托管的旧队列放掉：本地播放不会再引用它，
      * 而 app_online 那边已经不再持有这块内存（所有权在本模块）。 */
     s_on_mode     = false;
+    s_url_retry   = 0;             /* 切回本地：在线那套计数清掉 */
+    s_on_resume_ms = 0;            /* 切回本地：不带着在线的断点走 */
+    s_eof_retry    = 0;
+    apply_src_badge();             /* 徽标切回"本地播放"（此刻 s_on_mode 已是 false） */
+    apply_play_mode_ui();          /* 本地才可能用到随机循环，图标跟着模式走 */
     online_discard_ready();
     s_on_songs    = NULL;
     s_on_count    = 0;
@@ -440,6 +550,7 @@ static void start_track_at(int idx, uint32_t resume_ms)
         update_lyric_highlight();
     }
     s_buf_show = false;    /* 本地文件：立刻出声，不要"缓冲中"提示 */
+    s_seek_buf_pending = false;
 
     /* 封面：先退回占位（别把上一首的封面留在屏上），再交给工作线程解 */
     cover_show(NULL, 0, 0);
@@ -486,17 +597,20 @@ static void play_next(int dir)
         int idx = s_index;
         if (idx < 0) {
             idx = 0;
-        } else if (s_play_mode == PLAY_MODE_SHUFFLE && s_on_count > 1) {
-            int r = idx;
-            while (r == idx) {
-                r = (int)(esp_random() % (uint32_t)s_on_count);
-            }
-            idx = r;
         } else {
+            /*
+             * 在线**只做顺序**（dir=+1 下一首 / -1 上一首 / 0 重放当前这首）。
+             * 随机循环在在线队列上是被禁掉的（见 on_mode_click 与
+             * app_music_play_online 的兜底），所以这里不再有随机分支 ——
+             * 留着反而容易让人以为"在线也支持随机"。
+             */
             idx = (idx + dir + (int)s_on_count) % (int)s_on_count;
         }
         s_index = idx;               /* 目标歌先记上：界面/状态立刻指向它 */
         s_on_seq++;
+        s_url_retry = 0;             /* 换了一首：地址重刷次数从头算 */
+        s_on_resume_ms = 0;          /* 换曲不续播（只有"同一首被掐断"才用断点） */
+        s_eof_retry    = 0;
         online_discard_ready();      /* 清掉还没起播的旧结果（缓冲一并释放） */
         s_on_failed = false;
         s_on_req = idx;
@@ -584,11 +698,39 @@ static void on_volume(lv_event_t *e)
 
 /* ------------------------------------------------------------------ 进度条定位 */
 
-/* MP4/M4A 是随机访问容器：按字节 seek 后解码器对不上帧，直接不给拖 */
+/*
+ * 按字节 seek 之后"解码器能不能自己重新对上帧"决定了这个容器能不能拖。
+ *
+ *   MP3 / AAC / TS / FLAC —— 帧头自带同步码，从中间接上就行
+ *       （FLAC 的 STREAMINFO 解码器在打开时已经拿到，中途 seek 不需要重读）；
+ *   MP4 / M4A —— 必须有 moov 里的 sample table 才能解释字节流，按字节跳过去就是杂音；
+ *   OGG / Opus —— 每个逻辑流开头有 codec setup 头，中途接上解不出来。
+ *
+ * ⚠ 名单以外一律"允许拖"：错了顶多听起来对不上，而挡住一个本来能拖的格式
+ *   会直接废掉功能。要改名单先在真机上试一遍。
+ */
 static bool track_seek_unsupported(const char *path)
 {
-    const char *dot = path ? strrchr(path, '.') : NULL;
-    return dot && (strcasecmp(dot, ".m4a") == 0);
+    if (!path) {
+        return false;
+    }
+    /* 在线流地址带签名查询串（...mp3?vuutv=...），认扩展名时先把它排除掉；
+     * 再看**文件名部分**的最后一个点，避免把目录里的点当成扩展名 */
+    const char *q    = strchr(path, '?');
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    const char *dot = NULL;
+    for (const char *p = base; *p && (!q || p < q); ++p) {
+        if (*p == '.') {
+            dot = p;
+        }
+    }
+    if (!dot) {
+        return false;
+    }
+    return strncasecmp(dot, ".m4a", 4) == 0 || strncasecmp(dot, ".mp4", 4) == 0 ||
+           strncasecmp(dot, ".ogg", 4) == 0 || strncasecmp(dot, ".oga", 4) == 0 ||
+           strncasecmp(dot, ".opus", 5) == 0;
 }
 
 /* 触点 x 在抓取区里的比例 → 千分比（0~1000） */
@@ -672,20 +814,59 @@ static void on_seek_release(lv_event_t *e)
     const int32_t permille = seek_pointer_permille();
     const uint32_t target  = (uint32_t)((uint64_t)permille * s_dur_ms / 1000ULL);
 
-    const track_t *t = s_on_mode ? NULL : storage_service_track((size_t)s_index);
-    if (t && track_seek_unsupported(t->path)) {
-        ui_toast("M4A 暂不支持拖动定位", 2000);
+    /*
+     * 两道关都要给用户一句解释 —— 进度条是"活的"（拇指跟手），要是拖完什么都不发生，
+     * 用户只会以为界面卡了（2026-10 用户报的原话就是"点了没反应"）。
+     *   1) 容器：MP4/M4A/OGG 这类要索引/setup 头的格式，按字节跳过去解码器对不上帧；
+     *   2) 位置算不算得出来：本地要有 probe 到的平均码率，在线要有"总字节 + 时长"。
+     */
+    if (track_seek_unsupported(s_track_path)) {
+        ui_toast("这个格式不支持拖动定位", 2000);
         return;
     }
-    if (audio_service_seek_ms(target) != ESP_OK) {
-        ui_toast("定位失败：码率未知或格式不支持", 1800);
+    if (!audio_service_seek_supported()) {
+        ui_toast("定位失败：码率未知", 1800);
         return;
     }
 
-    /* 位置本来靠墙钟累计，定位成功后要对齐过去，否则下一次 tick 会把进度拉回原处 */
-    s_elapsed_ms = target;
-    /* 进度记忆跟着用户的手动定位走（落盘由 play_state 防抖合并） */
-    if (s_track_path[0]) {
+    /*
+     * 在线流式：长距离拖动会关掉 HTTP 连接、带 Range 头重开，得重新缓冲几百毫秒起。
+     * 先挂上"缓冲中"提示（tick 按 audio_service_output_active() 撤掉 ——
+     * audio_service_seek_ms() 内部已经把出声标志清零，所以它表示"seek 之后又出声了"）。
+     * 暂停状态下不挂：那时不会有 PCM 出来，提示会永远留在屏上。
+     */
+    const bool streamed = (s_on_mode && !s_on_stream_local);
+    if (streamed && audio_service_is_playing()) {
+        set_buffering_hint();
+        s_seek_buf_pending = true;      /* 出声后打一行落点，便于对日志核对 */
+    }
+
+    if (audio_service_seek_ms(target) != ESP_OK) {
+        ui_toast("定位失败：码率未知或格式不支持", 1800);
+        s_seek_buf_pending = false;
+        return;
+    }
+
+    /*
+     * 落点核对：服务端少数情况下会忽略 Range（或按别的范围给），这时"实际听到的位置"
+     * 和请求的时间点会差很多。服务在 seek 后第一块 PCM 出来时按字节反推真实位置，
+     * 这里等它回报（最多 5 秒 ≈ 10 个 tick，超时就不管了）。
+     */
+    s_seek_landing_wait = streamed ? 10 : 0;
+
+    /*
+     * 定位期间的两个"重新计数"：
+     *   - s_stall_kicks/s_stall_ticks：卡死看门狗只盯在线流（"声称在播但没有 PCM"），
+     *     而重新缓冲正好就是这段特征 —— 不重置的话它会在 10 秒后去 pause/resume，
+     *     把正在缓冲的 seek 又搅一次；
+     *   - s_elapsed_ms：本来靠墙钟累计，要对齐到请求的位置，否则下一次 tick 拉回原处。
+     */
+    s_stall_kicks = 0;
+    s_stall_ticks = 0;
+    s_elapsed_ms  = target;
+    /* 进度记忆跟着用户的手动定位走（落盘由 play_state 防抖合并）。
+     * 在线流地址是带时效签名的，存下来没意义（和起播路径的判断保持一致）。 */
+    if (s_track_path[0] && !streamed) {
         save_progress(target);
     }
     if (s_p_seek) {
@@ -1118,6 +1299,10 @@ static void tick_cb(lv_timer_t *t)
 {
     (void)t;
 
+    /* 来源徽标（本地/在线）：内部有"值没变就直接返回"的判断，每 tick 调也不花钱。
+     * 放在最前面：切歌、切队列的路径很多，靠这一处兜住最稳。 */
+    apply_src_badge();
+
     /* 在线曲目：下载完成 → 起播；失败 → 提示（都在 LVGL 任务里处理） */
     if (s_on_ready) {
         const int idx = s_on_ready_idx;
@@ -1138,6 +1323,7 @@ static void tick_cb(lv_timer_t *t)
         /* 缓冲提示不能留在屏上：把歌词区恢复成 歌词 / 暂无歌词
          * （s_buf_show 也要清掉，否则下一个 tick 又把"缓冲中…"写回去） */
         s_buf_show = false;
+        s_seek_buf_pending = false;
         lyric_apply_mode();
     }
     /* 注：原先这里会"顺手预取下一首的封面/歌词"，但它会占住唯一的准备槽位，
@@ -1157,15 +1343,48 @@ static void tick_cb(lv_timer_t *t)
      *   服务端分块传输（没有 Content-Length）时 stream_progress() 返回 false，
      *   那就保持 set_buffering_hint() 写的那句"缓冲中，请稍后..."。
      */
+    /*
+     * 拖动定位的落点核对（见 on_seek_release 里的说明）：
+     * 服务在 seek 后第一块 PCM 出来时回报"按字节反推的真实时间点"。和请求值差得明显
+     * （> 3 s，说明服务端没按 Range 给数据）就把进度与歌词对齐过去 —— 否则用户听到的
+     * 位置和界面显示会一直差着一截，而且拖一次差一次。
+     */
+    if (s_seek_landing_wait > 0) {
+        uint32_t land = 0;
+        if (audio_service_seek_landing_ms(&land)) {
+            s_seek_landing_wait = 0;
+            const int32_t diff = (int32_t)land - (int32_t)s_elapsed_ms;
+            if (diff > 3000 || diff < -3000) {
+                ESP_LOGW(TAG, "seek landing off by %d ms (asked %u, got %u), realign",
+                         (int)diff, (unsigned)s_elapsed_ms, (unsigned)land);
+                s_elapsed_ms = land;
+                lyric_resync();
+            }
+        } else {
+            s_seek_landing_wait--;      /* 还没出声/拿不到位置：下个 tick 再看 */
+        }
+    }
+
     if (s_buf_show) {
         if (audio_service_output_active()) {
             s_buf_show = false;
+            /*
+             * 拖动定位引起的这次缓冲结束了：打一行落点，用来核对 seek 准不准
+             * （百分比是"IO 已读到的位置 / 文件总长"，跟请求的时间点大致对应）。
+             * 命中 GMF 环形缓冲的瞬移不打印（那种情况下一个 tick 就出声了，也没意义）。
+             */
+            if (s_seek_buf_pending) {
+                s_seek_buf_pending = false;
+                int pct = -1;
+                if (audio_service_stream_progress(&pct)) {
+                    ESP_LOGI(TAG, "seek rebuffered, stream at %d%%", pct);
+                } else {
+                    ESP_LOGI(TAG, "seek rebuffered");
+                }
+            }
             lyric_apply_mode();          /* 出声了：说明行交回 歌词 / 暂无歌词 */
         } else if (s_p_lyric_hint) {
-            int pct = 0;
-            if (audio_service_stream_progress(&pct)) {
-                lv_label_set_text_fmt(s_p_lyric_hint, "缓冲中… %d%%", pct);
-            }
+            buf_hint_text();             /* 缓冲中 <速度> · <pct>%（速度是活的） */
         }
     }
 
@@ -1182,29 +1401,90 @@ static void tick_cb(lv_timer_t *t)
     s_advance_req = false;
 
     if (err) {
-        s_fail_streak++;
-        if (s_fail_streak >= 3) {
-            ui_toast("连续几首都放不了，先停下", 2200);
-            done = false;
-            s_index = -1;
+        /*
+         * 在线流媒体：**先怀疑播放地址过期**（网易云 URL 带时间戳 + 签名，放一阵就 403，
+         * 日志 `ESP_GMF_HTTP: Invalid HTTP stream, status code = 403`）。这时重新解析一次
+         * 地址接着放，而不是把这首歌当"放不了"跳过去 —— 用户点回来听同一首是很自然的操作。
+         * 刷新后仍然失败（或已经刷够次数）才走下面的"这首放不了，已跳过"。
+         */
+        if (online_url_refresh()) {
+            err  = false;
+            done = false;             /* 别顺着 s_advance_req 跳下一首 */
         } else {
-            ui_toast("这首放不了，已跳过", 1600);
+            s_fail_streak++;
+            if (s_fail_streak >= 3) {
+                ui_toast("连续几首都放不了，先停下", 2200);
+                done = false;
+                s_index = -1;
+            } else {
+                ui_toast("这首放不了，已跳过", 1600);
+            }
         }
     }
-    /* 真的播起来一会儿才算这首没问题，清掉失败计数（否则一首坏文件会一直跳） */
+    /* 真的播起来一会儿才算这首没问题，清掉失败计数与地址重刷计数
+     * （否则一首坏文件会一直跳；而"重刷过"的账也要在放成功之后销掉） */
     if (s_playing && s_elapsed_ms > 3000) {
         s_fail_streak = 0;
+        s_url_retry   = 0;
     }
-    if (done && storage_service_count() > 0) {
-        if (s_play_mode == PLAY_MODE_ONE && s_index >= 0) {
-            /* 单曲循环：同一首从头再放（坏文件由上面的 fail_streak 兜住，
-             * 连续失败 3 次会把 done 置假并停下，不会死循环） */
-            start_track(s_index);
-        } else if (storage_service_count() > 1) {
-            play_next(+1);
+    /*
+     * ★ 播放结束 → 按模式决定下一首。
+     *
+     * ⚠ 这一块必须**在线/本地分开**（2026-10 用户报"在线单曲循环失效"）：
+     *   以前只有"本地"那一套逻辑，于是
+     *     - 在线 + 单曲循环会去调**本地**的 start_track()：那首根本不在本地库里，
+     *       要么报"曲目不存在"、要么拿同下标的**本地曲目**顶上 —— 就是"单曲循环失效"；
+     *     - 整块还被 `storage_service_count() > 0` 挡着：没插卡 / 本地为空时
+     *       storage_service_count()==0，在线歌放完**停住不续播**。
+     *   现在：在线队列走 play_next()（它认识在线队列，会重新解析地址 → 起播）。
+     */
+    if (done) {
+        const bool   on_queue   = (s_on_mode && s_on_songs && s_on_count > 0);
+        const bool   repeat_one = (s_play_mode == PLAY_MODE_ONE && s_index >= 0);
+        const size_t local_n    = storage_service_count();
+
+        /*
+         * ★ "提前结束" ≠ 放完（2026-10 用户报：连接被 reset 后卡住/没声音）。
+         *
+         * TCP 被 reset 之后，GMF 有可能把"读不到数据"当成整体结束（IO 报 is_done），
+         * 于是 done 在歌只放了一小半时就到了 —— 这时**跳下一首是错的**（用户听到的
+         * 是"歌没放完就切了"），正确做法是重刷地址 + 从断点续播。
+         * 判据：知道总时长，而当前进度明显短于它（>15 s 的缺口）。
+         * 单独的 s_eof_retry 上限防"每次都断在同一处"的死循环：额度只在真换曲时清零。
+         */
+        if (on_queue && s_dur_ms > 30000 && (s_elapsed_ms + 15000) < s_dur_ms) {
+            if (s_eof_retry < EARLY_EOF_RETRY_MAX) {
+                s_eof_retry++;
+                ESP_LOGW(TAG, "online stream ended early (%u/%u ms), refresh + resume (try %d/%d)",
+                         (unsigned)s_elapsed_ms, (unsigned)s_dur_ms,
+                         s_eof_retry, EARLY_EOF_RETRY_MAX);
+                if (online_url_refresh()) {   /* 内部会把 s_elapsed_ms 记成续播点 */
+                    done = false;
+                }
+            } else {
+                ESP_LOGW(TAG, "online stream keeps ending early, give up and advance");
+                s_eof_retry = 0;
+            }
         }
-    } else if (done && s_fail_streak >= 3) {
-        s_fail_streak = 0;
+
+        if (done) {
+            if (repeat_one) {
+                if (on_queue) {
+                    /* 同一首重新走一遍"解析地址 → 起播"：play_next(0) 就是它。
+                     * 顺带把可能已经过期的签名地址换成新的（见 online_url_refresh）。 */
+                    ESP_LOGI(TAG, "online repeat-one: replay idx=%d", s_index);
+                    play_next(0);
+                } else {
+                    /* 本地：同一首从头再放（坏文件由上面的 fail_streak 兜住，
+                     * 连续失败 3 次会把 done 置假并停下，不会死循环） */
+                    start_track(s_index);
+                }
+            } else if (on_queue ? (s_on_count > 1) : (local_n > 1)) {
+                play_next(+1);
+            } else if (s_fail_streak >= 3) {
+                s_fail_streak = 0;
+            }
+        }
     }
 
     /*
@@ -1215,16 +1495,48 @@ static void tick_cb(lv_timer_t *t)
      * 也没人重试，用户看到的就是"卡住不动"。
      *
      * 这里用最可靠的判据盯它：**"声称在播"但"连续 N 秒没有 PCM 输出"**。
-     *   - 只看在线曲目（本地文件不会这样卡，卡了也该报错而不是重试）；
-     *   - 缓冲突发（起播/切歌那几秒）本来就 output_active=false，所以阈值给 10 s；
+     *   - 在线与**本地**都盯（2026-10 补：本地也会卡 —— 见下面 !s_on_mode 分支的说明）；
+     *   - 缓冲突发（起播/切歌那几秒）本来就 output_active=false，所以阈值给 20 s；
      *   - 触发后**踢一下管线**：暂停再恢复（等价于重新拉起 IO），必要时再补一次
      *     seek 到当前进度 —— 实测能把卡住的 HTTP 读唤醒；
      *   - 每首最多踢 3 次，之后只打日志（不无限折腾），日志里带上下载进度便于定位。
      */
-    if (s_on_mode && audio_service_is_playing() && !audio_service_output_active()) {
-        if (++s_stall_ticks >= STALL_TICKS) {
+    /*
+     * 阈值分两种：在线流重新缓冲可能真的要十几秒（所以 20 s），
+     * 而**本地文件**第一条 PCM 最多等 2~3 秒（SD 读 + 解第一帧）——
+     * 8 s 没声音就是文件解不出来，早点跳过少让用户干等。
+     */
+    const int stall_limit = s_on_mode ? STALL_TICKS : LOCAL_STALL_TICKS;
+    if (audio_service_is_playing() && !audio_service_output_active()) {
+        if (++s_stall_ticks >= stall_limit) {
             s_stall_ticks = 0;
-            if (s_stall_kicks < STALL_KICK_MAX) {
+            if (!s_on_mode) {
+                /*
+                 * ★ 本地文件也一样会"卡死"（2026-10 用户报：某 FLAC 反复
+                 *   `AUD_Dec_Parse: Not found frame in max frame size 3635`，
+                 *   解码器**一帧都吐不出来**，但管线状态仍是 RUNNING ——
+                 *   界面看着"在播"、没有任何声音、日志还一直刷屏）。
+                 *   SD 读很快，这么久没 PCM 只能是这个文件解不出来 → 当"放不了"跳过，
+                 *   别无限耗着（以前这里只听在线流，本地这种情况**永远没人管**）。
+                 *   注意用 play_next() 而不是 s_advance_req：后者在单曲循环下会把
+                 *   同一个坏文件再放一遍，等于死循环。
+                 */
+                s_fail_streak++;
+                ESP_LOGW(TAG, "local file no PCM for %u s (fail streak %d), skip it",
+                         (unsigned)(LOCAL_STALL_TICKS * TICK_MS / 1000), s_fail_streak);
+                if (s_fail_streak >= 3) {
+                    s_fail_streak = 0;
+                    ui_toast("连续几个文件都放不了，先停下", 2200);
+                    audio_service_stop();
+                    s_playing = false;
+                    if (s_p_btn) {
+                        lv_label_set_text(lv_obj_get_child(s_p_btn, 0), LV_SYMBOL_PLAY);
+                    }
+                } else {
+                    ui_toast("这个文件解不出来，已跳过", 1800);
+                    play_next(+1);
+                }
+            } else if (s_stall_kicks < STALL_KICK_MAX) {
                 s_stall_kicks++;
                 int pct = -1;
                 audio_service_stream_progress(&pct);
@@ -1234,10 +1546,33 @@ static void tick_cb(lv_timer_t *t)
                 if (audio_service_resume() != ESP_OK) {
                     audio_service_seek_ms(s_elapsed_ms);   /* resume 不回来就重定位一次 */
                 }
+                /*
+                 * ★ 兜底：pause 成功而 resume 失败时，管线会**停在 PAUSED** ——
+                 *   现象就是"卡一下之后彻底没声音"，而且看门狗只盯"声称在播"的流
+                 *   （is_playing() 为假就不再进这个分支），于是**再也没人来救**。
+                 *   所以踢完不管走哪条路，最后都确认它真的在跑。
+                 */
+                if (!audio_service_is_playing()) {
+                    ESP_LOGW(TAG, "stream stall: player not running after kick, force resume");
+                    audio_service_resume();
+                }
             } else {
-                ESP_LOGW(TAG, "stream stall: 已重试 %d 次仍无输出（网络/服务端问题）",
+                /*
+                 * ★ 踢了 STALL_KICK_MAX 次还是没有 PCM：pause/resume 已经救不回来了。
+                 *   最可能的原因是**播放地址失效 / 连接被服务端彻底掐死**（GMF 此时
+                 *   既不出错也不返回，所以 app 那套错误处理永远收不到事件 —— 这也是
+                 *   用户看到"彻底没声音"的原因）。
+                 *   这里主动升级成"重刷地址 + 断点续播"：地址过期会被顺手修掉，
+                 *   没过期也能靠 seek 关掉旧连接、带 Range 重开一条。
+                 */
+                ESP_LOGW(TAG, "stream stall: 已重试 %d 次仍无输出，升级为重刷地址 + 断点续播",
                          STALL_KICK_MAX);
-                s_stall_kicks = 0;                          /* 下个 10 s 再来一轮 */
+                s_stall_kicks = 0;                          /* 下一轮重新计数 */
+                if (!online_url_refresh()) {
+                    /* 刷新额度也用完了：交给错误处理（换下一首 / 连续失败后停下） */
+                    ESP_LOGW(TAG, "stream stall: refresh gave up, report as error");
+                    s_err_req = true;
+                }
             }
         }
     } else {
@@ -1263,6 +1598,42 @@ static void tick_cb(lv_timer_t *t)
     s_playing = audio_service_is_playing();
 
     /*
+     * ★ 在线"断点续播"（2026-10 用户报：CDN 掐断长连接后卡住/没声音）。
+     *
+     * online_url_refresh() 只是重新解析地址，起播是从 0 开始的；真正的续播在这里：
+     * 等"总长（Content-Length）+ 时长"都就绪（audio_service_seek_supported()），
+     * 再调 seek_ms() 定位回断点 —— 它内部会重新算字节、清 PCM 基准、挂落点核对，
+     * 所以进度条/歌词会跟着对齐（见 §11.4）。
+     *
+     * 与下面本地续播（s_resume_ms）分开写：本地那条依赖 info.bitrate > 0，
+     * 而在线流的 MUSIC_INFO 码率恒为 0，走它只会超时放弃。
+     */
+    if (s_on_resume_ms > 0 && s_on_mode && s_playing) {
+        if (audio_service_seek_supported()) {
+            const uint32_t target = s_on_resume_ms;
+            s_on_resume_ms = 0;
+            if (audio_service_seek_ms(target) == ESP_OK) {
+                s_elapsed_ms = target;      /* seek 成功：时间轴先按目标对齐，落点核对会再纠 */
+                s_seek_buf_pending = !audio_service_output_active();
+                s_stall_kicks = 0;          /* 重新缓冲期间别让看门狗误判 */
+                s_stall_ticks = 0;
+                lyric_resync();
+                ESP_LOGI(TAG, "online resume at %u ms after URL refresh", (unsigned)target);
+            } else {
+                ESP_LOGW(TAG, "online resume seek failed, continue from 0");
+            }
+        } else if (++s_on_resume_wait > RESUME_WAIT_MAX_TICKS) {
+            /* 总长/时长一直没就绪（或服务端没给 Content-Length）：放弃续播，从头放 */
+            s_on_resume_ms = 0;
+            s_elapsed_ms   = 0;
+            ESP_LOGW(TAG, "online resume: not ready after %d ticks, start from 0",
+                     RESUME_WAIT_MAX_TICKS);
+        }
+    } else if (!s_on_mode) {
+        s_on_resume_wait = 0;
+    }
+
+    /*
      * 进度记忆（需求）：从"上次听到的位置"续播。
      *
      * 为什么放在这里而不是 start_track_at()：按字节定位需要平均码率，
@@ -1273,10 +1644,10 @@ static void tick_cb(lv_timer_t *t)
     if (s_resume_ms > 0 && s_playing && s_track_path[0]) {
         const uint32_t target = s_resume_ms;
         if (track_seek_unsupported(s_track_path)) {
-            /* M4A 是随机访问容器，按字节 seek 后解码器对不上帧 → 只能从头放 */
+            /* 随机访问容器（M4A/OGG…）按字节 seek 后解码器对不上帧 → 只能从头放 */
             s_resume_ms  = 0;
             s_elapsed_ms = 0;
-            ESP_LOGW(TAG, "resume unsupported for m4a, start from 0");
+            ESP_LOGW(TAG, "resume unsupported for this container, start from 0");
         } else {
             audio_info_t info;
             const bool info_ok = audio_service_get_info(&info) && info.bitrate > 0;
@@ -1394,7 +1765,10 @@ static void player_on_delete(lv_event_t *e)
     s_p_seek = s_p_seek_hit = s_p_btn = NULL;
     s_p_cover_box = s_p_cover_img = NULL;
     s_p_lyric_box = s_p_lyric_hint = s_p_lyric_col = NULL;
+    s_p_hint_row = s_p_buf_spin = NULL;
     s_p_mode_btn = s_p_mode_badge = NULL;
+    s_p_src_badge = NULL;
+    s_src_badge_state = -1;         /* 下次建页面要重新画一次 */
     s_lyric_mode = false;
     s_seeking    = false;
     s_p_lyric_n  = 0;
@@ -1667,6 +2041,69 @@ static void online_prepare_task(void *arg)
 }
 
 /*
+ * 播放地址过期 → 重新解析一次地址（LVGL 任务上下文，从 tick_cb 里调）。
+ *
+ * 网易云给的流地址带时间戳和签名（`.../20261010132238/....mp3?vuutv=...`），
+ * 放一阵或过一会儿再点回来就 403：
+ *   I ESP_GMF_HTTP: The total size is 150 bytes
+ *   E ESP_GMF_HTTP: Invalid HTTP stream, status code = 403
+ *   E ESP_GMF_IO: esp_gmf_io_open failed
+ *   E audio_svc: player error state
+ * 到 app 这一层只剩一个 AUDIO_EVT_ERROR（**拿不到状态码**），所以策略是：
+ * 在线流媒体只要出错，先重刷一次地址再放 —— 刷新后仍然失败才按"这首放不了"跳过。
+ *
+ * 复用点歌那条准备链路（解析 302 → 封面/歌词 → s_on_ready → tick 起播）：
+ * 封面/歌词在 online_service 里本来就按歌缓存，重刷基本只花解析 URL 的时间。
+ *
+ * 返回 true = 已经发起刷新（调用方**不要**跳下一首，等 s_on_ready 重放这首）。
+ */
+static bool online_url_refresh(void)
+{
+    if (!s_on_mode || !s_on_songs || s_index < 0 || (size_t)s_index >= s_on_count) {
+        return false;                       /* 本地曲目/没有在线队列：维持原行为 */
+    }
+    if (s_on_busy) {
+        /*
+         * 已经有一次解析在跑（多半是用户刚点了别的歌、失败的那首是旧的）：
+         * 等它的结果就行，既不叠一个请求、也**别把当前这首当成"放不了"跳掉**。
+         * 返回 true 只是告诉调用方"不要 advance"，不重复弹提示。
+         */
+        ESP_LOGI(TAG, "online player error while preparing: keep waiting");
+        return true;
+    }
+    if (s_url_retry >= ONLINE_URL_RETRY_MAX) {
+        ESP_LOGW(TAG, "online url refresh gave up (tried %d)", s_url_retry);
+        return false;
+    }
+    s_url_retry++;
+    /*
+     * ★ 记住"从哪儿断的"：刷新成功后由 tick 定位回去（s_on_resume_ms），
+     *   别让用户听了 40 秒又被扔回 0 秒。
+     *   门槛 5 秒：刚起播就出错的话，从头放更干净（也不值得开一次 Range 重连）。
+     *   注意 s_elapsed_ms 只在**真的出声**期间累加（见 tick 里的墙钟），
+     *   卡住/无声那段时间不会让它虚涨 —— 所以它天然就是"断点"。
+     */
+    if (s_elapsed_ms > 5000) {
+        s_on_resume_ms   = s_elapsed_ms;
+        s_on_resume_wait = 0;
+    } else {
+        s_on_resume_ms = 0;
+    }
+    ESP_LOGI(TAG, "online url stale/expired (403?), refreshing (try %d/%d), resume at %u ms",
+             s_url_retry, ONLINE_URL_RETRY_MAX, (unsigned)s_on_resume_ms);
+    ui_toast("音乐链接已过期，正在刷新链接...", 2000);
+    set_buffering_hint();
+
+    /* 与点歌同一条路：旧结果作废 → 重新下单 → 工作线程解析 → ready → tick 起播 */
+    s_on_seq++;
+    online_discard_ready();
+    s_on_failed = false;
+    s_on_req    = s_index;
+    online_prepare_kick();
+    return true;
+}
+
+/*
  * 起播一首在线歌（LVGL 任务上下文）。
  * uri 可能是 https 流地址（s_on_stream）或本地缓存路径（下载兜底）：
  * audio_service_play_uri() 两种都认。
@@ -1751,6 +2188,14 @@ static void start_track_online_at(int idx, const char *uri)
         ui_toast("在线歌曲播放失败（网络或格式不支持）", 2200);
         return;
     }
+    /*
+     * ★ 告诉服务"这首多长"（在线拖动定位的前提）。
+     *
+     * 服务要靠**平均码率**把时间换成字节，而流上没有文件可探测 —— 只能用
+     * "总字节（HTTP Content-Length）× 8000 ÷ 时长"。GMF 的 MUSIC_INFO 里 duration
+     * 恒为 0，所以时长只能从这里给。**必须在 play_uri() 之后**：换曲会把上一首清掉。
+     */
+    audio_service_set_duration_ms((uint32_t)s_dur_ms);
     s_playing = true;
     if (s_p_btn) {
         lv_label_set_text(lv_obj_get_child(s_p_btn, 0), LV_SYMBOL_PAUSE);
@@ -1798,6 +2243,7 @@ static void online_switch_ui_to(int idx)
     s_elapsed_ms = 0;
     s_dur_ms     = 0;
     s_buf_show   = false;      /* 让 set_buffering_hint() 重新置位（下面调用方会调） */
+    s_seek_buf_pending = false;
     s_seeking    = false;
 
     /* 封面：先退回占位（别把上一首的封面留在屏上），就绪后再解新的 */
@@ -1829,6 +2275,21 @@ void app_music_play_online(const online_song_t *songs, size_t count, size_t idx)
     online_owned_drop();
     s_index    = (int)idx;
     s_on_seq++;
+    s_url_retry = 0;             /* 点了新歌：地址重刷次数从头算 */
+    s_on_resume_ms = 0;          /* 用户点了这一首：从头放（不续播断点） */
+    s_eof_retry    = 0;
+    /*
+     * ★ 在线队列只支持 列表循环 / 单曲循环：本地开着"随机"时切到在线要先落回列表，
+     *   否则随机在在线队列上不会生效（用户在本地设了随机、进在线却发现顺序播放，
+     *   只会以为是 bug）。这里不弹 Toast —— 紧接着的"缓冲中"Toast 会把它顶掉。
+     *   播放器页的模式图标与来源徽标会立刻反映出来，看得见。
+     */
+    if (s_play_mode == PLAY_MODE_SHUFFLE) {
+        s_play_mode = PLAY_MODE_LIST;
+        ESP_LOGI(TAG, "shuffle -> list (switch to online queue)");
+    }
+    apply_play_mode_ui();
+    apply_src_badge();
     online_discard_ready();      /* 点歌即弃：旧结果（若有）不再起播 */
     s_on_failed = false;
     s_on_req   = (int)idx;
@@ -1967,12 +2428,62 @@ static void lyric_rebuild(void)
 }
 
 /*
- * 在线歌的"解析地址 + 抓封面 + 取歌词"是异步的（实测 1~3 秒）。
- * 这段时间右栏说明行显示"缓冲中，请稍后..."，让用户看到明确的等待状态；
- * 起播时 start_track_online_at() 会走 lyric_rebuild() → lyric_apply_mode()
- * 把它恢复成 歌词 / 暂无歌词。
+ * 缓冲提示文字（需求："缓冲中 20 KB/s" + 一个转圈，别让用户以为卡死）。
  *
- * 置 s_buf_show 之后，tick_cb 会把它刷成"缓冲中… xx%"（在线流式的下载进度），
+ * 速度来自 GMF 的下载统计（`audio_service_stream_speed()`，单位 **Kbps**），
+ * 这里 **÷8 换成 KB/s** —— 单位千万别混：320 kbps 的流按 Kbps 印成 "320 KB/s" 会差 8 倍。
+ * 10 KB/s 以下给一位小数（慢速网络下 0 与 1 KB/s 的区别看得出来）。
+ *
+ * 总长已知时把百分比接在后面（"缓冲中 20 KB/s · 45%"）：百分比来自
+ * audio_service_stream_progress()，拿不到就不显示（分块传输 / 未知长度）。
+ */
+static void buf_hint_text(void)
+{
+    if (!s_p_lyric_hint) {
+        return;
+    }
+    /*
+     * 转圈的可见性在这里一并保证（而不是只在 set_buffering_hint() 里开）：
+     * 起播流程里 start_track_online_at() → lyric_rebuild() → lyric_apply_mode()
+     * 会先把转圈藏起来，而这时 HTTP 流**才刚开始缓冲**（s_buf_show 仍为真）——
+     * 只看 set_buffering_hint() 的话，最该转圈的那一段反而没有转圈。
+     * 所以"有文字就有转圈"，两处状态由这一个函数对齐。
+     */
+    if (s_p_buf_spin) {
+        lv_obj_remove_flag(s_p_buf_spin, LV_OBJ_FLAG_HIDDEN);
+    }
+    int kbps = 0;
+    int pct  = -1;
+    const bool has_speed = audio_service_stream_speed(&kbps);
+    (void)audio_service_stream_progress(&pct);      /* 拿不到就保持 -1 */
+
+    char buf[48];
+    if (has_speed && kbps > 0) {
+        if (kbps >= 80) {                           /* ≥10 KB/s：整数就够 */
+            snprintf(buf, sizeof(buf), "缓冲中 %d KB/s", kbps / 8);
+        } else {
+            const int t = kbps * 10 / 8;            /* 0.1 KB/s 精度 */
+            snprintf(buf, sizeof(buf), "缓冲中 %d.%d KB/s", t / 10, t % 10);
+        }
+    } else {
+        snprintf(buf, sizeof(buf), "缓冲中");
+    }
+    if (pct >= 0) {
+        char full[96];
+        snprintf(full, sizeof(full), "%s · %d%%", buf, pct);
+        lv_label_set_text(s_p_lyric_hint, full);
+    } else {
+        lv_label_set_text(s_p_lyric_hint, buf);
+    }
+}
+
+/*
+ * 在线歌的"解析地址 + 抓封面 + 取歌词"是异步的（实测 1~3 秒）。
+ * 这段时间右栏说明行显示"缓冲中 <速度>"，**并且把转圈转起来**（需求：
+ * 只写一行字看着像卡死）；起播时 start_track_online_at() 会走
+ * lyric_rebuild() → lyric_apply_mode() 把它恢复成 歌词 / 暂无歌词。
+ *
+ * 置 s_buf_show 之后，tick_cb 会周期性刷新速度/百分比，
  * 并在真的出声时交回 lyric_apply_mode()。
  */
 static void set_buffering_hint(void)
@@ -1982,7 +2493,7 @@ static void set_buffering_hint(void)
     }
     s_buf_show = true;
     lv_obj_remove_flag(s_p_lyric_hint, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(s_p_lyric_hint, "缓冲中，请稍后...");
+    buf_hint_text();                    /* 首帧就有速度，并把转圈转起来 */
 }
 
 /*
@@ -1994,6 +2505,11 @@ static void lyric_apply_mode(void)
 {
     const bool has_lyric = (s_p_lyric_n > 0);
     s_lyric_mode = true;
+
+    /* 走到这里说明"缓冲中"结束了（出声 / 换曲）：把转圈藏起来 */
+    if (s_p_buf_spin) {
+        lv_obj_add_flag(s_p_buf_spin, LV_OBJ_FLAG_HIDDEN);
+    }
 
     if (s_p_lyric_hint) {
         if (has_lyric) {
@@ -2023,11 +2539,41 @@ static void build_lyric_view(lv_obj_t *parent)
     lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
     s_p_lyric_box = box;
 
-    s_p_lyric_hint = lv_label_create(box);
+    /*
+     * 提示行：[转圈] [文字]，整体在框里居中。
+     *
+     * 需求（2026-10）：缓冲时只写一行"缓冲中…"看着像卡死，要**转圈 + 速度**。
+     * 用 flex 行把两个都装进去，比绝对定位省事：转圈藏起来时（"暂无歌词"等状态）
+     * 文字自己就居中了，不需要额外调整。
+     */
+    lv_obj_t *hint_row = lv_obj_create(box);
+    lv_obj_remove_style_all(hint_row);
+    lv_obj_set_size(hint_row, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(hint_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(hint_row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(hint_row, UI_PX_W(10), LV_PART_MAIN);
+    lv_obj_remove_flag(hint_row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(hint_row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(hint_row);
+    s_p_hint_row = hint_row;
+
+    /* 转圈：lv_spinner 自带无限循环动画（LV_SPINNER_TYPE_SPINNING_ARC），不用自己起 timer。
+     * 样式与 app_online 的"载入中"一致（暗底圈 + 强调色转弧）。 */
+    s_p_buf_spin = lv_spinner_create(hint_row);
+    lv_obj_set_size(s_p_buf_spin, UI_PX_H(22), UI_PX_H(22));
+    lv_obj_set_style_arc_width(s_p_buf_spin, UI_PX_H(3), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(s_p_buf_spin, UI_PX_H(3), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(s_p_buf_spin, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(s_p_buf_spin, UI_COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(s_p_buf_spin, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_remove_flag(s_p_buf_spin, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_p_buf_spin, LV_OBJ_FLAG_HIDDEN);   /* 只有缓冲时才转 */
+
+    s_p_lyric_hint = lv_label_create(hint_row);
     lv_obj_set_style_text_font(s_p_lyric_hint, UI_FONT_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_p_lyric_hint, UI_COLOR_FG_DIM, LV_PART_MAIN);
     lv_label_set_text(s_p_lyric_hint, "轻点封面显示歌词");
-    lv_obj_center(s_p_lyric_hint);
 
     /* 歌词列：整列用 translate_y 平移让当前行居中（逐行滚动会抖） */
     s_p_lyric_col = lv_obj_create(box);
@@ -2089,6 +2635,18 @@ static lv_obj_t *page_player(void)
     /* 播放器页会被路由压栈打开（首页/本地/在线都会进这里）：返回键由
      * ui_core 的全局返回键自动叠在顶层，这里不再自己画。标题行仍按
      * UI_HEADER_TEXT_X 起排，给左侧按钮留位。 */
+
+    /* 播放来源徽标：在线播放 / 本地播放（需求：播放器页要显式说明来源）。
+     * 单独一行放在标题上方 —— 标题是整宽滚动 label，同行会挤掉它的滚动宽度。 */
+    s_p_src_badge = lv_label_create(right);
+    lv_obj_set_style_text_font(s_p_src_badge, UI_FONT_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_p_src_badge, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_p_src_badge, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_p_src_badge, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(s_p_src_badge, UI_PX_W(10), LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(s_p_src_badge, UI_PX_H(3), LV_PART_MAIN);
+    s_src_badge_state = -1;                  /* 页面刚建：强制重画一次 */
+    apply_src_badge();
 
     /* 标题与副标题用独立的 block 元素，不要塞进同一个 label 的 inline span */
     s_p_title = lv_label_create(right);
@@ -2274,6 +2832,8 @@ static fs_entry_t *s_entries;                 /* 目录条目缓冲（PSRAM，�
 static size_t    s_entries_cap;               /* s_entries 的容量（条） */
 static int        s_entry_n;                  /* 当前目录的条目总数 */
 static int        s_page;                     /* 当前页（从 0 开始） */
+static lv_timer_t *s_local_sd_timer;          /* SD 热插拔轮询（页面存活期间） */
+static uint32_t  s_local_sd_gen;              /* 上次见到的 SD 状态代次 */
 
 #define LOCAL_ROOT   "/sdcard"
 
@@ -2617,6 +3177,64 @@ static void local_page_watch(lv_event_t *e)
     (void)e;
     s_list_col  = NULL;
     s_list_hint = NULL;
+    if (s_local_sd_timer) {
+        lv_timer_delete(s_local_sd_timer);
+        s_local_sd_timer = NULL;
+    }
+}
+
+/* ------------------------------------------------------------------ SD 热插拔
+ *
+ * 板子没有卡检测脚，storage_service 里有个任务在轮询，每次插入/拔出把代次 +1。
+ * 这里只是跟着代次走：拔卡 → 列表换成"未检测到"；插卡（或换了一张卡）→
+ * 从根目录重新列一遍。**换卡必须走这一步**：不重新列的话，列表和播放队列
+ * 还是旧卡的内容（旧挂载点没释放，读到的永远是旧卡）。
+ *
+ * 提示音交给状态栏那个统一入口去弹（插卡成功时它还会报容量），这里只在
+ * "播放被拔卡打断"时补一句 —— 那件事只有播放器自己知道。
+ */
+#define LOCAL_SD_POLL_MS 500
+
+static void local_sd_apply(void)
+{
+    if (!s_list_col) {
+        return;
+    }
+
+    if (!storage_service_sd_is_mounted()) {
+        if (!s_on_mode && s_playing) {
+            audio_service_stop();
+            ui_toast("SD 卡已拔出，播放已停止", 2000);
+        }
+        s_entry_n = 0;
+        s_page    = 0;
+        snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", LOCAL_ROOT);
+        if (s_list_hint) {
+            lv_label_set_text(s_list_hint, "未检测到 SD 卡");
+        }
+        lv_obj_clean(s_list_col);
+        local_add_row("未检测到 SD 卡，插好后会自动刷新", false, false, 0, LOCAL_SEL_NONE);
+        return;
+    }
+
+    /* 插上了：回到挂载点重新列一遍（换卡也能认出来） */
+    s_page = 0;
+    snprintf(s_cur_dir, sizeof(s_cur_dir), "%s", bsp_sdcard_mount_point());
+    if (s_list_hint) {
+        lv_label_set_text(s_list_hint, "载入中…");
+    }
+    local_rebuild();
+}
+
+static void local_sd_tick(lv_timer_t *t)
+{
+    (void)t;
+    const uint32_t gen = storage_service_sd_generation();
+    if (gen == s_local_sd_gen) {
+        return;
+    }
+    s_local_sd_gen = gen;
+    local_sd_apply();
 }
 
 static lv_obj_t *page_local(void)
@@ -2664,7 +3282,13 @@ static lv_obj_t *page_local(void)
 
     lv_obj_add_event_cb(scr, local_page_watch, LV_EVENT_DELETE, NULL);
 
-    if (!bsp_sdcard_is_mounted()) {
+    /* SD 热插拔轮询：进来时有没有卡都要建 —— 页面开着的时候插卡也要能刷新 */
+    s_local_sd_gen = storage_service_sd_generation();
+    if (!s_local_sd_timer) {
+        s_local_sd_timer = lv_timer_create(local_sd_tick, LOCAL_SD_POLL_MS, NULL);
+    }
+
+    if (!storage_service_sd_is_mounted()) {
         lv_label_set_text(s_list_hint, "未检测到 SD 卡");
         local_add_row("未检测到 SD 卡，仅在线音乐可用", false, false, 0, LOCAL_SEL_NONE);
         return scr;

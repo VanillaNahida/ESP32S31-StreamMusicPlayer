@@ -53,7 +53,7 @@ function Save-Png32([System.Drawing.Bitmap]$bmp, [string]$path) {
 # ---------------------------------------------------------------- 1) 头像
 # assets/default.png 实为 JPEG（404x456）：先居中裁成正方形（避免被拉扁），
 # 再用高质量插值缩到 192x192，之后由 gen_icon.py 缩到显示尺寸。
-$srcPath = Join-Path $Root 'assets\default.png'
+$srcPath = Join-Path $Root 'assets\Seia.png'
 $src = [System.Drawing.Image]::FromFile($srcPath)
 Write-Host ("头像源 : default.png  {0}x{1}（魔数其实是 JPEG）" -f $src.Width, $src.Height)
 $side = [Math]::Min($src.Width, $src.Height)

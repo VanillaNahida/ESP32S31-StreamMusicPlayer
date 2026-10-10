@@ -49,7 +49,6 @@ extern "C" {
 #define BA_CANCEL_A      0xEEF5F9   /* 次按钮渐变亮端 */
 #define BA_CANCEL_B      0xD5E2EB   /* 次按钮渐变暗端 */
 #define BA_CANCEL_FG     0x3B5166   /* 次按钮文字 */
-#define BA_BADGE_BG      0x1A2A3E   /* 键位徽章底 */
 #define BA_INPUT_BG      0xF1F5F9   /* 输入框底 */
 #define BA_INPUT_LINE    0x64748B   /* 输入框下边框 */
 #define BA_DANGER        0xE5484D   /* 危险动作（删除） */
@@ -106,17 +105,16 @@ void ui_ba_on_close(ui_ba_dialog_t *d, void (*cb)(void *user), void *user);
 /* ------------------------------------------------------------------ 卡片内控件 */
 
 /*
- * 底部按钮：斜切平行四边形 + 渐变 + 键位徽章。
+ * 底部按钮：斜切平行四边形 + 渐变。
  *
  *   primary true = 青蓝渐变（确认），false = 浅灰蓝渐变（取消）
- *   badge   徽章文字（"Enter" / "Esc" / NULL = 不画徽章）
  *   返回按钮对象（回调挂在它上面）
  */
-lv_obj_t *ui_ba_btn(lv_obj_t *row, const char *text, bool primary, const char *badge,
+lv_obj_t *ui_ba_btn(lv_obj_t *row, const char *text, bool primary,
                     lv_event_cb_t cb, void *user);
 
 /* 同上，但可以指定样式：0 = 次按钮（浅灰蓝）、1 = 主按钮（青蓝）、2 = 危险（红） */
-lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style, const char *badge,
+lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style,
                            lv_event_cb_t cb, void *user);
 
 /* 列表行按钮（长按菜单 / 输出设备列表那种）：浅底 + 左侧色条 + 深色文字。

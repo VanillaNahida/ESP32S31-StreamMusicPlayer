@@ -8,3 +8,6 @@ build_check/*
 assets/ncm-ck.txt
 libs/
 *zip
+NeteaseCloudMusicApi/
+QQMusicApi/
+QQMusicPythonApi/

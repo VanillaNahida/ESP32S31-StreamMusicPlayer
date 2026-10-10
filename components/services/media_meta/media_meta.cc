@@ -972,6 +972,281 @@ esp_err_t media_meta_probe_mp3(const char *audio_path, audio_probe_t *out)
     return ESP_OK;
 }
 
+/* ================================================================== 通用探测
+ *
+ * 需求（2026-10 用户报"部分音频文件播放卡顿、无法拖动、总时长无法显示"）：
+ * 以前只有 media_meta_probe_mp3()，**只认 .mp3** —— 于是 FLAC / WAV / AAC 这些
+ * 本地文件拿不到时长与平均码率：
+ *   - GMF 的 MUSIC_INFO 对这些文件报 `0 bps, 0 ms`（真机日志：
+ *     `audio_svc: music info: 48000 Hz 2ch 16bit 0 bps, 0 ms`）；
+ *   - 没有时长 → 界面上总时长一直是 `--:--`、进度条不动；
+ *   - 没有码率 → seek 的"时间→字节"算不出来 → 拖动直接报"定位失败：码率未知"。
+ *
+ * 这里按**魔数**（不是扩展名：用户的文件扩展名经常撒谎）分派，只读头部若干字节，
+ * 同步小 IO，别在 LVGL 任务里调（调用方 audio_service 在播放器事件里调）。
+ *
+ * ⚠ 走"按块长度跳"而不是"逐字节扫"：FLAC 的内嵌封面（PICTURE 块）动辄几百 KB~几 MB，
+ *   逐字节扫既慢又正是 ESP 那个解析器在真机上刷 `Not found frame in max frame size` 的原因。
+ */
+
+/* 小端读取（WAV 用） */
+static uint32_t le16(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
+}
+static uint32_t le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* 码率兜底：容器里没有"码率"字段时（FLAC/WAV…）用 音频字节数 × 8 ÷ 时长 当平均码率。
+ * 这正是 seek 需要的那个"平均"值（VBR 也成立）。 */
+static void probe_fill_bitrate(uint32_t audio_bytes, audio_probe_t *out)
+{
+    if (out->bitrate == 0 && out->duration_ms > 0 && audio_bytes > 0) {
+        out->bitrate = (uint32_t)(((uint64_t)audio_bytes * 8ULL * 1000ULL) / out->duration_ms);
+    }
+}
+
+/*
+ * FLAC：`fLaC` 之后是一串元数据块，**规范要求 STREAMINFO（类型 0）必须是第一块**。
+ * 块头 4 字节：[1B: last<<7 | type][3B 大端: 数据长度]，数据紧跟其后。
+ * STREAMINFO 34 字节（大端）：
+ *   [0..1] 最小块 [2..3] 最大块 [4..6] 最小帧 [7..9] 最大帧
+ *   [10..17] 20bit 采样率 | 3bit(声道-1) | 5bit(位深-1) | **36bit 总采样数**
+ * 拿到总采样数就能算准时长；FLAC 没有码率字段，按文件大小估（见 probe_fill_bitrate）。
+ * 音频起始偏移 = 元数据链走完的位置（**不去读封面**，只按长度跳过）。
+ */
+static esp_err_t probe_flac(FILE *f, long file_size, audio_probe_t *out)
+{
+    uint8_t hdr[10];                    /* 够放 ID3v2 头（10 字节），也复用于 `fLaC`(4) */
+    long    pos = ftell(f);
+    /* 有些工具会在 FLAC 前面塞 ID3v2（10 字节头 + synchsafe 长度）——顺手跳过去，
+     * 这一条比 ESP 自带的解析器还宽容 */
+    if (fread(hdr, 1, 10, f) == 10 && memcmp(hdr, "ID3", 3) == 0) {
+        const uint32_t tag = ((uint32_t)(hdr[6] & 0x7F) << 21) | ((uint32_t)(hdr[7] & 0x7F) << 14) |
+                             ((uint32_t)(hdr[8] & 0x7F) << 7) | (uint32_t)(hdr[9] & 0x7F);
+        pos = 10 + (long)tag;
+        if (fseek(f, pos, SEEK_SET) != 0) {
+            return ESP_FAIL;
+        }
+    } else if (fseek(f, pos, SEEK_SET) != 0) {
+        return ESP_FAIL;
+    }
+
+    if (fread(hdr, 1, 4, f) != 4 || memcmp(hdr, "fLaC", 4) != 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    for (int guard = 0; guard < 64; guard++) {          /* 元数据块最多几十个，给个上限防跑飞 */
+        uint8_t bh[4];
+        if (fread(bh, 1, 4, f) != 4) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        const bool     last = (bh[0] & 0x80) != 0;
+        const uint8_t  type = bh[0] & 0x7F;
+        const uint32_t len  = be24(bh + 1);
+        if (type == 0) {                                /* STREAMINFO */
+            uint8_t si[34];
+            if (len < sizeof(si) || fread(si, 1, sizeof(si), f) != sizeof(si)) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            const uint32_t sr    = ((uint32_t)si[10] << 12) | ((uint32_t)si[11] << 4) |
+                                   ((uint32_t)si[12] >> 4);
+            const uint8_t  ch    = (uint8_t)(((si[12] >> 1) & 0x07) + 1);
+            const uint8_t  bits  = (uint8_t)((((si[12] & 0x01) << 4) | (si[13] >> 4)) + 1);
+            const uint64_t total = (((uint64_t)(si[13] & 0x0F) << 32) | ((uint64_t)si[14] << 24) |
+                                    ((uint64_t)si[15] << 16) | ((uint64_t)si[16] << 8) |
+                                    (uint64_t)si[17]);
+            if (sr == 0) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            out->sample_rate = sr;
+            out->channels    = ch;
+            if (bits) {
+                /* 位深不进 audio_probe_t（结构里没有），但可以据此提示调用方 */
+                ESP_LOGI(TAG, "flac: %u Hz %uch %ubit total %llu samples", (unsigned)sr,
+                         (unsigned)ch, (unsigned)bits, (unsigned long long)total);
+            }
+            if (total > 0) {
+                out->duration_ms = (uint32_t)((total * 1000ULL) / sr);
+            }
+            /* 音频数据的起点 = 当前位置（STREAMINFO 之后继续走完剩余块） */
+            long data_off = ftell(f);
+            uint32_t rest = len - (uint32_t)sizeof(si);
+            for (;;) {
+                if (rest > 0) {
+                    data_off += rest;
+                    rest = 0;
+                }
+                if (last) {
+                    break;
+                }
+                uint8_t nb[4];
+                if (fread(nb, 1, 4, f) != 4) {
+                    break;
+                }
+                data_off += 4;                          /* 块头 */
+                const uint32_t nlen = be24(nb + 1);
+                if ((nb[0] & 0x80) != 0) {              /* 最后一块 */
+                    data_off += (long)nlen;
+                    break;
+                }
+                data_off += (long)nlen;
+            }
+            if (data_off > 0 && data_off < file_size) {
+                probe_fill_bitrate((uint32_t)(file_size - data_off), out);
+            }
+            return ESP_OK;
+        }
+        if (fseek(f, (long)len, SEEK_CUR) != 0) {       /* 只按长度跳，不读封面 */
+            return ESP_FAIL;
+        }
+        if (last) {
+            break;
+        }
+    }
+    return ESP_ERR_NOT_SUPPORTED;                       /* 没找到 STREAMINFO：按未知处理 */
+}
+
+/*
+ * WAV：`RIFF` + 大小 + `WAVE`，之后是块链：`fmt `（采样率/声道/位深/字节率）
+ * 与 `data`（音频字节数）。时长 = data 大小 ÷ 字节率。都是小端。
+ */
+static esp_err_t probe_wav(FILE *f, long file_size, audio_probe_t *out)
+{
+    uint8_t h[12];
+    if (fread(h, 1, sizeof(h), f) != sizeof(h) || memcmp(h, "RIFF", 4) != 0 ||
+        memcmp(h + 8, "WAVE", 4) != 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    uint32_t byte_rate = 0;
+    uint32_t data_size = 0;
+    for (int guard = 0; guard < 64; guard++) {
+        uint8_t ch[8];
+        if (fread(ch, 1, sizeof(ch), f) != sizeof(ch)) {
+            break;
+        }
+        const uint32_t sz = le32(ch + 4);
+        if (memcmp(ch, "fmt ", 4) == 0) {
+            uint8_t fmt[16];
+            const size_t want = (sz < sizeof(fmt)) ? sz : sizeof(fmt);
+            if (fread(fmt, 1, want, f) != want) {
+                break;
+            }
+            out->channels    = (uint8_t)le16(fmt + 2);
+            out->sample_rate = le32(fmt + 4);
+            byte_rate        = le32(fmt + 8);
+            if (sz > want && fseek(f, (long)(sz - want), SEEK_CUR) != 0) {
+                break;
+            }
+        } else if (memcmp(ch, "data", 4) == 0) {
+            data_size = sz;
+            break;                                      /* 音频数据起点 = 当前位置 */
+        } else {
+            if (fseek(f, (long)sz + (long)(sz & 1u), SEEK_CUR) != 0) {
+                break;                                  /* 块按偶数字节对齐 */
+            }
+        }
+    }
+    if (out->sample_rate == 0 || byte_rate == 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    if (data_size == 0) {                               /* 有些文件 data 长度写 0：按剩余文件算 */
+        const long here = ftell(f);
+        if (here > 0 && file_size > here) {
+            data_size = (uint32_t)(file_size - here);
+        }
+    }
+    if (data_size > 0) {
+        out->duration_ms = (uint32_t)(((uint64_t)data_size * 1000ULL) / byte_rate);
+        out->bitrate     = byte_rate * 8u;
+    }
+    return ESP_OK;
+}
+
+/*
+ * ADTS 封装的 AAC（.aac / 部分 .m4a 的裸流）：头 7 字节里带
+ *   profile / 采样率索引 / 声道 / **帧长度(13bit)** / 每帧 1024 采样。
+ * 头信息足够算出"每帧字节数 ÷ 每帧时长"= 平均码率；时长用文件大小估
+ * （AAC 没有全局头，逐帧扫太慢也不值得 —— 拖动定位要的是平均码率）。
+ */
+static const uint32_t k_aac_rate_tab[13] = { 96000, 88200, 64000, 48000, 44100, 32000, 24000,
+                                             22050, 16000, 12000, 11025, 8000, 7350 };
+
+static esp_err_t probe_adts_aac(FILE *f, long file_size, audio_probe_t *out)
+{
+    uint8_t h[7];
+    if (fread(h, 1, sizeof(h), f) != sizeof(h) || h[0] != 0xFF || (h[1] & 0xF6) != 0xF0) {
+        return ESP_ERR_NOT_SUPPORTED;                   /* 不是 ADTS 同步头 */
+    }
+    const uint32_t sfi = (uint32_t)((h[2] >> 2) & 0x0F);
+    if (sfi >= 13) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    const uint32_t sr        = k_aac_rate_tab[sfi];
+    const uint32_t frame_len = (((uint32_t)h[3] & 0x03u) << 11) | ((uint32_t)h[4] << 3) |
+                               ((uint32_t)h[5] >> 5);
+    const uint32_t ch        = (uint32_t)(((h[2] & 0x01u) << 2) | (h[3] >> 6));
+    if (sr == 0 || frame_len <= 7) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    out->sample_rate = sr;
+    out->channels    = (uint8_t)((ch == 0) ? 2 : ch);   /* ADTS 里 0 表示"按 PCE"，通常 2ch */
+    /* 每帧 1024 采样：帧字节数 ÷ (1024/采样率) = 瞬时码率；用它当平均码率够 seek 用 */
+    out->bitrate     = (uint32_t)(((uint64_t)frame_len * 8ULL * sr) / 1024ULL);
+    if (out->bitrate > 0) {
+        const long here = 7;
+        if (file_size > here) {
+            out->duration_ms =
+                (uint32_t)(((uint64_t)(file_size - here) * 8ULL * 1000ULL) / out->bitrate);
+        }
+    }
+    return ESP_OK;
+}
+
+esp_err_t media_meta_probe_audio(const char *audio_path, audio_probe_t *out)
+{
+    if (!audio_path || !out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /* MP3 走原有那条（它认得 ID3/Xing/Info，比这里重造一遍靠谱） */
+    const char *dot = strrchr(audio_path, '.');
+    if (dot && strcasecmp(dot, ".mp3") == 0) {
+        return media_meta_probe_mp3(audio_path, out);
+    }
+
+    FILE *f = fopen(audio_path, "rb");
+    if (!f) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    fseek(f, 0, SEEK_END);
+    const long file_size = ftell(f);
+    if (file_size <= 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_err_t ret = probe_flac(f, file_size, out);
+    if (ret != ESP_OK) {
+        rewind(f);
+        ret = probe_wav(f, file_size, out);
+    }
+    if (ret != ESP_OK) {
+        rewind(f);
+        ret = probe_adts_aac(f, file_size, out);
+    }
+    fclose(f);
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "audio probe: %u bps, %u ms, %u Hz, %uch (%s)",
+                 (unsigned)out->bitrate, (unsigned)out->duration_ms,
+                 (unsigned)out->sample_rate, (unsigned)out->channels, audio_path);
+    }
+    return ret;
+}
+
 /* ================================================================== 内嵌歌词
  *
  * 需求：从 ID3 标签读歌词 → 自动保存到 SD 卡的 /lrc 目录；播放时按

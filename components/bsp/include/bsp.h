@@ -56,6 +56,18 @@ const char *bsp_sdcard_mount_point(void);
 esp_err_t bsp_sdcard_capacity_kb(uint32_t *total_kb, uint32_t *free_kb);
 
 /*
+ * 探测"卡还在不在"：给**已经挂载**的情况用（热插拔轮询）。
+ *
+ * 为什么要专门探测：FATFS/VFS 把目录与 FAT 表都缓存在内存里，卡被拔掉之后
+ * `stat()`/`opendir()` 之类还能从缓存里给出答案 —— 界面于是永远显示"已挂载"，
+ * 而且换一张卡进来也读不到新内容（旧的挂载点还占着）。CMD13(SEND_STATUS)
+ * 是 SD 协议里最轻的"你还在吗"，卡不在时它超时/无响应，正好当探针。
+ *
+ * 未挂载返回 ESP_ERR_INVALID_STATE；卡不应答返回底层错误码（超时/无响应等）。
+ */
+esp_err_t bsp_sdcard_probe(void);
+
+/*
  * SD 卡的**物理信息**（"设置 → 存储"详情页用；容量之外的那些）。
  * 取不到的字段保持 0 / 空串，不报错 —— UI 少显示一行即可。
  *

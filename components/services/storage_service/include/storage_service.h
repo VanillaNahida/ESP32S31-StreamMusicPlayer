@@ -36,6 +36,40 @@ typedef void (*storage_scan_cb_t)(int found, int scanned, void *user);
 
 esp_err_t storage_service_init(void);
 
+/* ------------------------------------------------------------------ SD 热插拔
+ *
+ * 板子上**没有卡检测脚**（板级 YAML 里 fs_sdcard 没有 cd），所以"卡在不在"
+ * 只能靠定期试探：已挂载时发一条 CMD13（`bsp_sdcard_probe()`），没挂载时
+ * 定期尝试挂载。这两件事都在 storage_service 自己的低优先级任务里做，
+ * UI 只管看下面这个"代次"。
+ *
+ * 为什么必须有：不轮询的话，开机时挂上的那份 FATFS 会一直挂在 VFS 上 ——
+ * 卡拔了界面还显示"已挂载"，换一张卡进来也读不到新内容（就是"只有重启才能
+ * 识别到更换的卡"）。而且 FATFS 会把目录项缓存在内存里，普通文件操作未必
+ * 报错，非得问卡本身不可。
+ */
+
+/*
+ * SD 状态代号次：**每次插入/拔出各 +1**（开机时的首次挂载也算一次变化）。
+ *
+ * 多处 UI 同时看它没问题：各自记住上次见到的值，变了就刷新（不像"事件队列"
+ * 那样只能被一个人消费）。没变化时返回值稳定。
+ */
+uint32_t storage_service_sd_generation(void);
+
+/** 当前 SD 是否已挂载（与 bsp_sdcard_is_mounted() 同源，供 UI 查询） */
+bool storage_service_sd_is_mounted(void);
+
+/*
+ * 立刻重试一次（"设置 → 存储"的「重新检测」按钮用）。
+ *
+ * 是**同步**的：会尝试挂载并更新代次，返回是否已挂载。调用方在 LVGL 任务里，
+ * 阻塞时间 = 一次卡初始化（几十~几百毫秒），和这个按钮以前直接调
+ * bsp_sdcard_mount() 的开销一样；不同之处是现在与监控任务之间加了锁，
+ * 两者不会同时去 init/deinit 同一个 SDMMC 设备。
+ */
+bool storage_service_sd_rescan(void);
+
 /* 同步扫描（调用方负责放在低优先级任务里）；返回找到的曲目数，负数为错误 */
 int storage_service_scan(storage_scan_cb_t cb, void *user);
 

@@ -53,6 +53,39 @@ bool      audio_service_is_playing(void);
  * 只有拿到 MUSIC_INFO（码率）之后才能换算字节位置，且只对流式容器可靠。 */
 esp_err_t audio_service_seek_ms(uint32_t pos_ms);
 
+/*
+ * 告诉服务"当前这一首有多长"（毫秒，0 = 未知）。
+ *
+ * 在线曲目**必须**由上层告知：GMF 的 MUSIC_INFO 里 duration 拿不到（服务里一直是 0），
+ * 而在线 seek 的"时间→字节"要用**平均码率 = 总字节 × 8000 ÷ 时长** ——
+ * 总字节由 HTTP Content-Length 给出，时长只能从在线元数据来。
+ * 时机：**必须在 audio_service_play_uri() 之后调**（换曲会把上一首的值清掉）。
+ * 本地文件不需要（服务自己会用 media_meta 探测平均码率）。
+ */
+void audio_service_set_duration_ms(uint32_t dur_ms);
+
+/*
+ * 当前这首现在能不能拖动定位（UI 用它决定"拖了到底有没有用"）。
+ *   - 本地文件：MUSIC_INFO 到了、且探测到平均码率 → 能；
+ *   - 在线流：MUSIC_INFO 到了、且**已知总字节 + 时长**（能算平均码率）→ 能；
+ *     只有实测码率（播过一会儿之后才采得到）时也能**向前**拖，见实现里的相对映射。
+ * 容器层面的限制（MP4/M4A/OGG 按字节 seek 后对不上帧）在 app_music 里另有一道判断。
+ */
+bool audio_service_seek_supported(void);
+
+/*
+ * 取"上一次 seek 实际落到了哪"（毫秒），**一次性**：读到就清掉标志。
+ *
+ * 怎么来的：seek 之后第一块 PCM 写出来时，用 `esp_gmf_io_get_pos()` 按**同一个码率**
+ * 反推回时间。那个位置是"解码器已经消费到哪"（它的推进点在
+ * esp_gmf_io_release_read 里，看源码确认过），所以它就是真实落点。
+ * 正常情况下与请求的时间点一致；差得多说明服务端没按我们要的 Range 给数据
+ * （少数 CDN/代理会这样），这时上层应把进度/歌词对齐到这个真实位置。
+ *
+ * 返回 false = 还没有落点（seek 后还没出声，或拿不到 IO 位置）。
+ */
+bool audio_service_seek_landing_ms(uint32_t *out_ms);
+
 /* ------------------------------------------------------------------ 输出通道 */
 
 typedef enum {
@@ -103,6 +136,20 @@ bool audio_service_get_info(audio_info_t *out);
  * 纯查询，任何任务里调都安全。
  */
 bool audio_service_stream_progress(int *percent);
+
+/*
+ * 流式播放的**网络下载速率**，单位 **Kbps（千比特每秒）** —— 注意不是 KB/s，
+ * 显示成 KB/s 要自己 ÷8（UI 那边就是这么干的：`缓冲中 20 KB/s`）。
+ *
+ * 数据源是 GMF 的速度统计（IO 任务每读到一块数据就更新一次，1:9 平滑），
+ * 所以它反映的是**网络侧的真实下载速度**，起播缓冲期间也有值 ——
+ * 而 `audio_service_stream_progress()` 用的是"解码器消费到哪"，那会儿几乎不动。
+ *
+ * 返回 false = 没有可用速度（本地文件 / 速度统计没开 / 还没读到任何数据），
+ * 这时 UI 应当**不显示速度**，别显示 0。
+ * 纯查询，任何任务里调都安全。
+ */
+bool audio_service_stream_speed(int *kbps);
 
 /*
  * 本首是否**已经真的出声**（有 PCM 写到 codec / 蓝牙）。

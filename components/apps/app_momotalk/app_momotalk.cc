@@ -45,15 +45,30 @@ static const char *TAG = "app_momotalk";
  */
 #define MT_BAR_H        UI_PX_H(50)      /* 粉色标题栏高 */
 #define MT_BAR_LOGO     UI_PX_H(32)      /* 标题栏左侧圆形图标（= momotalk_icon 烘制尺寸） */
-#define MT_CLOSE_IMG    UI_PX_H(40)      /* 右上角 ✕ 位图尺寸（= momotalk_close 烘制尺寸） */
-#define MT_CLOSE_TOUCH  UI_MIN_TOUCH     /* ✕ 的可点区域（比图标大，好按） */
+#define MT_CLOSE_TOUCH  UI_MIN_TOUCH     /* 右上角 ✕ 的可点区域（位图尺寸由烘制尺寸决定 = momotalk_close） */
 #define MT_INPUTBAR_H   UI_PX_H(52)      /* 底部输入条高 */
 #define MT_TA_H         UI_PX_H(36)      /* 输入框高 */
 #define MT_SEND_W       UI_PX_W(76)      /* "发送"按钮宽 */
 #define MT_AVATAR       UI_PX_H(44)      /* 头像直径（= momotalk_avatar 烘制尺寸） */
+/*
+ * 气泡小尖角。
+ *
+ * ★ 尖角对象的高度 = MT_TAIL_OFF + MT_TAIL_H，三角**画在对象内部**、
+ *   从 y1+MT_TAIL_OFF 开始，而不是靠 translate_y 把整个对象往下挪 ——
+ *   靠 translate 的话"对象的实际位置"和"draw 回调里 lv_obj_get_coords()
+ *   拿到的位置"是不是同一个值，取决于 LVGL 把 translate 记在坐标里还是在
+ *   绘制时叠加；一旦两者不一致，画出来的三角就比气泡高出一截、
+ *   正好扎进气泡的圆角里（现象就是"三角形没贴合"）。
+ *   把偏移烘进对象高度 + 画点里，这条依赖就没了。
+ *
+ * ★ MT_TAIL_OFF 取**气泡圆角半径**（MT_BUBBLE_RADIUS）：圆角那一段气泡的左边缘
+ *   是往里收的，尖角竖边只有落在圆角**以下**的直边上才严丝合缝。
+ */
 #define MT_TAIL_W       UI_PX_W(7)       /* 气泡小尖角宽 */
-#define MT_TAIL_H       UI_PX_H(15)      /* 气泡小尖角高 */
-#define MT_TAIL_OFF     UI_PX_H(8)       /* 尖角相对气泡顶部的下沉（HTML 是 top:24px） */
+#define MT_TAIL_H       UI_PX_H(14)      /* 气泡小尖角高（竖边长度） */
+#define MT_TAIL_OFF     UI_PX_H(8)       /* 尖角顶端相对气泡顶部的下沉（= 圆角半径） */
+#define MT_TAIL_OVL     UI_PX_W(2)       /* 竖边往气泡里压进去这么多，盖掉 AA 缝 */
+#define MT_BUBBLE_RADIUS UI_PX_H(8)      /* 气泡圆角（HTML 是 16px，半屏缩放后 8） */
 #define MT_BUBBLE_PAD_X UI_PX_W(12)
 #define MT_BUBBLE_PAD_Y UI_PX_H(8)
 #define MT_BUBBLE_MAX_W UI_PCT_X(58)     /* 气泡最大宽度（HTML 是 620/1080 ≈ 57%） */
@@ -133,10 +148,15 @@ static void mt_text_copy(char *dst, size_t dst_size, const char *src)
 
 /* ------------------------------------------------------------------ 气泡尖角
  *
- * HTML 用 CSS 的 border 三角（.bubble::before/::after）。这里用两个点画一个
- * 三角形：竖边贴着气泡，另一个点在尖角对象的外侧中点。
- * 尖角对象是行里的一个固定尺寸 flex 项（气泡左边或右边），所以不需要任何
- * align_to —— 气泡改宽改高都不影响它。
+ * HTML 用 CSS 的 border 三角（.bubble::before/::after）：一个竖直边贴在气泡上、
+ * 另一头是个尖。这里同样用一个三角形画出来。
+ *
+ * 贴合的三个要点（少一个就会看到缝或者"扎进圆角里"）：
+ *   1. 尖角对象与气泡之间**不留列间距**（brow 的 pad_column = 0），
+ *      所以竖边就落在气泡的边缘上，不会中间空 1 px；
+ *   2. 竖边再往气泡里压 MT_TAIL_OVL，盖掉抗锯齿留下的那圈半透明缝；
+ *   3. 三角从对象顶部下沉 MT_TAIL_OFF（= 气泡圆角半径）开始画 ——
+ *      圆角那一段气泡边缘是圆弧，尖角必须落在下面的直边上。
  */
 static void mt_tail_draw(lv_event_t *e)
 {
@@ -149,24 +169,27 @@ static void mt_tail_draw(lv_event_t *e)
 
     lv_area_t c;
     lv_obj_get_coords(o, &c);
-    if (lv_area_get_width(&c) < 2 || lv_area_get_height(&c) < 4) {
+    if (lv_area_get_width(&c) < 2 || lv_area_get_height(&c) < MT_TAIL_OFF + 4) {
         return;
     }
+
+    const int32_t yt = c.y1 + MT_TAIL_OFF;          /* 竖边顶端 */
+    const int32_t yb = yt + MT_TAIL_H;              /* 竖边底端 */
 
     lv_draw_triangle_dsc_t d;
     lv_draw_triangle_dsc_init(&d);
     d.opa   = LV_OPA_COVER;
     d.color = lv_color_hex(left ? MT_C_OTHER : MT_C_MINE);
     if (left) {
-        /* 尖朝左：竖边在右（贴气泡），顶点在左中点 */
-        d.p[0].x = c.x2 + 1; d.p[0].y = c.y1;
-        d.p[1].x = c.x2 + 1; d.p[1].y = c.y2 + 1;
-        d.p[2].x = c.x1;     d.p[2].y = (c.y1 + c.y2) / 2;
+        /* 贴对方气泡的**左**边：竖边在右（压进气泡 MT_TAIL_OVL），尖朝左 */
+        d.p[0].x = c.x2 + MT_TAIL_OVL; d.p[0].y = yt;
+        d.p[1].x = c.x2 + MT_TAIL_OVL; d.p[1].y = yb + 1;
+        d.p[2].x = c.x1;               d.p[2].y = (yt + yb) / 2;
     } else {
-        /* 尖朝右：竖边在左（贴气泡），顶点在右中点 */
-        d.p[0].x = c.x1 - 1; d.p[0].y = c.y1;
-        d.p[1].x = c.x1 - 1; d.p[1].y = c.y2 + 1;
-        d.p[2].x = c.x2;     d.p[2].y = (c.y1 + c.y2) / 2;
+        /* 贴我方气泡的**右**边：竖边在左（压进气泡 MT_TAIL_OVL），尖朝右 */
+        d.p[0].x = c.x1 - MT_TAIL_OVL; d.p[0].y = yt;
+        d.p[1].x = c.x1 - MT_TAIL_OVL; d.p[1].y = yb + 1;
+        d.p[2].x = c.x2;               d.p[2].y = (yt + yb) / 2;
     }
     lv_draw_triangle(layer, &d);
 }
@@ -175,8 +198,8 @@ static lv_obj_t *mt_tail_create(lv_obj_t *parent, bool attach_left)
 {
     lv_obj_t *t = lv_obj_create(parent);
     lv_obj_remove_style_all(t);
-    lv_obj_set_size(t, MT_TAIL_W, MT_TAIL_H);
-    lv_obj_set_style_translate_y(t, MT_TAIL_OFF, LV_PART_MAIN);
+    /* 高度留出"下沉 + 竖边"两段：三角画在对象内部，不靠 translate 位移 */
+    lv_obj_set_size(t, MT_TAIL_W, MT_TAIL_OFF + MT_TAIL_H + 1);
     lv_obj_remove_flag(t, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(t, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(t, mt_tail_draw, LV_EVENT_DRAW_MAIN, (void *)(intptr_t)(attach_left ? 1 : 0));
@@ -193,7 +216,7 @@ static lv_obj_t *mt_bubble_create(lv_obj_t *parent, bool mine, const char *text)
     lv_obj_set_width(b, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(b, lv_color_hex(mine ? MT_C_MINE : MT_C_OTHER), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_radius(b, UI_PX_H(10), LV_PART_MAIN);
+    lv_obj_set_style_radius(b, MT_BUBBLE_RADIUS, LV_PART_MAIN);
     lv_obj_set_style_pad_hor(b, MT_BUBBLE_PAD_X, LV_PART_MAIN);
     lv_obj_set_style_pad_ver(b, MT_BUBBLE_PAD_Y, LV_PART_MAIN);
     lv_obj_remove_flag(b, LV_OBJ_FLAG_SCROLLABLE);
@@ -244,7 +267,7 @@ static lv_obj_t *mt_row_create(bool mine, const char *text)
         lv_obj_set_size(brow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
         lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
         lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-        lv_obj_set_style_pad_column(brow, UI_PX_W(1), LV_PART_MAIN);
+        lv_obj_set_style_pad_column(brow, 0, LV_PART_MAIN);   /* 尖角要贴着气泡，不能留缝 */
         lv_obj_remove_flag(brow, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_remove_flag(brow, LV_OBJ_FLAG_CLICKABLE);
         mt_bubble_create(brow, true, text);
@@ -290,7 +313,7 @@ static lv_obj_t *mt_row_create(bool mine, const char *text)
     lv_obj_set_size(brow, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(brow, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(brow, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
-    lv_obj_set_style_pad_column(brow, UI_PX_W(1), LV_PART_MAIN);
+    lv_obj_set_style_pad_column(brow, 0, LV_PART_MAIN);   /* 尖角要贴着气泡，不能留缝 */
     lv_obj_remove_flag(brow, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(brow, LV_OBJ_FLAG_CLICKABLE);
     mt_tail_create(brow, true);                  /* 尖角在气泡左边 */
@@ -352,10 +375,16 @@ static void mt_ime_apply_offset(bool open)
         return;
     }
     lv_obj_set_style_pad_bottom(s_scr, open ? (MT_IME_H + UI_PX_H(6)) : 0, LV_PART_MAIN);
-    if (open) {
-        lv_obj_update_layout(s_scr);
-        mt_scroll_bottom();
-    }
+    /*
+     * ★ **收起键盘时也要滚到底**（用户报："收起键盘后画面没有跟随滚动到下面"）。
+     *   键盘一开，列表可视高度从 ~340 px 缩到 ~100 px，我们滚到了底部；
+     *   键盘一收，可视高度涨回去，而 LVGL **不会**动滚动偏移 ——
+     *   于是停在"半中间"，下面空出一大块。所以开、关两个方向都重新贴底。
+     *   ⚠ 必须先 update_layout：pad_bottom 刚改，滚动上限还是按旧高度算的，
+     *     不刷新布局就滚不到真正的底部（`mt_scroll_bottom()` 里已经做了这件事）。
+     */
+    lv_obj_update_layout(s_scr);
+    mt_scroll_bottom();
 }
 
 static void mt_ime_hide(void)
@@ -441,6 +470,9 @@ static void mt_send(void)
     if (s_echo_timer) {
         lv_timer_delete(s_echo_timer);
     }
+
+    ESP_LOGI(TAG, "发送的原始消息: %s", msg);
+
     /* 延时一下，先让用户看到自己那条再冒出回复 */
     s_echo_timer = lv_timer_create([](lv_timer_t *t) {
         (void)t;

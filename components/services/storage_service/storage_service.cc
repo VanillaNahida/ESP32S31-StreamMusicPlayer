@@ -21,9 +21,13 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "bsp.h"
 
 static const char *TAG = "storage";
+
+/* SD 热插拔监控（实现见下面的"SD 热插拔"一节） */
+static void sd_monitor_start(void);
 
 #define MUSIC_ROOT      "/sdcard"
 #define MUSIC_ROOT_ALT  "/sdcard"
@@ -243,7 +247,196 @@ esp_err_t storage_service_init(void)
         return ESP_ERR_NO_MEM;
     }
     s_ready = true;
+    sd_monitor_start();
     return ESP_OK;
+}
+
+/* ------------------------------------------------------------------ SD 热插拔
+ *
+ * 见 storage_service.h 的说明：板上没有卡检测脚，只能定期试探。
+ *
+ * 节奏（都在本任务里，优先级比 LVGL 低，卡初始化那几十毫秒不会影响刷新）：
+ *   - 已挂载：每 SD_PROBE_MS 发一条 CMD13；连续 SD_PROBE_FAIL_MAX 次不应答才
+ *     认定"卡拔了"（一次超时不算拔卡，SD 偶发时序抖动是会有的）；
+ *   - 未挂载：每 SD_MOUNT_RETRY_MS 试挂一次，连续失败就退到 SD_MOUNT_SLOW_MS
+ *     （没插卡时没必要每 1.5 秒去初始化一次卡）。
+ *
+ * 状态变化才 +1 代次、才打日志：UI 靠代次判断"要不要刷新"，日志也不刷屏。
+ *
+ * 并发：挂/卸载都在 s_sd_lock 里做（监控任务 vs 设置页"重新检测"）。CMD13 探针
+ * 不需要这把锁 —— IDF 的 SDMMC 驱动自己在每条事务外面就拿了控制器的 mutex
+ * （sd_trans_sdmmc.c 的 sd_host_slot_sdmmc_do_transaction() 开头），所以探测和
+ * 播放中的 FATFS 读不会撞车，最多互相等一会儿。
+ */
+#define SD_PROBE_MS           1000
+#define SD_PROBE_FAIL_MAX     2
+#define SD_MOUNT_RETRY_MS     1500
+#define SD_MOUNT_SLOW_MS      5000
+#define SD_MOUNT_SLOW_AFTER   4
+/* 栈要够 FATFS 挂载那一趟用（esp_vfs_fat_sdmmc_mount 内部走 sdmmc_card_init +
+ * f_mount，IDF 例程里这类任务一般给 4 KB）。 */
+#define SD_MON_TASK_STACK     4096
+#define SD_MON_TASK_PRIO      2
+
+static volatile uint32_t s_sd_gen;          /* 状态代号次（每次变化 +1） */
+static volatile bool     s_sd_mounted;      /* 本服务记录的挂载状态 */
+static TaskHandle_t      s_sd_task;
+static SemaphoreHandle_t s_sd_lock;         /* 串行化 mount/unmount */
+
+/*
+ * 代次自增：监控任务写、UI 任务读，所以是 volatile。不能写成 `s_sd_gen++` ——
+ * C++20 起对 volatile 用 ++ 是 deprecated，本工程 -Werror 直接编译不过；
+ * 它只在锁里被改，也不需要原子读改写。
+ */
+static void sd_gen_bump(void)
+{
+    s_sd_gen = s_sd_gen + 1;
+}
+
+uint32_t storage_service_sd_generation(void)
+{
+    return s_sd_gen;
+}
+
+bool storage_service_sd_is_mounted(void)
+{
+    return s_sd_mounted;
+}
+
+/* 挂/卸载的唯一入口：都在锁里做，并且只在状态真的变了时才 +1 代次。
+ * 锁在 sd_monitor_start() 里建（那时还是单线程上下文），这里只管拿。 */
+static bool sd_lock_take(void)
+{
+    return (s_sd_lock != NULL) && (xSemaphoreTake(s_sd_lock, portMAX_DELAY) == pdTRUE);
+}
+
+static void sd_lock_give(void)
+{
+    if (s_sd_lock) {
+        xSemaphoreGive(s_sd_lock);
+    }
+}
+
+/** 返回 true 表示状态发生了变化（代次已 +1） */
+static bool sd_try_mount(bool quiet)
+{
+    if (!sd_lock_take()) {
+        return false;
+    }
+    bool changed = false;
+    if (!bsp_sdcard_is_mounted()) {
+        /*
+         * 后台轮询这条路上，没插卡时**每次**尝试挂载都会从板级管理器和 SDMMC
+         * 驱动里刷好几行 ERROR（"Failed to initialize device fs_sdcard"、
+         * "Failed to mount filesystem"、"send_op_cond returned 0x107"…），
+         * 而这是每几秒一次的常态 —— 日志会被它填满。
+         *
+         * 这里在"试这一次"的窗口里把**默认**日志级别压到 NONE，试完立刻恢复
+         * （这几个 tag 都没被单独设置过，所以都跟着默认级别走；窗口只有一次卡
+         * 初始化的几十~一百毫秒）。成功那一次自己打一行 INFO，失败不打。
+         *
+         * 只压"后台重试"这一条路：设置页点「重新检测」时保留日志，那是用户主动
+         * 要看的。
+         */
+        const esp_log_level_t saved_level = esp_log_get_default_level();
+        if (quiet) {
+            esp_log_level_set("*", ESP_LOG_NONE);
+        }
+        const esp_err_t ret = bsp_sdcard_mount();
+        if (quiet) {
+            esp_log_level_set("*", saved_level);
+        }
+        if (ret == ESP_OK) {
+            s_sd_mounted = true;
+            sd_gen_bump();
+            changed = true;
+            ESP_LOGI(TAG, "SD inserted at %s (gen %u)", bsp_sdcard_mount_point(),
+                     (unsigned)s_sd_gen);
+        }
+    }
+    sd_lock_give();
+    return changed;
+}
+
+/** 返回 true 表示状态发生了变化（代次已 +1） */
+static bool sd_drop_mount(void)
+{
+    if (!sd_lock_take()) {
+        return false;
+    }
+    bool changed = false;
+    if (bsp_sdcard_is_mounted()) {
+        /* 卡已经不在了：把挂载点放掉，下一次尝试挂载才可能识别到**换的那张卡** */
+        bsp_sdcard_unmount();
+        s_sd_mounted = false;
+        sd_gen_bump();
+        changed = true;
+        ESP_LOGW(TAG, "SD removed (gen %u)", (unsigned)s_sd_gen);
+    }
+    sd_lock_give();
+    return changed;
+}
+
+bool storage_service_sd_rescan(void)
+{
+    /* 用户主动点的：保留板级/驱动的报错，方便看为什么没挂上 */
+    sd_try_mount(false);
+    return s_sd_mounted;
+}
+
+static void sd_monitor_task(void *arg)
+{
+    (void)arg;
+    int fail = 0;
+    int mount_fail = 0;
+
+    for (;;) {
+        if (bsp_sdcard_is_mounted()) {
+            fail = 0;
+            mount_fail = 0;
+            if (bsp_sdcard_probe() != ESP_OK) {
+                if (++fail >= SD_PROBE_FAIL_MAX) {
+                    fail = 0;
+                    sd_drop_mount();
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(SD_PROBE_MS));
+        } else {
+            fail = 0;
+            /* quiet = true：没插卡时每几秒一次的失败尝试不该刷日志 */
+            if (!sd_try_mount(true)) {
+                mount_fail++;
+            } else {
+                mount_fail = 0;
+            }
+            const uint32_t wait = (mount_fail >= SD_MOUNT_SLOW_AFTER) ? SD_MOUNT_SLOW_MS
+                                                                    : SD_MOUNT_RETRY_MS;
+            vTaskDelay(pdMS_TO_TICKS(wait));
+        }
+    }
+}
+
+static void sd_monitor_start(void)
+{
+    if (s_sd_task) {
+        return;
+    }
+    /*
+     * 锁在这里建：本函数只从 storage_service_init() 里调一次，那时监控任务
+     * 还没起来，是单线程上下文。放到"谁先用到谁建"就会有两个任务同时建锁的
+     * 竞态（各自拿到不同的锁 = 等于没锁）。
+     */
+    if (s_sd_lock == NULL) {
+        s_sd_lock = xSemaphoreCreateMutex();
+    }
+    /* 开机时 main 已经试过一次挂载：把结果记下来，否则第一次轮询会误报"插入" */
+    s_sd_mounted = bsp_sdcard_is_mounted();
+    s_sd_gen = s_sd_mounted ? 1u : 0u;
+    if (xTaskCreate(sd_monitor_task, "sd_mon", SD_MON_TASK_STACK, NULL,
+                    SD_MON_TASK_PRIO, &s_sd_task) != pdPASS) {
+        s_sd_task = NULL;
+        ESP_LOGW(TAG, "SD monitor task create failed (热插拔不可用)");
+    }
 }
 
 int storage_service_scan(storage_scan_cb_t cb, void *user)

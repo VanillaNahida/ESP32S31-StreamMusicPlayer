@@ -311,12 +311,20 @@ ui_ba_dialog_t ui_ba_open_in(lv_obj_t *parent, const char *title, int width_pct,
 
     /* 装饰层：铺满卡片、不参与 flex、不吃点击。
      * 必须是**第一个**子对象 —— 子对象按创建顺序绘制，这样它压在白底之上、
-     * 文字与按钮之下。 */
+     * 文字与按钮之下。
+     *
+     * ⚠ 用 FLOATING 而不是 IGNORE_LAYOUT：卡片是 LV_SIZE_CONTENT 高，而这个
+     *   装饰层是 100% 高 —— IGNORE_LAYOUT 只让它不参与 flex，**仍然**算进
+     *   calc_content_height()（那里只跳过 HIDDEN / FLOATING），于是"卡片多高
+     *   取决于装饰层多高、装饰层多高又取决于卡片多高"就成了自反馈；
+     *   lv_obj_update_layout() 的 `while(scr->scr_layout_inv)` 没有次数上限，
+     *   一旦来回震荡就是 LVGL 任务空转、看门狗超时。FLOATING 会被布局和
+     *   内容尺寸计算一起跳过，正是"覆盖层"该有的语义。 */
     lv_obj_t *deco = lv_obj_create(card);
     lv_obj_remove_style_all(deco);
     lv_obj_set_size(deco, LV_PCT(100), LV_PCT(100));
     lv_obj_align(deco, LV_ALIGN_TOP_LEFT, 0, 0);
-    lv_obj_add_flag(deco, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(deco, LV_OBJ_FLAG_FLOATING);
     lv_obj_remove_flag(deco, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_remove_flag(deco, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(deco, ba_deco_draw, LV_EVENT_DRAW_MAIN, NULL);
@@ -352,12 +360,12 @@ ui_ba_dialog_t ui_ba_open_in(lv_obj_t *parent, const char *title, int width_pct,
         lv_obj_remove_flag(ul, LV_OBJ_FLAG_CLICKABLE);
     }
 
-    /* 右上角关闭 X：绝对定位（不参与 flex） */
+    /* 右上角关闭 X：绝对定位（不参与 flex，也不算进卡片的内容高度） */
     lv_obj_t *close = lv_obj_create(card);
     lv_obj_remove_style_all(close);
     lv_obj_set_size(close, UI_PX_H(34), UI_PX_H(34));
     lv_obj_align(close, LV_ALIGN_TOP_RIGHT, -UI_PX_W(6), UI_PX_H(6));
-    lv_obj_add_flag(close, LV_OBJ_FLAG_IGNORE_LAYOUT);
+    lv_obj_add_flag(close, LV_OBJ_FLAG_FLOATING);
     lv_obj_add_flag(close, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_set_ext_click_area(close, UI_PX_H(6));
     lv_obj_remove_flag(close, LV_OBJ_FLAG_SCROLLABLE);
@@ -455,7 +463,7 @@ void ui_ba_on_close(ui_ba_dialog_t *d, void (*cb)(void *user), void *user)
 
 /* ------------------------------------------------------------------ 卡片内控件 */
 
-lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style, const char *badge,
+lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style,
                            lv_event_cb_t cb, void *user)
 {
     if (!row) {
@@ -513,26 +521,10 @@ lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style, const cha
     lv_label_set_text(l, text ? text : "");
     lv_obj_center(l);
 
-    if (badge && badge[0]) {
-        lv_obj_t *bd = lv_obj_create(wrap);
-        lv_obj_remove_style_all(bd);
-        lv_obj_set_size(bd, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_style_bg_color(bd, lv_color_hex(BA_BADGE_BG), LV_PART_MAIN);
-        lv_obj_set_style_bg_opa(bd, LV_OPA_COVER, LV_PART_MAIN);
-        lv_obj_set_style_radius(bd, UI_PX_H(3), LV_PART_MAIN);
-        lv_obj_set_style_pad_hor(bd, UI_PX_W(9), LV_PART_MAIN);
-        lv_obj_set_style_pad_ver(bd, UI_PX_H(1), LV_PART_MAIN);
-        /* 徽章往按钮底下"咬"一点（HTML 里的 margin-top:-8px） */
-        lv_obj_set_style_translate_y(bd, -UI_PX_H(6), LV_PART_MAIN);
-        lv_obj_remove_flag(bd, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_remove_flag(bd, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_t *bl = lv_label_create(bd);
-        lv_obj_set_style_text_font(bl, UI_FONT_SMALL, LV_PART_MAIN);
-        lv_obj_set_style_text_color(bl, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-        lv_obj_set_style_text_letter_space(bl, 1, LV_PART_MAIN);
-        lv_label_set_text(bl, badge);
-        lv_obj_center(bl);
-    }
+    /*
+     * 按钮下面原来还画一个 "Enter" / "Esc" 键位徽章（BA 网页稿的键盘提示）。
+     * 本机是触摸 + 6 个 ADC 按键，没有键盘，这两个字纯属误导，已去掉。
+     */
 
     if (cb) {
         lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user);
@@ -540,10 +532,10 @@ lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style, const cha
     return btn;
 }
 
-lv_obj_t *ui_ba_btn(lv_obj_t *row, const char *text, bool primary, const char *badge,
+lv_obj_t *ui_ba_btn(lv_obj_t *row, const char *text, bool primary,
                     lv_event_cb_t cb, void *user)
 {
-    return ui_ba_btn_styled(row, text, primary ? BA_STYLE_CONFIRM : BA_STYLE_CANCEL, badge, cb, user);
+    return ui_ba_btn_styled(row, text, primary ? BA_STYLE_CONFIRM : BA_STYLE_CANCEL, cb, user);
 }
 
 lv_obj_t *ui_ba_opt_row(lv_obj_t *col, const char *text, uint32_t accent,
@@ -706,9 +698,9 @@ static void cfm_build_from_req(void)
     ui_ba_text(s_cfm.dlg.body, s_req.msg);
 
     ui_ba_btn_styled(s_cfm.dlg.btn_row, s_req.cancel_text[0] ? s_req.cancel_text : "取消",
-                     BA_STYLE_CANCEL, "Esc", cfm_cancel_clicked, NULL);
+                     BA_STYLE_CANCEL, cfm_cancel_clicked, NULL);
     ui_ba_btn_styled(s_cfm.dlg.btn_row, s_req.ok_text[0] ? s_req.ok_text : "确认",
-                     s_req.danger ? BA_STYLE_DANGER : BA_STYLE_CONFIRM, "Enter", cfm_ok_clicked, NULL);
+                     s_req.danger ? BA_STYLE_DANGER : BA_STYLE_CONFIRM, cfm_ok_clicked, NULL);
 }
 
 /*

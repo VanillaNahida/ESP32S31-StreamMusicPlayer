@@ -23,6 +23,7 @@ idf_component_register(
         bsp
         audio_service
         media_meta
+        storage_service
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)

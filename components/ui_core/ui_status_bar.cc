@@ -9,15 +9,27 @@
 #include "ui_internal.h"
 #include "ui_metrics.h"
 
+#include <stdio.h>
+
 #include "esp_log.h"
 
+#include "storage_service.h"   /* SD 热插拔：代次 + 挂载状态 */
+#include "bsp.h"               /* bsp_sdcard_capacity_kb（插入时报个容量） */
+
 static const char *TAG = "ui_status";
+
+#define SD_POLL_MS 500         /* SD 热插拔检查间隔（只是一个整数比较） */
 
 static lv_obj_t *s_clock;
 static lv_obj_t *s_wifi;
 static lv_obj_t *s_bt;
 static lv_obj_t *s_out;
 static lv_obj_t *s_sd;
+static lv_timer_t *s_sd_timer;
+static uint32_t  s_sd_gen_seen;
+static bool      s_sd_mounted_seen;
+
+static void sd_poll_cb(lv_timer_t *t);
 
 static lv_obj_t *make_icon(lv_obj_t *parent, const char *symbol)
 {
@@ -62,8 +74,61 @@ lv_obj_t *ui_status_bar_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(s_sd, UI_COLOR_FG_DIM, LV_PART_MAIN);
     lv_obj_align_to(s_sd, s_out, LV_ALIGN_OUT_LEFT_MID, -UI_PX_W(10), 0);
 
+    /*
+     * SD 卡状态由这里统一盯着（状态栏是常驻的，不管当前在哪个页面）。
+     *
+     * 板子没有卡检测脚，storage_service 里有个低优先级任务在轮询"卡在不在"，
+     * 每次插入/拔出把代号次 +1。这里只做三件事：更新图标、弹一句 Toast、
+     * 让正在看存储页/本地列表的页面自己去刷新（它们各自也记着上次的代次）。
+     *
+     * 为什么不在业务页面里做：状态栏、本地音乐页、设置存储页三处都要看这个
+     * 状态，谁都不是"拥有者"；放在常驻的状态栏上，插入/拔出在任何页面都能
+     * 看见反馈。500 ms 的轮询只是一个整数比较，开销可以忽略。
+     */
+    s_sd_gen_seen = storage_service_sd_generation();
+    s_sd_mounted_seen = storage_service_sd_is_mounted();
+    ui_status_set_sd(s_sd_mounted_seen);
+    s_sd_timer = lv_timer_create(sd_poll_cb, SD_POLL_MS, NULL);
+
     ESP_LOGD(TAG, "status bar created h=%d", (int)UI_STATUSBAR_H);
     return bar;
+}
+
+/* SD 热插拔轮询（见 ui_status_bar_create 里的说明） */
+static void sd_poll_cb(lv_timer_t *t)
+{
+    (void)t;
+    const uint32_t gen = storage_service_sd_generation();
+    if (gen == s_sd_gen_seen) {
+        return;
+    }
+    s_sd_gen_seen = gen;
+
+    const bool mounted = storage_service_sd_is_mounted();
+    if (mounted == s_sd_mounted_seen) {
+        return;
+    }
+    s_sd_mounted_seen = mounted;
+
+    ui_status_set_sd(mounted);
+    if (mounted) {
+        uint32_t total_kb = 0;
+        if (bsp_sdcard_capacity_kb(&total_kb, NULL) == ESP_OK && total_kb > 0) {
+            char buf[48];
+            /* 容量按 GB/MB 给，和设置页口径一致（都从 KB 换算） */
+            if (total_kb >= 1024u * 1024u) {
+                snprintf(buf, sizeof(buf), "已插入 SD 卡（%.1f GB）",
+                         (double)total_kb / (1024.0 * 1024.0));
+            } else {
+                snprintf(buf, sizeof(buf), "已插入 SD 卡（%u MB）", (unsigned)(total_kb / 1024u));
+            }
+            ui_toast(buf, 2000);
+        } else {
+            ui_toast("已插入 SD 卡", 2000);
+        }
+    } else {
+        ui_toast("SD 卡已拔出", 2000);
+    }
 }
 
 void ui_status_set_clock(const char *hhmm, const char *date_text)

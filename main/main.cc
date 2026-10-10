@@ -15,8 +15,11 @@
 
 #include "bsp.h"
 #include "ui_core.h"
+#include "ui_metrics.h"      /* UI_FONT_TEXT（输入法借用本工程的位图字体） */
+#include "lvgl_pinyin_ime/lv_pinyin_ime.h"
 #include "splash.h"
 #include "audio_service.h"
+#include "storage_service.h"   /* 本地曲库 + SD 热插拔监控任务的启动点 */
 #include "app_music.h"
 #include "app_settings.h"
 #include "app_online.h"
@@ -218,6 +221,16 @@ extern "C" void app_main(void)
     bsp_sdcard_mount();
     bsp_led_set(0, 0, 12);
 
+    /*
+     * 本地曲库服务：这里必须显式初始化一次 —— SD 热插拔监控任务就是在
+     * storage_service_init() 里起来的（板子没有卡检测脚，全靠它轮询）。
+     * 只在别的入口惰性初始化的话，用户不开本地音乐页就永远没有热插拔：
+     * 插拔卡没有 Toast、状态栏图标不动、换了卡也得重启。
+     */
+    if (storage_service_init() != ESP_OK) {
+        ESP_LOGW(TAG, "storage_service_init failed (本地曲库不可用)");
+    }
+
     /* 在线音乐：建 /sdcard/online 目录树 + 读回保存的歌单 ID（不需要网络） */
     online_service_init();
 
@@ -258,6 +271,20 @@ extern "C" void app_main(void)
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "ui_core_init failed: %s", esp_err_to_name(ret));
         }
+        /*
+         * 拼音输入法用**本工程的 UI 位图字体**，不用它自带的生成字体。
+         *
+         * 自带那两套只覆盖 tools/gen_charset.py 选的字符集（GB2312 + 十来个
+         * UI 符号），键盘上的说明文字一旦超出这个集合就是缺字方框 —— 而同样
+         * 一个字在别的页面（用 ui_font_text）显示得好好的，看起来就像"输入法
+         * 的字库坏了"。ui_font_text 是"GB2312 + 日文汉字补充"的 fallback 链，
+         * 覆盖面更宽，而且整机字体一致。
+         *
+         * 必须在任何 lv_pinyin_ime_create() 之前调用（字体是建控件时读的），
+         * 而两个用输入法的页面（在线搜索、MomoTalk）都是用户点进去才建的，
+         * 所以放在 ui_core_init 之后、启动图之前最稳妥。
+         */
+        lv_pinyin_ime_set_fonts(UI_FONT_TEXT, UI_FONT_TEXT);
         boot_splash_show();
         esp_lv_adapter_unlock();
     }

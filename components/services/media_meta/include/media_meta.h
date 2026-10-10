@@ -146,6 +146,25 @@ typedef struct {
  */
 esp_err_t media_meta_probe_mp3(const char *audio_path, audio_probe_t *out);
 
+/*
+ * **通用**音频参数探测（2026-10 加，修"部分文件没时长 / 不能拖动"）。
+ *
+ * 按**魔数**分派（不看扩展名 —— 用户的文件扩展名经常撒谎），当前覆盖：
+ *   - MP3（ID3 + 帧头 + Xing/Info）→ 直接转给上面的 media_meta_probe_mp3()
+ *   - FLAC（`fLaC` → 块链找到 STREAMINFO → 总采样数 ÷ 采样率 = 准确时长）
+ *   - WAV（`RIFF/WAVE` → fmt 的字节率 + data 长度）
+ *   - ADTS 封装的 AAC（帧头里的帧长 + 采样率 → 平均码率，时长按文件大小估）
+ * 其它容器（M4A/OGG/Opus）暂时返回 ESP_ERR_NOT_SUPPORTED，调用方保持原逻辑。
+ *
+ * 为什么必须有：GMF 的 MUSIC_INFO 对非 MP3 本地文件报 `0 bps, 0 ms`，
+ * 于是总时长显示 `--:--`、进度条不动，拖动定位还会直接报"定位失败：码率未知"。
+ * 拿到时长后码率按 `音频字节数 × 8 ÷ 时长` 补（FLAC/WAV 没有码率字段）。
+ *
+ * ⚠ 逐块按长度跳过（**不去读封面**，FLAC 的 PICTURE 动辄几 MB）。
+ * 同步小 IO（最多读几十字节 + 少量 seek），别在 LVGL 任务里调用。
+ */
+esp_err_t media_meta_probe_audio(const char *audio_path, audio_probe_t *out);
+
 #ifdef __cplusplus
 }
 #endif

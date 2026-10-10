@@ -269,6 +269,249 @@ Meting API（`http://meting.xcnahida.cn/...`，**明文 http** 就够，省掉 T
 `audio_service_play_uri()` 边下边播；流地址拿不到才回退"先下载到 SD 再当本地文件播"）。
 封面 / 歌词在任何一条路径下都只进 PSRAM 缓存，不再写 SD。
 
+**播放地址会过期（403），app 自动重刷**（2026-10 加，`app_music.cc`）：
+
+```
+I ESP_GMF_HTTP: HTTP Open, URI = http://m701.music.126.net/20261010132238/...mp3?vuutv=...
+E ESP_GMF_HTTP: Invalid HTTP stream, status code = 403
+E ESP_GMF_IO: esp_gmf_io_open failed   →   E audio_svc: player error state
+```
+
+网易云的流地址带**时间戳 + 签名**（`.../20261010132238/...?vuutv=...`），放一阵、或过一会儿
+再点回来听就 403。到 app 这层只剩一个 `AUDIO_EVT_ERROR`（**拿不到状态码**），所以策略是
+"在线流媒体出错先重刷一次地址再放"：`online_url_refresh()` 弹
+`音乐链接已过期，正在刷新链接...` → 复用点歌的准备链路（解析 302 → `s_on_ready` → 起播），
+**每首最多 `ONLINE_URL_RETRY_MAX`(2) 次**，仍然失败才按原来的"这首放不了，已跳过"处理
+（本地曲目不走这条路）。计数在"起播成功 3 秒后"与"点新歌 / 切回本地"时清零。
+⚠ 出错那一刻如果 `s_on_busy`（用户刚点了别的歌，在跑的准备是新的那首），只"别 advance"、
+不重复下单、也不再弹提示。
+
+**拖动定位（seek）**（2026-10 加：`audio_service.cc` + `app_music.cc`。传输层是 GMF 现成的，
+我们只负责"时间 → 字节"与 seek 前后的收尾）：
+
+| 环节 | 事实 |
+| --- | --- |
+| 传输 | `esp_gmf_io_http` 的 `_http_open()` 在 `info.pos != 0` 时**自动**加 `Range: bytes=N-`（不用自己调 `esp_http_client_set_header`）；`_http_seek()` = 关连接 + 重开 |
+| 缓存内瞬移 | `esp_gmf_io_seek()` 先试 `seek_in_cache()`：**只处理向前**、且目标落在"已预读、还没喂给解码器"的数据里 → 就地丢字节，零网络（日志 `Seek within buffer, drop N bytes`）。4 MB 环形缓冲 ≈ 320 kbps 的 100 秒 |
+| 服务端不支持 Range | 回 200 时 `range_not_supported=true` + `skip_bytes=info.pos` → 本地丢掉前 N 字节（慢，但**不是"不能 seek"**） |
+| 实测 | 网易云 CDN `m801.music.126.net` 对 `Range: bytes=1000000-` 回 **206 + `Content-Range: bytes 1000000-1000103/3195693`** ✓ |
+| 时间 → 字节 | 码率优先级：① 本地 `media_meta` 探测的平均码率（MUSIC_INFO 处理时已换过）② **在线 `Content-Length ÷ 时长`**（就是"(目标时间/总时长)×总字节数"）③ 兜底解码器第一帧码率。②的时长由 `audio_service_set_duration_ms()` 告知（GMF 的 MUSIC_INFO 里 duration 恒为 0），**必须在 `play_uri()` 之后调**（换曲会清零） |
+| 出声标志 | `audio_service_seek_ms()` 里把 `s_out_flowing` 清零：UI 靠 `audio_service_output_active()` 判"缓冲结束、撤掉'缓冲中…'"，不清零的话提示刚挂上就被撤掉，用户只看到"进度条跳过去了但没声音" |
+| 卡死看门狗 | seek 后必须复位 `s_stall_kicks/s_stall_ticks`：重新缓冲正是它盯的特征（声称在播但没 PCM），不复位它 10 s 后会去 pause/resume 搅局 |
+| 容器白名单 | `app_music` 的 `track_seek_unsupported()`：**mp3/aac/ts/flac 能拖**（帧自带同步字；FLAC 的 STREAMINFO 解码器打开时已拿到）；**m4a/mp4/ogg/opus 挡掉**（要 moov 索引 / 要 codec setup 头）。认扩展名时先切掉在线 URL 的 `?vuutv=...` 签名串，只看文件名部分 |
+| 已知误差 | 流上 `s_data_offset = 0`（不扣 ID3v2 头）→ 中段定位会**早到几秒**（标签越大越明显）；网易云下发的流标签很小（封面走单独接口），实测可忽略 |
+| 暂停时拖动 | 不挂"缓冲中"提示（那时不会有 PCM，提示会永远留在屏上）；在线拖动的进度**不写进度记忆**（URL 带时效签名，存了没用） |
+
+验证用日志：`ESP_GMF_IO: Seek within buffer, drop N bytes, seek to M`（瞬移）/
+`ESP_GMF_HTTP: HTTP Open, URI = ...`（Range 重连）/ `W ESP_GMF_HTTP: Server ignored HTTP
+Range (status 200)`（兜底，慢）/ `audio_svc: seek -> NNNms (byte N, bitrate N bps, stream
+size/duration)` / `app_music: seek rebuffered, stream at N%`（落点核对）。
+
+**seek 的两个进阶机制**（2026-10 补，全在 `audio_service.cc` 里）：
+
+1. **实测有效码率**（`s_meas_bps`）：`esp_gmf_io_get_pos()` 的推进点在
+   `esp_gmf_io_release_read()`（消费者 release 一块数据时才 `+valid_size`），也就是
+   **"解码器吃到哪了"**，**不是"网络读到哪"** —— 所以 `Δpos ÷ Δ已播时长` 就是这段音频的
+   真实码率（VBR 也成立）。采样在 `out_write_cb` 里顺带做：跳过起播抢读期
+   （`SEEK_MEAS_WARMUP_MS` = 2 s，那会儿解码器会抢读一大段，测出来能飙到几 Mbps）、
+   每 `SEEK_MEAS_WINDOW_MS`(1 s) 采一个窗口、两道合理性检查（绝对值 8 kbps~2 Mbps +
+   与全曲平均相差不超过 4 倍，后者专防**跨 seek 的脏采样**），结果做 3:1 IIR。
+2. **相对映射**（`seek_byte_for()`）：向前拖、且实测码率与全曲平均差 20% 以上
+   （VBR，或压根没有全曲平均）时用
+   `byte = 解码器当前位置 + Δ时间 × 实测码率 ÷ 8000`；其余情况用绝对映射
+   `byte = offset + 时间 × 平均码率 ÷ 8000`。**向后拖只能用绝对映射**（相对没法往回推）。
+   时间轴 = `s_pcm_bytes ÷ 192`（输出固定 48 kHz/16bit/2ch ⇒ 192 B/ms），
+   seek 成功时把基准挪到目标时刻、PCM 计数清零（避免逐块取整的漂移）。
+3. **落点核对**（`audio_service_seek_landing_ms()`）：seek 后**第一块 PCM** 出来时，用
+   `esp_gmf_io_get_pos()` 按**同一个码率**把字节反推回时间并打日志；`app_music` 轮询它
+   （最多 10 个 tick），偏差 > 3 s 就把 `s_elapsed_ms` 对齐过去 + `lyric_resync()`
+   —— 防的是"服务端悄悄忽略 Range / 按别的范围给数据"，那种情况不校正就永远差一截。
+
+对应日志：`audio_svc: seek -> NNNms (byte N, N bps, average|measured(relative))`、
+`audio_svc: seek landed: byte N -> NNN ms (asked NNN ms, diff N ms)`、
+`app_music: seek landing off by N ms ... realign`（只有偏差大时才打）。
+
+⚠ **GMF 的坑：`HTTP_STREAM_FINISH_REQUEST` 只在 writer 方向派发**（2026-10 真机踩过）。
+`esp_gmf_io_http.c` 的 `_http_open()` 里是
+`if (http->is_open && (http->base.dir == ESP_GMF_IO_DIR_WRITER)) { … dispatch_hook(FINISH_REQUEST) }`
+—— 流式播放是 **READER**，这个事件**永远不来**，所以钩子里的 `s_stream_total` 恒为 0。
+真机现象：在线拖动定位弹"定位失败：码率未知" —— 总长为 0 就算不出平均码率，而那条流
+GMF 报的 MUSIC_INFO 码率又是 **0 bps**（`music info: 48000 Hz 2ch 16bit 0 bps, 200884 ms`），
+连兜底都没有。**总长度一律走 `stream_total_bytes()`**：问 `esp_gmf_io_get_size()` ——
+`_http_open()` 里 `esp_gmf_io_set_size(self, info.size)` 就是 Content-Length，读侧也照设
+（"缓冲中 xx%" 一直能显示，靠的也是这条兜底）。
+
+⚠⚠ **别拿"注册进池子的 IO 句柄"当管道在用的那个**（2026-10 真机踩了**两轮**才定位到）。
+`esp_audio_simple_player_register_io()` 只是把句柄登记进池子；建管道时
+`esp_gmf_pool_new_io()` 走的是 **`esp_gmf_obj_dupl()`**（`tmp->new_obj(tmp->cfg, new_obj)`）
+—— 池子按 cfg **新建一份实例**给管道用，所以注册进去的那个"模板"永远不会被 open，
+它的 `esp_gmf_io_get_pos()` / `esp_gmf_io_get_size()` **恒为 0**。
+症状：在线拖动定位弹"定位失败：码率未知"（总长取到 0 → 算不出平均码率）；**同一个原因**
+也让"缓冲中 xx%"一直显示不出来（一直停在"缓冲中，请稍后..."）。
+**正确来源：`esp_gmf_pipeline_get_in(pipe, &io)`**（源码里就是个赋值 + 无锁，随便调）——
+`audio_service` 里封成 `stream_io_update()`，在 `play_uri_locked()` 成功 `run()` 之后调一次；
+`play_uri_locked()` 开头先把旧句柄清空（管道里的实例可能已经重建）。
+⚠ cfg 是**共享**的，所以 4 MB 环形缓冲、事件钩子这些都照旧生效 —— 只有**句柄身份**是错的，
+别被"日志里 ring 4096 KB 明明生效了"误导。
+
+排查这类"算不出来"的问题，先看这行自诊断日志（`audio_service_seek_supported()` 拒绝时打）：
+`audio_svc: seek not ready: info=1 io=0x… total=0 dur=114770 avg=0 meas=0 gmf_br=0`
+—— `total=0` 就是上面这个坑；`info=0` 是 MUSIC_INFO 还没来；全都有值却还是失败，
+那就是 app 侧的容器白名单挡的（`track_seek_unsupported()`）。
+
+**CDN 掐断长连接 → GMF 自己重连续传（别被 ERROR 吓到）**（2026-10 真机日志）：
+
+```
+E transport_base: tcp_read error, errno=Connection reset by peer      ← 服务端/中间设备掐了长连接
+W HTTP_CLIENT: esp_transport_read returned:-2 and errno:5
+E ESP_GMF_HTTP: The error is happened in reading data, return value: -1, error msg: I/O error
+I ESP_GMF_HTTP: HTTP Open, URI = …（同一条 URI）                       ← GMF 自己重开
+I ESP_GMF_HTTP: The total size is 2576344 bytes                       ← 仍是**整首**总长（有意保留）
+W ESP_GMF_HTTP: Reconnect to peer successful                          ← ★ 成功了
+```
+
+- 这组是**恢复成功**的样本：`_http_read_data()` 读到错误 → `connect_times++` →
+  `_http_reconnect()`（= `_http_close()` + `_http_open()`）。
+- **续传按位置来**：`_http_open()` 从 IO 的 `info.pos` 拼 `Range: bytes=<pos>-`；
+  `info.size` 只在 `info.pos <= 0` 时取本次 Content-Length，否则**保留原总长**
+  （源码注释：*"the total byte of content has been changed after seek, set
+  info.total_bytes at beginning only"*）—— 所以日志里是整首大小、不是剩余长度。
+- 服务端**不支持** Range 才走兜底：`W Server ignored HTTP Range (status 200) … skip N bytes`
+  （日志里没这行 = 这次是正常的 206 部分续传 ✓）。
+- 计数是"**连续**失败"：`if (rlen > 0) http->connect_times = 0;` —— 成功读到一次就清零，
+  所以 `HTTP_MAX_CONNECT_TIMES(5)` 是"连着 5 次重连都拿不到数据"才放弃。
+- **什么时候才算真出问题**：`Reconnect times more than 5, disconnect http stream` +
+  `Failed to reset http connection` → `ESP_GMF_IO_FAIL` → `audio_svc: player error state`
+  → 这时才轮到 app 那套（403 重刷 / 换下一首）。
+- ⚠ 4 MB 环形缓冲会**长时间不读网络**（预读满就等消费），空闲长连接正是 CDN/NAT 最爱掐的
+  —— 这类 reset 出现得频繁是正常的，缓冲够深时听感不受影响。
+
+**⚠ 已知未修：重连连传锚点偏保守（会重复缓冲里那段）**。
+`info.pos` 的推进点是 `esp_gmf_io_release_read()`（**消费者已取走**的字节），
+而重连路径**不 flush 环形缓冲** —— 所以 `Range: bytes=<pos>-` 发出去后，
+服务端重发的 `[pos, N)` 会和缓冲里**还没消费**的那段重叠，被播两遍。
+重叠长度 = 重连瞬间缓冲里的存量，**与 `STREAM_RING_BYTES` 成正比**：
+GMF 默认 20 KB（≈0.5 s，没人会注意）→ 我们的 4 MB（可能整首重放）。
+正确锚点是"网络前沿" `anchor = info.pos + 缓冲已填字节数`
+（`esp_gmf_db_get_filled_size()`；首次 open 与 seek 后都为 0，所以对那两个调用点是 no-op）。
+真要修就改 `_http_open()` 里 Range 与 200 兜底 `skip_bytes` 用的那个值（托管组件补丁，同 §11.7/§11.8）。
+
+**在线流断了之后的三种收尾**（2026-10 用户报"卡了、甚至会没声音"，全在 `app_music.cc`）：
+
+| 现象 | 处理 |
+| --- | --- |
+| GMF 报错（403 / open 失败） | `online_url_refresh()` 重解析地址 → **从断点续播**（`s_on_resume_ms`，见下） |
+| **提前结束**（TCP reset 后 GMF 把"读不到"当成整体结束，`done` 在歌只放了一小半时到） | `tick` 里判 `s_dur_ms > 30 s && s_elapsed_ms + 15 s < s_dur_ms` → 不当成放完，改走重刷 + 续播；`s_eof_retry` 每首上限 3 次（**只在真换曲时清零**，否则"放了 3 秒"就把额度补满 = 没上限） |
+| **彻底卡死**（GMF 既不出错也不返回，所以 app 永远收不到事件） | 20 s 无 PCM 的看门狗：先 pause/resume 踢 3 次；**踢完必须确认 `audio_service_is_playing()` 为真**（pause 成功而 resume 失败会把管线留在 PAUSED，而看门狗只盯"声称在播"的流 → 再也没人来救 = 彻底无声）；3 次无效后**升级成重刷地址 + 断点续播**，刷新额度也用完才 `s_err_req = true` 交给错误处理 |
+
+- **断点续播**（`s_on_resume_ms`）：`online_url_refresh()` 在重刷前把 `s_elapsed_ms`
+  记下来（>5 s 才记），起播后由 `tick` 等 `audio_service_seek_supported()`
+  就绪再 `audio_service_seek_ms()` 定位回去 —— 复用的是 §11.4 那套"时间 → 字节"，
+  所以进度条/歌词会跟着对齐、落点核对还会纠偏差。以前是**从头放**（听了 40 秒一出错回 0 秒）。
+  `s_elapsed_ms` 只在**真的出声**期间累加，所以卡住/无声那段不会让它虚涨，它天然就是断点。
+- 续播超时（`Content-Length` 拿不到 / 时长未知）会放弃并从头放，日志 `online resume: not ready`。
+
+**播放器页的缓冲提示：转圈 + 实时下载速度**（2026-10 需求："只写一行字像卡死"）：
+
+```
+[◜] 缓冲中 20 KB/s · 45%
+```
+
+- **速度来源是 GMF 自己的速度统计**：`esp_gmf_io_get_speed_stats()`（头文件里的
+  `esp_gmf_io_speed_stats_t.current_speed_kbps / average_speed_kbps`）。
+  `audio_service_stream_speed(int *kbps)` 把它包出来（**纯查询**，任何任务都能调）。
+  - 统计是在 IO 任务每次真读到数据后 `esp_gmf_io_update_speed_stats(io, 实际字节, 耗时)`
+    更新的（1:9 平滑，≥100 ms 一次），所以它反映的是**网络下载速率**；
+  - ⚠ 单位是 **Kbps（千比特/秒）**（源码 `interval_bytes * 8 / interval_time_ms`）。
+    UI 要 KB/s 得 **÷8**（`app_music` 的 `buf_hint_text()` 就是这么干的）——
+    直接把 Kbps 当 KB/s 印，320 kbps 的流会显示成 "320 KB/s"，差 8 倍；
+  - ⚠⚠ **必须在这个句柄上开**：`esp_gmf_io_enable_speed_monitor(io, true)` 要调在
+    `stream_io_update()` 拿到的、**管道真正在用的**那个 IO 上 —— 池子里的"模板"开了没用
+    （同 §11.4 那个 `esp_gmf_obj_dupl()` 的坑）。`enable(true)` 只在没分配时分配、
+    重复调用只是 memset 清零，不会泄漏。
+  - 拿不到速度（本地文件 / 没开统计 / 还没读）时函数返回 false，UI **不显示速度**，
+    别显示 "0 KB/s"。
+- **转圈**用 `lv_spinner`（本工程 `CONFIG_LV_USE_SPINNER=y`，app_online 的"载入中"也是它；
+  它自带无限循环动画，不用自己起 timer）。样式抄 app_online：暗底圈 `UI_COLOR_PILL` +
+  强调色转弧 `UI_COLOR_ACCENT`，`arc_width` 3 px，尺寸 22 px。
+- **布局**：提示行是一个 `LV_SIZE_CONTENT` 的 **flex row**（转圈 + 文字）居中放在歌词框里。
+  用 flex 而不是绝对定位，是因为转圈藏起来时（"暂无歌词"/"轻点封面显示歌词"）
+  文字会自动居中，不用额外调。
+- ⚠ **转圈的可见性只在 `buf_hint_text()` 里对齐**（"有文字就有转圈"）。
+  为什么不能只在 `set_buffering_hint()` 里显示：起播流程是
+  `app_music_play_online()` → `set_buffering_hint()`（显示转圈）→
+  `start_track_online_at()` → `lyric_rebuild()` → `lyric_apply_mode()`
+  （**把转圈藏起来**）—— 而这时 HTTP 流才刚开始缓冲（`s_buf_show` 仍为真），
+  只在第一处开的话，最需要转圈的那一段反而没转圈。
+  `lyric_apply_mode()` 负责关（出声/换曲时调用）。
+
+**本地文件"没时长 / 不能拖 / 卡死"三件事**（2026-10 用户报，真机日志）：
+
+```
+I AUD_Dec_Parse: FLAC sample_rate 44100 duration:268384 max_frame:3635
+E AUD_Dec_Parse: Not found frame in max frame size 3635      ← 反复刷
+...
+I audio_svc: music info: 48000 Hz 2ch 16bit 0 bps, 0 ms      ← ★ 码率/时长都是 0
+I media_meta: cover decoded 240x240                          ← 说明 media_meta 能读这个文件
+```
+
+- **根因①（时长 / 拖动）**：`media_meta_probe_mp3()` **只认 `.mp3`**（注释里写着"其它扩展名
+  返回 `ESP_ERR_NOT_SUPPORTED`"）→ FLAC / WAV / AAC 这些本地文件的 `s_info` 永远是
+  `0 bps, 0 ms` → 界面总时长 `--:--`、进度条不动，拖动直接报"定位失败：码率未知"。
+  **修法**：新增 `media_meta_probe_audio()`，**按魔数**分派（不看扩展名）：
+
+  | 容器 | 取值 | 时长怎么算 |
+  | --- | --- | --- |
+  | MP3 | 直接转给原有 `media_meta_probe_mp3()`（ID3 + 帧头 + Xing/Info） | Xing 帧数，或大小÷码率 |
+  | FLAC | `fLaC` → 块链找 **STREAMINFO**（34 B）：20bit 采样率 / 声道 / 位深 / **36bit 总采样数** | 总采样数 ÷ 采样率（**准确**） |
+  | WAV | `RIFF/WAVE` → `fmt ` 的字节率 + `data` 长度 | data ÷ byte_rate |
+  | ADTS AAC | 帧头 7 B：采样率索引 + 13bit 帧长（每帧 1024 采样） | 大小 ÷ 平均码率（估） |
+
+  - FLAC/WAV **没有码率字段** → 码率按 `音频字节数 × 8 ÷ 时长` 补（这正是 seek 要的平均值，
+    VBR 也成立）。
+  - ⚠ **按块长度跳，绝不逐字节扫**：FLAC 的内嵌封面（PICTURE 块）动辄几百 KB~几 MB，
+    逐字节扫又慢、又正是 ESP 那个解析器刷 `Not found frame in max frame size` 的来源。
+    我们只读几十字节 + 少量 `fseek`。
+  - 顺手比 ESP 解析器宽容：允许 FLAC 前面带 **ID3v2** 标签（先按 synchsafe 长度跳过）。
+  - **还没做的容器**：M4A（要走 moov/mvhd）、OGG/Opus（要末页 granule）→ 仍走原逻辑
+    （时长显示 `--:--`）。这两类本来就在 seek 白名单之外（见上面的容器表）。
+  - 调用点在 `audio_service.cc` 的 MUSIC_INFO 处理里（本地文件优先用探测值，
+    顺带把 GMF 漏报的采样率也补上）。
+- **根因②（卡死 / 刷屏）**：那个 FLAC 解码器**一帧都吐不出来**，但管线状态仍是 RUNNING
+  → 界面显示"在播"、没有任何声音、日志一直刷，而**旧看门狗只看在线流**
+  （注释里甚至写着"本地文件不会这样卡"，已被真机打脸）→ 本地这种情况**永远没人管**。
+  **修法**：看门狗改成在线/本地都盯，阈值分开 —— 在线 20 s（重新缓冲可能真要十几秒）、
+  **本地 8 s**（`LOCAL_STALL_TICKS`，SD 读 + 解第一帧只要 2~3 s）。
+  本地超时 → `s_fail_streak++` + Toast「这个文件解不出来，已跳过」+ **`play_next(+1)`**
+  （**不能**置 `s_advance_req`：那个走 done 分支，单曲循环下会把同一个坏文件再放一遍 =
+  死循环）；连续 3 个都放不了就停下并提示。
+- **仍未定位**：那个 FLAC 为什么解不出帧。解析器在**预编译库**里
+  （`libesp_audio_simple_dec.a` 的 `es_parse_default.c` / `esp_es_parse.c`；
+  反汇编 `flac_frame_verify` 看到它只是个 CRC-16 校验，报错来自它的调用方），
+  而且**没有配置入口**（`esp_flac_dec.h` 的 open 是 `cfg=NULL, cfg_sz=0`）——
+  §11.8 那个 `set_search_limit` 补丁管的是"首次同步头搜索"的总上限，不是这条
+  按 `max_frame` 分块的搜索。**要定位必须拿到那个文件本身**（看它的 STREAMINFO、
+  元数据块链和首帧位置）。
+
+**循环模式：在线只支持 列表循环 / 单曲循环**（2026-10 用户报"在线单曲循环失效"）：
+
+- **根因（两个都修了）**：`tick_cb` 里"放完 → 下一首"那块原来只有**本地**那套逻辑：
+  ① `PLAY_MODE_ONE` 分支调的是本地的 `start_track(s_index)` —— 在线曲目不在本地库里，
+  要么报"曲目不存在"、要么拿**同下标的本地曲目**顶上（这就是"单曲循环失效"）；
+  ② 整块被 `storage_service_count() > 0` 挡着 —— 没插卡 / 本地为空时，在线歌放完
+  **停住不续播**。现在按 `on_queue = (s_on_mode && s_on_songs && s_on_count > 0)` 分开：
+  在线单曲循环走 **`play_next(0)`**（重新解析地址 → 起播，顺带换掉可能过期的签名地址），
+  在线列表循环走 `play_next(+1)`，本地那两条逻辑不变。
+- **在线禁用随机循环**：`on_mode_click()` 在线时只在 列表 ↔ 单曲 之间切，想切随机就拦下并
+  Toast「在线播放不支持随机循环」；切到在线队列时（`app_music_play_online()`）若当前是随机，
+  **兜底落回列表**（这里不弹 Toast —— 会被紧接着的"缓冲中"顶掉），并且 `play_next()` 的
+  在线分支里**删掉了随机分支**，不给"在线也能随机"的错觉。
+- **播放器页显式标注来源**（需求）：标题上方一个小药丸 `apply_src_badge()` ——
+  **在线播放**（强调色底、深色字）/ **本地播放**（灰底、暗字）。
+  它由 `tick_cb` 每 500 ms 兜底刷新（内部比较上次画的状态，没变就直接返回，零开销），
+  所以换队列/切歌的路径再多也不会漏。页面销毁时记得把 `s_p_src_badge` 置空 +
+  `s_src_badge_state = -1`（否则重进页面不重画）。
+
 ### 11.5 Wi-Fi / 蓝牙开关与开机自动连
 
 - 开关状态存各自 NVS：`wifi_cfg/on`、`bt_cfg/on`（默认开）；UI 在设置页顶部（`lv_switch`）
@@ -334,6 +577,7 @@ free）当作键盘 READY 事件的 `user_data`。而 `wifi_tick` 每 500 ms 就
 
 **这些是改在 `managed_components/` 里的**，`idf.py update-dependencies`、
 删 `managed_components/` 或换 `dependencies.lock` 都会把它们冲掉。改完记得回来补。
+（同一目录下还有 §11.8 的 FLAC 搜索上限补丁，也在 `esp_gmf_audio_dec.c` 里。）
 
 补丁位置（同一个根因，三处）：
 
@@ -376,9 +620,97 @@ MTVAL = 0x8   ← NULL + valid_size 的偏移
 （`esp_gmf_task_stop()` 内部 `GMF_TASK_WAIT_FOR_STATE_BITS` 等 STOP 位），
 所以 `play_uri_locked()` 里"先 stop 再 run"的顺序没问题，别去那边找原因。
 
+### 11.8 ⚠ 补丁：FLAC 内嵌大封面导致整首放不出来（2026-10 真机踩过）
+
+**症状**（本地 FLAC，41 MB）：
+
+```
+I (641945) audio_svc: playing file:///sdcard/024-Shoujo Delight_38762618.flac
+I (642184) AUD_Dec_Parse: FLAC sample_rate 48000 duration:138172 max_frame:6942
+E (643192) ESP_ES_PARSER: Search overlimited 512000
+E (643193) ESP_GMF_ASMP_DEC: Failed to decode data, ret: -7
+I (643203) ESP_GMF_FILE: CLose, pos = 513024/41671543
+E (643248) audio_svc: player error state
+```
+
+**根因**：FLAC 的元数据块（尤其内嵌封面 PICTURE）可以有好几百 KB 到几 MB，**音频首帧在
+它后面**；而 `esp_audio_simple_dec` 里那个 es_parser 在"找首帧"时默认只肯扫 **512000**
+字节。反汇编 `libesp_audio_simple_dec.a` 的 `esp_audio_simple_dec_open` 看得很清楚：
+
+```asm
+190: li   a5,50          ; 内部参数 = 50
+194: lui  a1,0x7d        ; ★ a1 = 0x7D000 = 512000
+198: lw   a0,4(s0)       ; 解析器句柄
+19a: sh   a5,40(s0)
+1a0: jalr ...            ; esp_es_parse_set_search_limit(parser, 512000)
+```
+
+**修法**（`managed_components/espressif__gmf_audio/esp_gmf_audio_dec.c`，
+和 §11.7 一样是托管组件补丁，重装依赖会丢）：
+
+```c
+/* 组件头文件里没声明，符号是导出的（nm 里是 T） */
+extern esp_audio_err_t esp_audio_simple_dec_set_search_limit(void *handle, uint32_t search_limit,
+                                                             uint16_t reserved);
+static esp_audio_err_t aud_dec_open_patched(esp_audio_simple_dec_cfg_t *cfg, void **handle)
+{
+    esp_audio_err_t ret = esp_audio_simple_dec_open(cfg, handle);
+    if (ret == ESP_AUDIO_ERR_OK && *handle != NULL) {
+        esp_audio_simple_dec_set_search_limit(*handle, 4 * 1024 * 1024, 50);   /* 50 = 库默认 */
+    }
+    return ret;
+}
+```
+
+文件里**三处** `esp_audio_simple_dec_open()`（open / 探测后 open / reopen）都改成走这个
+包装，任何一条打开路径都会放宽上限。
+
+- **签名是反汇编确认的**：`handle` + 32 位字节上限 + 16 位内部参数（库里默认
+  `(512000, 50)`）；`esp_audio_simple_dec_set_search_limit` 内部把第 3 个参数以 `sh`
+  写进 handle 偏移 40，把第 2 个参数转交给 `esp_es_parse_set_search_limit`（那里是
+  `sw a1,104(a0)`，确认是 32 位字节数）。第三个参数保持库默认值 50，别乱动。
+- **不额外吃内存**：搜索是"边读边丢"的流式扫描（只推进位置），所以放宽到 4 MB 只是允许
+  它多读一段元数据；普通文件首帧就在开头，零影响。
+- 升级 `esp_audio_codec` 后如果这个符号没了，**链接会失败**（正好能发现），
+  那时去看新版本有没有公开的配置入口。
+
 ---
 
 ## 12. 本地音乐列表 与 UI 帧率（2026-10 修复）
+
+### 12.0 ★★ 布局自反馈 = LVGL 空转 + 看门狗超时（2026-10 真机踩过）
+
+真机日志长这样（BT 在放歌，`lvgl` 一直跑、IDLE1 饿死）：
+
+```
+E task_wdt: Task watchdog got triggered. ... - IDLE1 (CPU 1)
+E task_wdt: CPU 1: lvgl
+--- 0x401db2de: calc_content_height at .../lv_obj_pos.c:1464
+```
+
+根因是 **`lv_obj_update_layout()` 里的 `while(scr->scr_layout_inv)` 没有次数上限**
+（`lv_obj_pos.c:393`）：只要一轮布局里又有对象把布局标脏，它就再来一轮。最常见的
+制造方式是**内容尺寸自反馈**：
+
+```c
+lv_obj_t *card = lv_obj_create(parent);          /* lv_obj_set_height(card, LV_SIZE_CONTENT) */
+lv_obj_t *ovl  = lv_obj_create(card);
+lv_obj_set_size(ovl, LV_PCT(100), LV_PCT(100));  /* 高度 = 卡片高度 */
+lv_obj_add_flag(ovl, LV_OBJ_FLAG_IGNORE_LAYOUT); /* ← 以为这样就"不影响布局"了 */
+```
+
+**`IGNORE_LAYOUT` 只让子对象不参与 flex/grid 布局，并不会让它不算进父对象的
+`calc_content_height()`** —— 那里只跳过 `HIDDEN` 和 `FLOATING`
+（`lv_obj_pos.c:1482`）。于是"卡片多高取决于覆盖层、覆盖层多高又取决于卡片"，
+来回震荡就永远出不来。同理，`lv_obj_align_to()`（会记住 base 并在 base 移动时重新
+对齐）放在 `LV_SIZE_CONTENT` 的父对象里也是同一个坑。
+
+**规则**：覆盖层/装饰层/浮动提示用 **`LV_OBJ_FLAG_FLOATING`**（布局与内容尺寸
+计算都会跳过它）；`IGNORE_LAYOUT` 只在"父对象尺寸已经定死"时才够用。
+
+**已经这么改过的**：`ui_ba.cc` 的卡片装饰层与右上角关闭按钮、`lvgl_pinyin_ime`
+的拼音 chip（改成候选栏内的普通 flex 子对象）与"左滑清空"提示条。
+**另外**：条件允许就别在最外层套 `LV_SIZE_CONTENT`；固定高度能让整类问题消失。
 
 ### 12.1 列表"显示不全"的根因：一个写死的 64
 
@@ -403,6 +735,54 @@ MTVAL = 0x8   ← NULL + valid_size 的偏移
 滚动每帧遍历它们。所以**列表按 120 行分页**（"‹ 上一页 / 下一页 ›"两行 + 顶部提示
 "第 x/y 页 · 共 N 项"），而**播放队列仍是整个目录** —— 完整性问题用分页解决，不用截断。
 翻页只重画（`local_render()`），不重读 SD 目录。
+
+### 12.2.1 SD 卡热插拔（2026-10 加）
+
+**板子上没有卡检测脚**（板级 YAML 的 `fs_sdcard` 没有 `cd`），所以"卡在不在"
+只能定期试探。三件事合起来才成立，缺一个就会变成"插拔没反应 / 换卡要重启"：
+
+1. **探测**：`bsp_sdcard_probe()` 用 **CMD13(SEND_STATUS)** 问卡还在不在。
+   ⚠ 不能用 `stat()`/`opendir()` 代替 —— FATFS 把目录项与 FAT 表缓存在内存里，
+   卡拔了它照样能回答，界面于是永远显示"已挂载"。
+2. **卸载**：探测连续失败 `SD_PROBE_FAIL_MAX`(2) 次才 `bsp_sdcard_unmount()`。
+   ⚠ 卸载**必须**走板级 `esp_board_manager_deinit_device_by_name("fs_sdcard")`：
+   它的 deinit 会 `esp_vfs_fat_sdcard_unmount()` → 内部 `call_host_deinit()`，
+   把 SDMMC 也一起拆干净（`sdmmc_host_deinit()` 里 `s_ctlr=NULL`）。不拆干净的话，
+   重新挂载会在 `sdmmc_host_init_slot()` 上拿到 "slot already initialized"
+   —— 这就是"换了卡也得重启才认"的根因。`sdmmc_host_init()` 自己是幂等的
+   （已建就返回旧句柄），所以关键在 **slot** 有没有被拆。
+3. **轮询任务**：`storage_service` 里 `sd_monitor_task`（4 KB 栈、优先级 2）——
+   已挂载时每 1 s 探一次，未挂载时每 1.5 s 试着挂一次（连续失败退到 5 s，
+   免得没插卡时每 1.5 秒初始化一次卡）。挂/卸都过一把互斥锁，设置页的
+   「重新检测」（`storage_service_sd_rescan()`）走同一个入口，两边不会同时
+   init/deinit 同一个设备。
+
+**UI 怎么跟上**：状态每变一次 `storage_service_sd_generation()` **+1**（多处 UI
+各记自己上次见到的代次，比"事件队列"好，不存在谁消费掉了）。用它的有三处：
+
+| 位置 | 行为 |
+| --- | --- |
+| `ui_status_bar.cc` | 500 ms 轮询代次 → 更新 SD 图标 + Toast（插入还报容量） |
+| `app_music` 本地列表页 | 拔卡 → 列表换"未检测到"，**正在放本地歌就停播**并提示；插卡 → 从挂载点重新列一遍（换卡也能认出来） |
+| `app_settings` 存储页 | 代次变了就 `storage_rebuild()` 重画容量/卡信息 |
+
+Toast 只在**状态栏**那一处弹（插入/拔出各一句），页面不重复弹，否则两句会互相覆盖。
+
+**轮询的日志必须自己管住**（2026-10 用户报"每秒一行 `BOARD_DEVICE: Device handle
+fs_sdcard found`"）—— 热插拔是每秒/每几秒一次的常态动作，任何 INFO/ERROR 都会刷屏：
+
+| 噪声来源 | 修法 |
+| --- | --- |
+| `esp_board_manager_get_device_handle()` 每次都打一行 INFO | `bsp_sdcard_probe()` / `bsp_sdcard_card_info()` 改用**挂载时缓存的卡句柄**（`s_card = fat->card`，卸载时先清空，生命周期与 `s_mounted` 一致），不再每次去问 |
+| 没插卡时每次重试挂载都会从板级管理器 / SDMMC 驱动刷好几行 ERROR（"Failed to initialize device"、"Failed to mount filesystem"、"send_op_cond returned 0x107"…） | 后台重试那一次把**默认日志级别**临时压到 `ESP_LOG_NONE`（`esp_log_level_set("*", ...)` + `esp_log_get_default_level()` 保存/恢复，窗口只有一次卡初始化的几十~一百毫秒），试完立刻恢复；成功那次自己打一行 `SD inserted at /sdcard (gen N)` |
+| 用户主动点的「重新检测」 | **不压日志**（`sd_try_mount(false)`）：那是用户要看失败原因的场景 |
+| `bsp_sdcard_mount()` 自己的失败 WARN | 一个"失败连续段"里只打一次（`s_mount_fail_logged`，成功时清零）；开机那次是显式调用，正常打出来 |
+
+⚠ 别用 `esp_log_set_default_level()`：它虽然是"只改默认级别、不动 per-tag 表"的正解，
+但声明在 **`esp_private/log_level.h`** 里（私有头）。工程里没有任何地方设过 per-tag 级别，
+所以 `esp_log_level_set("*", ...)` 的"清空 linked list"副作用没有代价 —— 用它就够，
+而且是公开 API。将来真用上 `esp_log_level_set("<tag>", ...)` 的话，这里的保存/恢复要
+跟着改成按 tag 逐个处理。
 
 ### 12.3 帧率：先看这三件事
 
@@ -1033,6 +1413,54 @@ discovery_start/stop、connect/disconnect、set_scan_mode）。于是"开机自�
   : UI_COLOR_ACCENT;`，别套 `uint32_t` + 再 `lv_color_hex()` 一次。
 
 ---
+
+### 15.5 设备信息页（"关于本机"，2026-10 需求）
+
+设置 →「关于本机」以前只弹一句 Toast（版本号），现在点进去是完整的设备信息页
+（`page_about`，`app_settings.cc`）：**芯片 / Flash 存储 / 内存 / 网络标识 / 系统** 五组。
+
+| 项 | 取法 | 坑 |
+| --- | --- | --- |
+| 型号 · 核心数 · 修订 | `esp_chip_info()` | 枚举里**有** `CHIP_ESP32S31`；认不出的型号退回 `CONFIG_IDF_TARGET` |
+| CPU 频率 | **`CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ`** | `esp_clk_cpu_freq()` 声明在 `esp_private/esp_clk.h`（私有头，别碰）。本工程没开 `CONFIG_PM_ENABLE`/DFS，主频开机定死，配置值就是运行时值；哪天真开了 DFS 要换运行时查询 |
+| Flash 容量 | `esp_flash_get_size(NULL, &sz)` | 外挂 flash 的总容量（本板 16 MB） |
+| 分区大小 / Flash 可用 | 运行分区 `address/size` − **镜像长度** | 镜像长度只能问 `esp_image_get_metadata()`（`esp_app_get_description()` **没有** size 字段）。该 API 已验证是**只读且静默**的（内部 `do_load=false, do_verify=false, silent=true`），LVGL 任务里调用安全 —— **别换成 `esp_image_verify`**（那个会读整个镜像） |
+| SRAM / PSRAM 总量与可用 | `heap_caps_get_total_size / get_free_size(MALLOC_CAP_INTERNAL / MALLOC_CAP_SPIRAM)` | 两者分开问；PSRAM 总量为 0 时显示"未启用" |
+| Wi-Fi / 热点 / 蓝牙 MAC | `esp_read_mac(mac, ESP_MAC_WIFI_STA / _SOFTAP / ESP_MAC_BT)` | **直接读 eFuse**，Wi-Fi/蓝牙驱动关着也能读到（不用等无线服务起来） |
+| 版本 / 编译时间 / IDF / 运行时长 / 屏幕 / SD 卡 | `esp_app_get_description()` + `esp_timer_get_time()` + LVGL 版本宏 + `UI_W/UI_H` + `storage_service_*` | — |
+
+- 页面由 `about_section()`（分组小标题）+ `about_add()`（"名称 → 值"行）+ 1 s 的
+  `about_tick` 组成。值 label 宽度是 **`UI_PCT_X(52)`**（不是列表默认的 30%）——
+  MAC 串、容量串更长。
+- **只有"会变的"四行**（SRAM 可用 / PSRAM 可用 / 运行时长 / SD 卡）交给 tick，
+  用 `label_set_if_changed()` 就地改文本；**绝不重建控件** —— 重建会把滚动位置和
+  触摸状态一起弄乱（同 §15.4 的 `storage_rebuild`）。
+- `app_settings/CMakeLists.txt` 为此补了 `esp_hw_support / heap / spi_flash /
+  esp_partition / app_update / bootloader_support / esp_timer`。
+  ⚠ **改这个 CMakeLists 会触发整个 app 组件树重编**：2026-10 就因此把别处"正在编辑器里
+  改到一半"的文件一起编了，报出一串看着像本次改动引起的错 —— 先看那个文件**当前磁盘
+  内容**再判断，别顺着错误信息去改自己的新代码。
+- `-Werror=format-truncation`：把 `about_fmt_bytes()` 的结果再拼进更短的缓冲时必须写
+  `%.20s` 显式限长（同 §12.3 的老规矩）。
+
+**芯片温度**（追加需求，`about_tsens_*`）：用 IDF 的 `temperature_sensor`
+（组件 **`esp_driver_tsens`**；本 target 有 `CONFIG_SOC_TEMP_SENSOR_SUPPORTED=y`）。
+
+- **量程只能从芯片给定的几档里选**（表在
+  `esp_hal_ana_conv/esp32s31/temperature_sensor_periph.c`）：
+  `50~125(±3)` / `20~100(±2)` / **`-10~80(±1)`** / `-30~50(±2)` / `-40~20(±3)`。
+  取 **-10~80**：日常环境温度落在这一档，误差最小（±1 °C）。
+  ⚠ 请求的 `[min,max]` 必须被某一档**完整包住**，否则 `temperature_sensor_install()`
+  会报 *"the boundary you gave cannot meet the range of internal temperature sensor"*。
+- **装一次、按页面生命周期开关**：`install` 只做一次（它内部要 malloc 一份量程表，
+  反复装会反复分配）；`enable`/`disable` 跟着页面走 —— 传感器在低功耗域，
+  离开页面就别让它一直耗电。
+- **它和 ADC 是独立模块**（`SOC_TSENS_IS_INDEPENDENT_FROM_ADC=1`）—— 这点很关键：
+  本板六个按键是 **ADC1** 读的，任何"共享 ADC"的温度方案都会干扰按键。
+- 读数**不能用 `%f`**：本工程 newlib 是 nano 配置，printf 不支持浮点 →
+  在整数域四舍五入到 0.1 °C 再拼 `"%d.%d °C"`。
+  `°`(U+00B0) **在 `ui_font_sc16` 里**（cmap 中 `range_start=164` 那张稀疏表的偏移 12 ✓），
+  所以不用换成"度"字。
 
 ## 16. 开机图片：启动图 + 首页背景图（2026-10 需求）
 
