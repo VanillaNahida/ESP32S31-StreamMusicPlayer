@@ -177,6 +177,10 @@ AMOLED、ES8311。
 - 播放器页是**横屏左右分栏**（左封面 / 右歌词与信息）
 - 图标用矢量/位图，**不用 emoji**
 - 800×480 下中文最小 14 px
+- ⚠ **LVGL 真机崩溃的坑集中在 [`docs/lvgl-pitfalls.md`](docs/lvgl-pitfalls.md)** ——
+  改"全局复用的控件"和"挂 `lv_layer_top()` 的浮层/键盘"之前**必读**。
+  最容易踩的一条：`lv_keyboard_set_textarea()` / `lv_pinyin_ime_attach()` 只存指针、
+  textarea 删除时**不清理**，比 textarea 活得久的键盘必须显式解绑（2026-10 因它崩过一次）。
 
 ## 8. 字体规则
 
@@ -274,15 +278,31 @@ powershell -ExecutionPolicy Bypass -File tools\flash_dict.ps1 -Port COM20 -Dict
 
 ### 11.4 在线音乐（`components/services/online_service`）
 
-Meting API（`http://meting.xcnahida.cn/...`，**明文 http** 就够，省掉 TLS/校时依赖）：
+**★ 播放地址来自"自建中间件 + 当前登录 CK"，不是 meting**（2026-10 用户要求改）。
+meting 退居**辅助**：歌词 / 封面 / 歌单列表；并且在"没登录 / CK 失效 / 中间件不可达"
+时仍然当**兜底**（能力只增不减）。
 
 | 用途 | 接口 |
 | --- | --- |
+| **播放直链** | **自建中间件 `GET /song/url/v1?id=<歌曲id>&level=standard`（带 `cookie=`）**，失败再试 `level=exhigh`；仍失败才退回 meting 的 `type=url`。见 `os_account.cc: online_netease_song_url()` + `os_stream_url.cc` |
 | 歌单 | `/api?server=netease&type=playlist&id=<歌单ID>` |
 | **搜索** | `/meting/api?server=netease&type=search&id=<关键词>`（关键词在 `id=`，内部做百分号编码） |
-| 播放地址 | `type=url&id=<歌曲ID>`（302 到 https CDN） |
+| 播放地址（兜底） | `type=url&id=<歌曲ID>`（302 到 https CDN）—— **匿名请求**，会员/数字专辑歌只给 30 秒试听片段 |
 | 歌词 | `type=lrc&id=`（纯文本 LRC，UTF-8） |
 | 封面 | `type=pic&id=`（302 到 jpg） |
+
+**为什么必须带 CK 取直链**：meting 的 `type=url` 是匿名请求 —— 会员歌只下发
+**30 秒试听片段**（真机实测 Content-Length 439 KB ≈ 128 kbps 的 27 秒，而元数据时长
+是整首），连带把 seek 时间→字节映射、进度条、"提前结束"判据全带偏。带 CK 走中间件
+拿到的才是**完整**直链（`/song/url/v1` 还顺手给准确的 `size` + `br`，时长因此是准的）。
+
+判读日志：`online: song url <id>: N bytes, M ms`（成功）/
+`... **试听片段(freeTrialInfo)**：该账号对这首没有完整版权`（登录了但没 VIP/无版权）/
+`stream: 账号直链(CK) 拿不到 id=…，退回 meting`（未登录或中间件不可达）。
+
+⚠ **同一个 id 的老缓存可能是试听片段**：`online_song_prepare()` 命中缓存时会拿
+"服务端报的完整大小"比一比，明显偏小就 unlink 重下（日志 `疑似试听片段缓存，重下`）。
+"先下载再播"的 m4a/ogg/opus 与手动缓存都走这条体检。
 
 ⚠️ `/api?type=search&keywords=xxx` 在该实例上**忽略关键词、返回固定列表**，别用。
 

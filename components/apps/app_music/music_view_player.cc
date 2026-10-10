@@ -205,6 +205,64 @@ void music_view_player_set_play_icon(bool playing)
     }
 }
 
+/*
+ * 加载态：播放按钮换成转圈 + 禁用点击。
+ *
+ * 需求原话（2026-10 用户）："在加载的时候禁用播放按钮，用加载动画来代替，
+ * 可以避免一些奇奇怪怪的 bug" —— 确实是：加载期间（解析地址 / 抓封面歌词 / 缓冲）
+ * 按播放会走 `on_play_pause()` → `audio_service_toggle()`，而这时会话可能刚建到一半，
+ * toggle 失败后走"重新起播"分支 → **重新起播会释放屏上的封面再重新请求**，
+ * 而这一次的封面数据可能已经被消费掉 → 封面就"没了"（用户报的现象）。
+ *
+ * 实现要点：
+ *   - 转圈懒建在播放按钮**里面**（居中），与按钮同生共死，页面销毁时随按钮一起走；
+ *   - 图标 label 是按钮的第 0 个子对象（见 music_view_page.cc 的建按钮处），
+ *     加载时把它藏起来，转圈顶上；
+ *   - `LV_STATE_DISABLED` 只负责"看起来禁用"（变暗）；**是否真的吃掉点击**
+ *     由 `on_play_pause` 里那道门负责（别依赖 LVGL 的 disabled 语义）。
+ *   - 幂等：tick 每 500 ms 调一次，状态没变直接返回，不动控件。
+ */
+void music_view_player_set_busy(bool busy)
+{
+    if (!s_c.btn || s_c.btn_busy == busy) {
+        return;
+    }
+    s_c.btn_busy = busy;
+    lv_obj_t *icon = lv_obj_get_child(s_c.btn, 0);
+
+    if (busy) {
+        if (!s_c.btn_spinner) {
+            s_c.btn_spinner = lv_spinner_create(s_c.btn);
+            lv_obj_remove_style_all(s_c.btn_spinner);
+            lv_obj_set_size(s_c.btn_spinner, UI_PX_H(26), UI_PX_H(26));
+            lv_obj_set_style_arc_width(s_c.btn_spinner, 3, LV_PART_MAIN);
+            lv_obj_set_style_arc_width(s_c.btn_spinner, 3, LV_PART_INDICATOR);
+            lv_obj_set_style_arc_color(s_c.btn_spinner, UI_COLOR_PILL, LV_PART_MAIN);
+            lv_obj_set_style_arc_color(s_c.btn_spinner, UI_COLOR_ACCENT, LV_PART_INDICATOR);
+            lv_obj_center(s_c.btn_spinner);
+            lv_obj_remove_flag(s_c.btn_spinner, LV_OBJ_FLAG_CLICKABLE);
+        }
+        lv_obj_remove_flag(s_c.btn_spinner, LV_OBJ_FLAG_HIDDEN);
+        if (icon) {
+            lv_obj_add_flag(icon, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_add_state(s_c.btn, LV_STATE_DISABLED);
+    } else {
+        if (s_c.btn_spinner) {
+            lv_obj_add_flag(s_c.btn_spinner, LV_OBJ_FLAG_HIDDEN);
+        }
+        if (icon) {
+            lv_obj_remove_flag(icon, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_remove_state(s_c.btn, LV_STATE_DISABLED);
+    }
+}
+
+bool music_view_player_is_busy(void)
+{
+    return s_c.btn_busy;
+}
+
 void music_view_player_set_elapsed_text(uint32_t elapsed_ms)
 {
     if (s_c.cur) {
@@ -321,6 +379,14 @@ bool music_view_player_lyric_timed(void)
  */
 void music_view_player_refresh_buffer_hint(void)
 {
+    /*
+     * 加载态与缓冲提示共用同一个判据（`buf_show || on_busy`），在这里对齐：
+     * 只要还在"解析地址 / 抓封面歌词 / 缓冲"，播放按钮就是转圈 + 禁用。
+     * 出声后 tick 会把 buf_show 清掉，按钮自动恢复成播放/暂停图标。
+     */
+    const music_state_t *st = music_state();
+    music_view_player_set_busy(st->buf_show || st->on_busy);
+
     lv_obj_t *hint = music_view_lyric_hint_label();
     if (!hint) {
         return;
@@ -589,6 +655,21 @@ void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek)
     s_c.cur  = cur;
     s_c.tot  = tot;
     s_c.seek = seek;
+}
+
+/*
+ * 标题/歌手必须绑定（2026-10 修）。
+ *
+ * 拆分页面时漏了这一步：label 建出来直接 set 了文本，却没有登记进控件表，
+ * 于是 `s_c.title/s_c.artist` 永远是 NULL —— `music_view_player_set_now_playing()`
+ * 变成空操作，表现就是"**页面初次进入显示正常，之后换曲再也不会更新**"
+ * （标题/歌手一直停在建页面那一刻的那首）。所有 `bind_*` 都是这个用途，
+ * 新增控件时别只 set 文本忘了 bind。
+ */
+void music_view_player_bind_now_playing(lv_obj_t *title, lv_obj_t *artist)
+{
+    s_c.title  = title;
+    s_c.artist = artist;
 }
 
 /* ------------------------------------------------------------------ 事件与销毁 */

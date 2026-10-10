@@ -124,6 +124,8 @@ static void tick_buffer_hint(void)
     }
     if (audio_service_output_active()) {
         st->buf_show = false;
+        /* 加载结束：播放按钮从"转圈 + 禁用"恢复成播放/暂停图标 */
+        music_view_player_set_busy(false);
         /*
          * 拖动定位引起的这次缓冲结束了：打一行落点，用来核对 seek 准不准
          * （百分比是"IO 已读到的位置 / 文件总长"，跟请求的时间点大致对应）。
@@ -158,6 +160,12 @@ static void tick_consume_events(void)
     st->advance_req = false;
 
     if (err) {
+        /*
+         * 出错就退出加载态：否则"转圈 + 禁用播放按钮"会一直挂着（用户既听不到声音、
+         * 又按不动播放），比原来的表现还糟。
+         */
+        st->buf_show = false;
+        music_view_player_set_busy(false);
         /*
          * 在线流媒体：**先怀疑播放地址过期**（网易云 URL 带时间戳 + 签名，放一阵就 403）。
          * 这时重新解析一次地址接着放，而不是把这首歌当"放不了"跳过去 ——
@@ -521,6 +529,37 @@ static void tick_derive_duration(void)
     }
 }
 
+/* #12b 在线流：采用服务**纠正过**的总时长。
+ *
+ * 起因（2026-10 用户报"在线 seek 支持还不是很好"）：在线总时长来自元数据，
+ * 而网易云对 VIP 歌下发的是 **30 秒试听片段** —— 元数据说 200 s、流里只有 27 s。
+ * 后果有三处，全是用户能看到的：
+ *   1. 进度条按 200 s 爬，永远走不到头；
+ *   2. seek 的时间→字节映射按错误码率算，拖到 50% 落点不对；
+ *   3. 「提前结束」判据（`dur > 30s && elapsed + 15s < dur`）把片段正常播完
+ *      当成"流被掐断" → 反复重刷地址重连。
+ * 服务侧用"已下载 ÷ 已播"实测出真码率后会把 `info.duration_ms` 修正过来
+ * （见 audio_engine_bitrate），这里跟它走。
+ */
+static void tick_adopt_stream_duration(void)
+{
+    music_state_t *st = music_state();
+    if (!st->on_mode || st->on_stream_local || st->index < 0) {
+        return;
+    }
+    audio_info_t info;
+    if (!audio_service_get_info(&info) || info.duration_ms < 1000) {
+        return;
+    }
+    const uint32_t d = info.duration_ms;
+    /* 差 5% 以内不动（免得每 tick 微调让进度条抖） */
+    if (st->dur_ms > d + d / 20 || st->dur_ms + st->dur_ms / 20 < d) {
+        ESP_LOGI(TAG, "online duration: %u -> %u ms (stream-derived)",
+                 (unsigned)st->dur_ms, (unsigned)d);
+        st->dur_ms = d;
+    }
+}
+
 /* #13 控件刷新（进度条 / 时间 / 按钮 / 输出图标 / 歌词高亮） */
 static void tick_refresh_widgets(void)
 {
@@ -551,6 +590,7 @@ void music_player_tick(void)
     tick_resume_local();
     tick_save_progress();
     tick_derive_duration();
+    tick_adopt_stream_duration();
     tick_refresh_widgets();
 
     /* 封面：先把工作线程的产出搬上屏（下标对不上就丢掉），再按需拉起下一次解码 */

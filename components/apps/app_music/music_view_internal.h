@@ -32,6 +32,8 @@ typedef struct {
     int       src_badge_state;   /* 上次画的状态（-1 = 还没画过） */
     lv_obj_t *mode_btn;      /* 模式按钮里的图标 label */
     lv_obj_t *mode_badge;    /* 单曲循环的 "1" 角标 */
+    lv_obj_t *btn_spinner;   /* 加载态：播放按钮里的转圈（懒建，与按钮同生共死） */
+    bool      btn_busy;      /* 播放按钮当前是不是"加载中"（已禁用 + 转圈） */
     bool      seeking;       /* 手指正在拖进度条：期间别让 tick 覆盖它 */
 } music_player_ctrls_t;
 

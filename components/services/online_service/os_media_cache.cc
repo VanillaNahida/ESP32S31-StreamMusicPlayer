@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "esp_log.h"
@@ -275,8 +276,29 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
     audio_path[0] = '\0';
 
     if (os_find_cached_audio(song->id, audio_path, cap)) {
-        ESP_LOGI(TAG, "audio cache hit: %s", audio_path);
-        return ESP_OK;
+        /*
+         * ★ 缓存体检：老缓存可能是**匿名时代下到的 30 秒试听片段**
+         *   （2026-10 换"CK 直链优先"之前，会员歌就是这么被下下来的）。
+         *   拿服务端这次报的完整大小比一比：明显偏小就作废重下 ——
+         *   否则用户会一边"已经登录了"、一边永远听片段。
+         */
+        char probe[1024] = {0};
+        int64_t full = 0;
+        if (online_song_stream_info(song, probe, sizeof(probe), &full, NULL) == ESP_OK &&
+            full > 0) {
+            struct stat st = {};
+            if (stat(audio_path, &st) == 0 && st.st_size > 0 &&
+                (int64_t)st.st_size + (int64_t)st.st_size / 10 < full) {
+                ESP_LOGW(TAG, "cache %s is %ld B but stream is %lld B: 疑似试听片段缓存，重下",
+                         audio_path, (long)st.st_size, (long long)full);
+                unlink(audio_path);
+                audio_path[0] = '\0';
+            }
+        }
+        if (audio_path[0]) {
+            ESP_LOGI(TAG, "audio cache hit: %s", audio_path);
+            return ESP_OK;
+        }
     }
     if (!online_has_network()) {
         return ESP_ERR_INVALID_STATE;
@@ -286,7 +308,22 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
     char tmp[192];
     snprintf(tmp, sizeof(tmp), ONLINE_AUDIO_DIR "/%u.part", (unsigned)song->id);
     uint8_t sniff[16] = {};
-    esp_err_t ret = http_download(song->audio_url, tmp, 64 * 1024, sniff);
+
+    /*
+     * ★ 下载也要走"登录 CK + 中间件"那条正路（online_song_stream_url 内部已经
+     *   优先取 CK 直链、失败才退回 meting）。直接用 `song->audio_url` 的话，
+     *   会员歌下到的是**30 秒试听片段** —— "下载兜底"的 m4a/ogg/opus 与手动缓存
+     *   都会中招。
+     *   缓冲取 1024：网易 CDN 的签名直链（含 `?vuutv=…`）实测 200~400 字符，
+     *   `online_song_t.audio_url` 只有 320，装不下。
+     */
+    char dl_url[1024] = {0};
+    if (online_song_stream_url(song, dl_url, sizeof(dl_url)) != ESP_OK || !dl_url[0]) {
+        ESP_LOGW(TAG, "no stream url for id %u (account CK + meting 都没拿到)",
+                 (unsigned)song->id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    esp_err_t ret = http_download(dl_url, tmp, 64 * 1024, sniff);
     if (ret != ESP_OK) {
         return ret;
     }

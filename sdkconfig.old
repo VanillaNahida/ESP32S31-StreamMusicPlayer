@@ -1256,7 +1256,7 @@ CONFIG_PARTITION_TABLE_MD5=y
 #
 # Online music account (网易云账号)
 #
-CONFIG_ONLINE_NETEASE_API_BASE="http://8.134.64.27:3000"
+CONFIG_ONLINE_NETEASE_API_BASE="https://ncmapi.ysnb.com.cn"
 CONFIG_ONLINE_NETEASE_API_TOKEN="sk-kP0pF3yD4gF6aP2qW3lJ2wD8gV9zO"
 CONFIG_ONLINE_NETEASE_CK_FILE="assets/ncm-ck.txt"
 # end of Online music account (网易云账号)
@@ -5078,6 +5078,69 @@ CONFIG_WL_SECTOR_SIZE=4096
 # end of Wear Levelling
 
 #
+# espaudiocore
+#
+# default:
+# CONFIG_ESPAUDIOCORE_DEBUG_DIAGNOSTICS is not set
+# default:
+CONFIG_ESPAUDIOCORE_LOG_LEVEL=3
+
+#
+# Decoders
+#
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_WAVPACK=y
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_WAV=y
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_MP3=y
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_AAC=y
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_M4A=y
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_FLAC=y
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_VORBIS=y
+# default:
+CONFIG_ESPAUDIOCORE_ENABLE_OPUS=y
+# end of Decoders
+
+#
+# Output
+#
+# default:
+CONFIG_ESPAUDIOCORE_OUTPUT_BITS=0
+# default:
+CONFIG_ESPAUDIOCORE_DEFAULT_VOLUME_DB=0
+# end of Output
+
+#
+# Memory
+#
+# default:
+# CONFIG_ESPAUDIOCORE_FILE_SOURCE_WINDOW is not set
+# default:
+CONFIG_ESPAUDIOCORE_FILE_SOURCE_VFS=y
+# default:
+CONFIG_ESPAUDIOCORE_VFS_BUFFER_SIZE=65536
+# default:
+# CONFIG_ESPAUDIOCORE_PSRAM_REQUIRED is not set
+# end of Memory
+
+#
+# Task
+#
+# default:
+CONFIG_ESPAUDIOCORE_TASK_STACK_DEFAULT=8192
+# default:
+CONFIG_ESPAUDIOCORE_TASK_PRIORITY=8
+# default:
+CONFIG_ESPAUDIOCORE_TASK_CORE=1
+# end of Task
+# end of espaudiocore
+
+#
 # IoT Button
 #
 # default:
@@ -5210,37 +5273,6 @@ CONFIG_AUDIO_ENCODER_G722_SUPPORT=y
 # default:
 # CONFIG_ESP_AUDIO_EFFECTS_S31_USE_ASM is not set
 # end of Audio Effects Configuration
-
-#
-# ESP Audio Simple Player
-#
-
-#
-# Audio Simple Player IO Stream
-#
-# default:
-CONFIG_ESP_AUDIO_SIMPLE_PLAYER_HTTP_EN=y
-# default:
-CONFIG_ESP_AUDIO_SIMPLE_PLAYER_FILE_EN=y
-# default:
-CONFIG_ESP_AUDIO_SIMPLE_PLAYER_EMBED_FLASH_EN=y
-# end of Audio Simple Player IO Stream
-
-#
-# Audio Simple Player Filters
-#
-CONFIG_ESP_AUDIO_SIMPLE_PLAYER_RESAMPLE_EN=y
-CONFIG_AUDIO_SIMPLE_PLAYER_RESAMPLE_DEST_RATE=48000
-CONFIG_ESP_AUDIO_SIMPLE_PLAYER_CH_CVT_EN=y
-CONFIG_AUDIO_SIMPLE_PLAYER_CH_CVT_DEST=2
-CONFIG_ESP_AUDIO_SIMPLE_PLAYER_BIT_CVT_EN=y
-CONFIG_AUDIO_SIMPLE_PLAYER_BIT_CVT_DEST_16BIT=y
-# CONFIG_AUDIO_SIMPLE_PLAYER_BIT_CVT_DEST_24BIT is not set
-# CONFIG_AUDIO_SIMPLE_PLAYER_BIT_CVT_DEST_32BIT is not set
-# default:
-CONFIG_AUDIO_SIMPLE_PLAYER_BIT_CVT_DEST_BITS=16
-# end of Audio Simple Player Filters
-# end of ESP Audio Simple Player
 
 #
 # ESP Bluetooth Audio
@@ -5456,25 +5488,6 @@ CONFIG_MMAP_FILE_NAME_LENGTH=16
 # end of mmap file support format
 
 #
-# ESP_Muxer Configuration
-#
-# default:
-CONFIG_ESP_MUXER_MP4_SUPPORT=y
-# default:
-CONFIG_ESP_MUXER_TS_SUPPORT=y
-# default:
-CONFIG_ESP_MUXER_OGG_SUPPORT=y
-# default:
-CONFIG_ESP_MUXER_WAV_SUPPORT=y
-# default:
-CONFIG_ESP_MUXER_FLV_SUPPORT=y
-# default:
-CONFIG_ESP_MUXER_CAF_SUPPORT=y
-# default:
-CONFIG_ESP_MUXER_AVI_SUPPORT=y
-# end of ESP_Muxer Configuration
-
-#
 # Espressif SCCB Configurations
 #
 # default:
@@ -5574,8 +5587,6 @@ CONFIG_USB_HOST_SUSPEND_ENTRY_MS=20
 
 # default:
 # CONFIG_USB_HOST_ENABLE_ENUM_FILTER_CALLBACK is not set
-# default:
-# CONFIG_USB_HOST_DWC_DMA_CAP_MEMORY_IN_PSRAM is not set
 # default:
 CONFIG_USB_OTG_SUPPORTED=y
 # end of USB-OTG

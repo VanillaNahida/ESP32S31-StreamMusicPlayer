@@ -41,6 +41,9 @@ void music_view_player_build_prepare(void);
 
 void music_view_player_bind_cover(lv_obj_t *box, lv_obj_t *img);
 void music_view_player_bind_src_badge(lv_obj_t *badge);
+/* 标题 / 歌手。★ 必须绑：set_now_playing() 靠这两个指针换曲时刷新，
+ *   漏绑的表现是"首次进页面正常、之后换曲标题不动"（2026-10 修过这个 bug）。 */
+void music_view_player_bind_now_playing(lv_obj_t *title, lv_obj_t *artist);
 void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek);
 void music_view_player_bind_seek(lv_obj_t *seek_hit);
 void music_view_player_bind_mode_btn(lv_obj_t *mode_btn);
@@ -58,6 +61,15 @@ void music_view_player_on_mode_click(lv_event_t *e);
 
 void music_view_player_set_now_playing(const char *title, const char *artist);
 void music_view_player_set_play_icon(bool playing);
+/*
+ * "加载中"：解析在线地址 / 抓封面歌词 / 缓冲的那段时间。
+ * 播放按钮会**换成转圈并禁用点击** —— 这段时间按播放没有意义，而且会去搅
+ * 正在建立的会话（真机现象：加载时点播放 → 封面丢了、或干脆不响）。
+ * 传 false 恢复播放/暂停图标。**幂等**，可以每个 tick 调。
+ */
+void music_view_player_set_busy(bool busy);
+/* 当前是不是加载态（业务侧决定"要不要受理播放/拖动"时问它） */
+bool music_view_player_is_busy(void);
 void music_view_player_set_elapsed_text(uint32_t elapsed_ms);
 void music_view_player_set_total_text(uint32_t dur_ms);
 void music_view_player_set_total_text_placeholder(void);

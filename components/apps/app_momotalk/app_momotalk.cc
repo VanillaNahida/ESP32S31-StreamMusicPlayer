@@ -73,6 +73,9 @@ static const char *TAG = "app_momotalk";
 #define MT_BUBBLE_PAD_Y UI_PX_H(8)
 #define MT_BUBBLE_MAX_W UI_PCT_X(58)     /* 气泡最大宽度（HTML 是 620/1080 ≈ 57%） */
 #define MT_IME_H        UI_PX_H(240)     /* 拼音键盘高度（与 app_online 的 IME_FIT_HEIGHT 一致） */
+/* 键盘弹出/收起时"布局上移"的动画时长（ms）。太快像硬跳、太慢打字会等，
+ * 220 ms + ease_out 接近 iOS/Android 聊天页的手感。 */
+#define MT_PAD_ANIM_MS  220
 
 /* ------------------------------------------------------------------ 配色（照 MomoTalk.html） */
 #define MT_C_PINK        0xFD8AA1     /* 标题栏主题粉 */
@@ -321,6 +324,65 @@ static lv_obj_t *mt_row_create(bool mine, const char *text)
     return row;
 }
 
+/* ------------------------------------------------------------------ 新消息入场动画
+ *
+ * 需求："新气泡滑入 + 淡入"，120 ms。
+ *
+ * 只对**新追加**的那一条做（`mt_push`）。进页面重建整个列表（`mt_rebuild`）时不做 ——
+ * 40 条一起淡入看着像"页面在闪"，而不是"来了条消息"。
+ *
+ * 做法：两个并行动画（LVGL 一个动画只驱动一个属性，同 var 不同 exec_cb 可以共存）：
+ *   - `translate_y`：+MT_ANIM_RISE px → 0（从下方"升"到位，聊天列表的自然方向）
+ *   - `opa`：0 → COVER（容器的不透明度会**带着子对象一起**淡入）
+ *
+ * ⚠ 三个细节：
+ *   1. **先把起始值写死再起动画**：不写的话，从"创建对象"到"动画第一次执行"之间
+ *      会有一帧是全不透明的，看起来是"闪一下再淡入"。
+ *   2. 结束值就是默认值（0 / COVER），动画跑完不留任何视觉残留。
+ *   3. 对象中途被删（换页 / 列表重建）时 LVGL 会自动删掉挂在它身上的动画，不用自己收尾。
+ *   想改成"我方从右、对方从左"的横向滑入，把 translate_y 换成 translate_x
+ *   并按 mine 给正负号即可。
+ */
+#define MT_ANIM_MS     120
+#define MT_ANIM_RISE   UI_PX_H(10)
+
+static void mt_anim_translate_y(void *obj, int32_t v)
+{
+    lv_obj_set_style_translate_y((lv_obj_t *)obj, v, LV_PART_MAIN);
+}
+
+static void mt_anim_opa(void *obj, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)obj, (lv_opa_t)v, LV_PART_MAIN);
+}
+
+static void mt_row_animate_in(lv_obj_t *row)
+{
+    if (row == NULL) {
+        return;
+    }
+    /* 先落起始状态（见上面第 1 条），再起两条并行动画 */
+    lv_obj_set_style_translate_y(row, MT_ANIM_RISE, LV_PART_MAIN);
+    lv_obj_set_style_opa(row, LV_OPA_TRANSP, LV_PART_MAIN);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, row);
+    lv_anim_set_exec_cb(&a, mt_anim_translate_y);
+    lv_anim_set_values(&a, MT_ANIM_RISE, 0);
+    lv_anim_set_duration(&a, MT_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, row);
+    lv_anim_set_exec_cb(&a, mt_anim_opa);
+    lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);
+    lv_anim_set_duration(&a, MT_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_start(&a);
+}
+
 static void mt_scroll_bottom(void)
 {
     if (!s_list) {
@@ -346,8 +408,11 @@ static void mt_push(bool mine, const char *text)
     mt_text_copy(s_msgs[s_msg_n].text, sizeof(s_msgs[s_msg_n].text), text);
     s_msg_n++;
 
-    mt_row_create(mine, s_msgs[s_msg_n - 1].text);
+    lv_obj_t *row = mt_row_create(mine, s_msgs[s_msg_n - 1].text);
+    /* 先贴到底、再起入场动画：`translate_y` 是绘制期变换，不参与 flex 布局，
+     * 所以滚动位置按"动画跑到终点的样子"算，动画期间不会抖。 */
     mt_scroll_bottom();
+    mt_row_animate_in(row);
 }
 
 /* 重画整个列表（进页面时用；消息数封顶 40，重建一次开销很小） */
@@ -368,23 +433,70 @@ static void mt_rebuild(void)
  * 与 app_online 的搜索页同一套（lvgl_pinyin_ime，键盘只建一次、挂在 lv_layer_top）；
  * 差别只有一处：键盘一开就把 screen 的 pad_bottom 顶到键盘高度，
  * flex 自动把输入条抬到键盘正上方 —— 打字时输入框和最新消息都看得见。
+ *
+ * ★ 2026-10：这个"顶上去"改成**动画**（原来一步到位，观感是"啪"地跳一下）。
+ *   动画只改 screen 的 pad_bottom：
+ *     - flex 每帧重算 → 消息区逐渐变矮、输入条与最新消息平滑上移；
+ *     - 每一帧都把消息列表贴到底（聊天页在键盘弹起时的标准手感：最新一条
+ *       始终贴着输入框，而不是被顶出可视区）；
+ *     - 收键盘是反向动画，结束后再贴一次底。
+ *   为什么不用 LVGL 的 style transition：transition 只在"状态/局部样式属性变化"
+ *   时触发，时机和 `lv_obj_update_layout` 不好配合，也不能保证每帧重贴底；
+ *   直接 `lv_anim` 改样式属性更直白，快速"开→关"打断也只是删掉旧动画。
  */
+
+/** 动画每帧：改 pad_bottom → 重算布局 → 贴底 */
+static void mt_pad_anim_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_pad_bottom((lv_obj_t *)var, v, LV_PART_MAIN);
+    /*
+     * ⚠ 必须 `lv_obj_update_layout(s_scr)`（父对象），不能只更新列表：
+     *   决定列表高度的是 screen 的 pad/flex，父对象不重排的话滚动上限还是旧的，
+     *   贴底就会停在"半中间"（原实现里也专门写了这一条）。
+     */
+    lv_obj_update_layout(s_scr);
+    if (s_list) {
+        lv_obj_scroll_to_y(s_list, LV_COORD_MAX, LV_ANIM_OFF);
+    }
+}
+
+/** 动画跑完：再贴一次底，兜住最后一帧取整带来的几像素差 */
+static void mt_pad_anim_done(lv_anim_t *a)
+{
+    (void)a;
+    if (s_scr) {
+        lv_obj_update_layout(s_scr);
+    }
+    if (s_list) {
+        lv_obj_scroll_to_y(s_list, LV_COORD_MAX, LV_ANIM_OFF);
+    }
+}
+
 static void mt_ime_apply_offset(bool open)
 {
     if (!s_scr) {
         return;
     }
-    lv_obj_set_style_pad_bottom(s_scr, open ? (MT_IME_H + UI_PX_H(6)) : 0, LV_PART_MAIN);
-    /*
-     * ★ **收起键盘时也要滚到底**（用户报："收起键盘后画面没有跟随滚动到下面"）。
-     *   键盘一开，列表可视高度从 ~340 px 缩到 ~100 px，我们滚到了底部；
-     *   键盘一收，可视高度涨回去，而 LVGL **不会**动滚动偏移 ——
-     *   于是停在"半中间"，下面空出一大块。所以开、关两个方向都重新贴底。
-     *   ⚠ 必须先 update_layout：pad_bottom 刚改，滚动上限还是按旧高度算的，
-     *     不刷新布局就滚不到真正的底部（`mt_scroll_bottom()` 里已经做了这件事）。
-     */
-    lv_obj_update_layout(s_scr);
-    mt_scroll_bottom();
+    const int32_t target = open ? (MT_IME_H + UI_PX_H(6)) : 0;
+    const int32_t from = lv_obj_get_style_pad_bottom(s_scr, LV_PART_MAIN);
+
+    /* 打断上一次（用户可能飞快地"开→关"）：同 var+exec_cb 的动画只留一个 */
+    lv_anim_delete(s_scr, mt_pad_anim_cb);
+
+    if (from == target) {
+        mt_pad_anim_done(NULL);         /* 已经在目标位置：只把底贴好 */
+        return;
+    }
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_scr);
+    lv_anim_set_exec_cb(&a, mt_pad_anim_cb);
+    lv_anim_set_values(&a, from, target);
+    lv_anim_set_duration(&a, MT_PAD_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_completed_cb(&a, mt_pad_anim_done);
+    lv_anim_start(&a);
 }
 
 static void mt_ime_hide(void)
@@ -637,13 +749,22 @@ static void mt_on_delete(lv_event_t *e)
 {
     (void)e;
     s_page_alive = false;
+    /* 布局上移动画可能还在跑：先删掉，否则动画回调会去碰已销毁的 screen/列表 */
+    if (s_scr) {
+        lv_anim_delete(s_scr, mt_pad_anim_cb);
+    }
     if (s_echo_timer) {
         lv_timer_delete(s_echo_timer);
         s_echo_timer = NULL;
     }
     /* 键盘挂在 lv_layer_top 上、不归本页所有：只收起来，不删（下次进页面复用，
-     * 删了要重新加载词库，卡一秒） */
+     * 删了要重新加载词库，卡一秒）。
+     * ★ 但**必须解绑**：组件只是把 textarea 指针存进 ctx（`ctx->ta`），
+     *   而本页的输入框会随页面销毁 —— 不解绑就留下一个悬垂指针
+     *   （同 app_online 那个"添加歌单浮层连续开关 → 渲染崩"的根因，见 ao_overlay.cc）。
+     *   这里趁 textarea 还活着解绑（页面 DELETE 回调在子对象被删之前触发）。 */
     if (s_ime) {
+        lv_pinyin_ime_attach(s_ime, NULL);
         lv_pinyin_ime_hide(s_ime);
     }
     s_scr = NULL;

@@ -50,12 +50,14 @@
 /**
  * 解码器 → 输出级的 PCM 环形缓冲。
  *
- * 取 32 KB（≈170 ms）而不是几 MB：它是"换曲/seek 的响应延迟"的直接来源。
- * **暂停不受它影响** —— 暂停时输出任务立刻停止消费，缓冲里那点音频留着，
- * 恢复时接着播（既不拖沓也不丢音），见 audio_output.cc 的 flow gate。
- * 抗抖动靠的是**上游压缩数据的 4 MB 缓冲**（AUDIO_STREAM_RING_BYTES），不是这里。
+ * 2026-10 从 32 KB 提到 **64 KB（≈340 ms）**：真机日志显示"取数 + 重采样"这条
+ * 生产链会略慢于实时（见 audio_output.cc 的 play stats 里 `产 N ms / 墙 W ms` 那一列），
+ * 留深一点让解码端提前跑在前面，输出任务就不必"刚好赶上"。
+ * 暂停不受它影响（暂停时输出任务立刻停止消费，缓冲里的音频留着）；
+ * seek 会 flush，也不会多播旧位置的声音。
+ * 抗抖动的大头仍然在**上游压缩数据的 4 MB 缓冲**（AUDIO_STREAM_RING_BYTES）。
  */
-#define AUDIO_PCM_RING_BYTES  (32 * 1024)
+#define AUDIO_PCM_RING_BYTES  (64 * 1024)
 
 /** 路径/URI 缓冲上限（本地文件与在线 URL 共用） */
 #define AUDIO_PATH_MAX  600
@@ -141,6 +143,18 @@ uint32_t audio_engine_duration_hint(void);
 
 /** 本曲平均码率（bit/s），0 = 未知。本地来自 media_meta 探测，在线来自总字节÷时长 */
 uint32_t audio_engine_bitrate(void);
+
+/**
+ * 本地文件：总时长未知时向**解码库**要一次（`espaudiocore_get_duration_ms()`）。
+ *
+ * 为什么需要：`media_meta` 的容器探测只覆盖 MP3/FLAC/WAV/ADTS，**M4A / OGG / Opus
+ * 没有**探测实现 → 这些本地文件的总时长恒为 0（界面 `--:--`、进度条不动）。
+ * 而解码库自己能从容器算出来（M4A 的 mvhd、OGG 的末页 granule、MP3 的 Xing）。
+ *
+ * ⚠ **必须在会话锁内调用**：它读的是库内部的会话对象（线程纪律见本文件开头）。
+ * 由输出任务在每块数据前调用（时长未知时才有实际开销）。
+ */
+void audio_engine_poll_duration(void);
 
 /** 输出级把 PCM 全部播完（EOS 之后）时回调，用来上报 FINISHED */
 void audio_engine_output_drained(uint32_t gen);
@@ -232,6 +246,8 @@ bool audio_http_speed(int *kbps);
 /** 已下载字节数 / 总字节数（0 = 未知） */
 uint64_t audio_http_downloaded(void);
 uint64_t audio_http_total(void);
+/** 压缩流环形缓冲里**还没被解码器取走**的字节数（算实测码率要用"已吃掉"的量） */
+uint64_t audio_http_ring_filled(void);
 const char *audio_http_url(void);
 
 /* ===========================================================================

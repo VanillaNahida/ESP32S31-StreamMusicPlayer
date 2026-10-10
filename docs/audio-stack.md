@@ -100,10 +100,17 @@ S31 有硬件 ASRC，但硬件路径要经 GDMA 访问 PSRAM 缓冲，对 cache-
 
 | 位置 | 修改 | 原因 |
 | --- | --- | --- |
+| `src/decoder_mp3.cpp` | `audio_free(xing_);` 后补 `xing_ = nullptr;` | ★★ **真机崩溃根因**：`close()` 里还会 `if (xing_) audio_free(xing_)` → 同一块内存第二次 free（详见 §7.1）。只在**可 seek 的源（本地文件）**上触发 |
 | `CMakeLists.txt` | 从 include 路径里**去掉** `lib/ffbase` | 它自己的 `string.h` / `time.h` 会顶替 C 库同名头（`-I` 优先于系统目录），导致 `memcpy`/`va_start` 全"未声明" |
 | `CMakeLists.txt` | 全组件定义 `FF_UNIX FF_LITTLE_ENDIAN FFBASE_OPT_SIZE` | ffbase 的平台自动探测不认识 newlib/RISC-V；而 `FFBASE_OPT_SIZE` 是"允许单独编译 sort.c/str-format.c"的开关（否则符号重复定义）。原来只有 `decoder_m4a.cpp` 单独定义过前两个 |
 | `CMakeLists.txt` | `decoder_m4a.cpp` 加 `-fpermissive` | 它 include avpack 的 C 头，`void*` 隐式转换在 C++ 里非法（GCC 标了 `[-fpermissive]`） |
 | `lib/avpack/base/mp4.h` | 新增 `MP4_BBOX_TBL` 宏（C 下是 `static const struct mp4_bbox`，C++ 下是 `extern const struct mp4_bbox`） | 那些 box 表用 C 的 tentative definition 分两步写，C++ 里是"大小未知的定义"，连 `-fpermissive` 都不降级 |
+| `src/audio_player.cpp` | `ctx_destroy()` 加逐段日志（`teardown: …`） | **仅诊断用**（panic 拿不到 backtrace），定位结束后可删 |
+
+> ⚠ **`libs/` 在外层仓库的 `.gitignore` 里** —— 以上改动外层 git 不跟踪。
+> 它们同时导出成了 [`patches/espaudiocore-local.patch`](patches/espaudiocore-local.patch)，
+> 重新克隆该库后用 `git apply -p1 --directory=libs/espaudiocore <补丁>` 还原（见 [patches/README.md](patches/README.md)）。
+
 
 ## 7. 排查用日志（真机验证时先看这几行）
 
@@ -117,6 +124,60 @@ S31 有硬件 ASRC，但硬件路径要经 GDMA 访问 PSRAM 缓冲，对 cache-
 | `audio_http: read error, reconnecting #N from N` | CDN 掐长连接后自动续传（正常现象） |
 | `audio_seek: local seek -> N ms` / `stream seek -> N ms = byte N` | 两条 seek 路径 |
 | `audio_svc: 容器 fmt=N 不能边下边解` | 触发 app 层的"先下载再播"回退 |
+
+## 7.1 ✅ 换曲瞬间的 double-free：**根因是 MP3 解码器里漏了置空**（2026-10 定案）
+
+**现场**（两次崩溃的日志特征一样，值得记住）：
+
+```
+I audio_eng: playback finished (gen 2)          ← 或 espaudiocore: decode loop stopped by request
+assert failed: tlsf_free rom/heap/tlsf/tlsf.c:629 (!block_is_free(block) && "block already marked as free")
+```
+
+判读钥匙是**它只发生在"关闭 MP3 解码器"的那一次切歌上**：
+第一次崩在"32 kHz MP3 → 停止"（同一条日志里 FLAC → MP3 关了 FLAC 解码器，没事），
+第二次崩在"32 kHz MP3 自然放完 → 起来下一首"。两次都不是"有关 ASRC 就崩"。
+
+**根因**（`libs/espaudiocore/src/decoder_mp3.cpp`）：
+
+```cpp
+/* open() 里解析 Xing/LAME 头取精确时长 */
+int n = in_->read(xing_, 2880);
+if (n > 4) {
+    xi = parseXingHeader(xing_, (size_t)n);
+    audio_free(xing_);          // ← 释放了，但**没有置空**
+    ...
+}
+...
+void close() {
+    ...
+    if (xing_) audio_free(xing_);   // ← 对同一块内存的**第二次 free**
+```
+
+为什么作者没踩到：这条分支要求 `in_->can_seek()`，**只有本地文件源**才成立；
+ringbuf（网络流）源不可 seek，永远走不到这里 —— 以流式为主的验证路径自然看不出来。
+
+**修法**：`audio_free(xing_);` 后面补 `xing_ = nullptr;`（另加注释说明）。
+
+> 复核方式：把库里**所有** `audio_free(...)` 逐个看"下一行有没有置空" —— 全库只有这一处漏了
+> （`id3_parser.cpp` 那处是局部变量，只 free 一次，正常）。
+
+### 顺带修掉的两个**真竞态**（不是这次崩溃的原因，但确实是 bug）
+
+排查过程中还发现"输出任务"与"会话拆除"之间有两处 use-after-free，已一并修掉：
+
+1. `pump_format()` 读 `espaudiocore_get_format()` 与 `audio_engine_stop()` 释放库会话对象之间
+   存在 TOCTOU 窗口；
+2. `esp_asrc_process()`（输出任务）与 `esp_asrc_close()`（拆除）会并发操作同一份 ASRC 状态。
+
+修法：**凡是"读库 / 用 ASRC"的动作都持会话锁，并在锁内重新确认会话还在**。
+注意**写硬件不占锁**（`esp_codec_dev_write` / `bt_service_write_pcm` 要阻塞几十毫秒，
+占锁会把 LVGL 一起卡住）—— 流程是"锁内取数 + 重采样（结果拷进本任务私有的 `s_stage`）
+→ 锁外写硬件"。
+
+诊断过程中的可复用经验：这类 panic 的 backtrace 是 **`frame did not save the PC`**，
+拿不到调用栈。有效手段是**在拆除路径上加逐段日志**（`session stop: …` / `teardown: delete dec`
+/ `asrc close: h=…`），让"崩溃前最后一行"把范围缩到某一次 free。
 
 ## 8. 真机验证清单（换库后必须走一遍）
 

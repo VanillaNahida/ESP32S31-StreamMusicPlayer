@@ -82,18 +82,35 @@ esp_err_t online_song_stream_info(const online_song_t *song, char *out, size_t c
     }
 
     /*
-     * ★ 账号歌（"我的歌单"/每日推荐来的）没有 meting 的 audio_url —— 直链必须带 cookie
-     *   现取（online_netease_song_url）。判据就用"audio_url 为空"：不用给
-     *   online_song_t 加字段，也就不会动到 SD 上定长记录（'OPL1'）的格式。
-     *   顺带好处：/song/url/v1 直接给 size + 码率，**总时长是准的**（不用再靠墙钟估）。
+     * ★★ 一律先走"**当前登录 CK + 自建中间件**"拿直链（2026-10 用户要求）。
+     *
+     * 为什么不能再用 meting 的 url：它是**匿名**请求，会员 / 数字专辑歌曲只会下发
+     * **30 秒试听片段**（真机实测 Content-Length 439 KB ≈ 128 kbps 的 27 秒，
+     * 而元数据时长是整首 —— 顺带把 seek 映射、进度条、"提前结束"判据全带偏了）。
+     * 带 CK 请求 `/song/url/v1` 拿到的才是**完整**直链，会员歌就能整首听。
+     *
+     * meting 退居辅助（歌词 / 封面 / 首页列表照旧），并且**仍然当兜底**：
+     * 未登录、cookie 失效、无版权、中间件不可达时，退回原来的 meting 解析 ——
+     * 能力只增不减，不会因为没登录就放不了歌。
+     *
+     * id 来自两处：中间件歌单的 `id` 字段，或 meting url 里抠出来的 `id=`
+     * （见 os_json.cc 的 os_id_from_url），所以 meting 歌单来的歌也能走这条路。
      */
-    if (!song->audio_url[0]) {
-        if (song->id == 0) {
-            return ESP_ERR_INVALID_ARG;
-        }
+    if (song->id != 0) {
         char sid[16];
         snprintf(sid, sizeof(sid), "%u", (unsigned)song->id);
-        return online_netease_song_url(sid, out, cap, out_bytes, out_dur_ms);
+        if (online_netease_song_url(sid, out, cap, out_bytes, out_dur_ms) == ESP_OK) {
+            ESP_LOGI(TAG, "stream: 账号直链(CK) id=%s, %lld B, %u ms", sid,
+                     (long long)(out_bytes ? *out_bytes : 0),
+                     (unsigned)(out_dur_ms ? *out_dur_ms : 0));
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "stream: 账号直链(CK) 拿不到 id=%s，退回 meting", sid);
+    }
+
+    if (!song->audio_url[0]) {
+        /* 既没有 CK 直链、也没有 meting 地址：只能报"找不到" */
+        return ESP_ERR_NOT_FOUND;
     }
     out[0] = '\0';
     if (!online_has_network()) {
@@ -202,14 +219,17 @@ esp_err_t online_song_stream_url(const online_song_t *song, char *out, size_t ca
         return ESP_ERR_INVALID_ARG;
     }
 
-    /* ★ 账号歌：audio_url 为空 → 带 cookie 现取直链（说明见 online_song_stream_info） */
-    if (!song->audio_url[0]) {
-        if (song->id == 0) {
-            return ESP_ERR_INVALID_ARG;
-        }
+    /* ★ 同上：先用"登录 CK + 中间件"拿直链，失败才退回 meting（说明见 stream_info） */
+    if (song->id != 0) {
         char sid[16];
         snprintf(sid, sizeof(sid), "%u", (unsigned)song->id);
-        return online_netease_song_url(sid, out, cap, NULL, NULL);
+        if (online_netease_song_url(sid, out, cap, NULL, NULL) == ESP_OK) {
+            return ESP_OK;
+        }
+        ESP_LOGW(TAG, "stream url: 账号直链(CK) 拿不到 id=%s，退回 meting", sid);
+    }
+    if (!song->audio_url[0]) {
+        return ESP_ERR_NOT_FOUND;
     }
     out[0] = '\0';
     if (!online_has_network()) {

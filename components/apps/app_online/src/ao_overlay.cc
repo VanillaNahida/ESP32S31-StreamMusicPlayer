@@ -275,12 +275,34 @@ static void modal_submit(lv_event_t *e);
 
 void ao_modal_close(void)
 {
-    /* 两个键盘都挂在 lv_layer_top 上（不是浮层的子对象），这里只隐藏 */
-    if (s_ime) {
-        lv_pinyin_ime_hide(s_ime);
-    }
+    /*
+     * ★★ 2026-10 真机崩溃根因修复：**必须在浮层真的被删掉之前把键盘解绑**。
+     *
+     * LVGL 的 `lv_keyboard_set_textarea()` 只存指针（`keyboard->ta = ta`），
+     * **不**注册 textarea 的 DELETE 处理，而且在**下一次**设置时会先去动旧对象：
+     *
+     *     void lv_keyboard_set_textarea(obj, ta) {
+     *         if (keyboard->ta) lv_obj_remove_state(keyboard->ta, LV_STATE_FOCUSED);  // ← 写旧 textarea
+     *         keyboard->ta = ta;
+     *     }
+     *
+     * 而 `s_kb` 是**全局复用**的：浮层关了只把键盘藏起来、指针没清 →
+     * 下次开浮层时那一次 `set_textarea()` 就是**往已释放的对象写状态位**，
+     * 踩坏 LVGL 的对象树。真机现象：**连续开/关"添加歌单"浮层**后，
+     * 渲染阶段 `Load address misaligned` in `lv_color_over32`（故障地址 0x9）。
+     *
+     * 这里趁 textarea 还活着先解绑（`set_textarea(kb, NULL)` 只会去 remove 旧对象的
+     * FOCUSED 状态，此刻它是合法的）。**顺序不能颠倒**：先解绑，再藏键盘。
+     * 拼音键盘同样处理 —— `lv_pinyin_ime_attach(ime, NULL)` 是允许的，
+     * 它内部只把 `ctx->ta` 置空（组件自己也不会在 textarea 删除时清理）。
+     */
     if (s_kb) {
+        lv_keyboard_set_textarea(s_kb, NULL);
         lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_ime) {
+        lv_pinyin_ime_attach(s_ime, NULL);
+        lv_pinyin_ime_hide(s_ime);
     }
     if (s_modal) {
         /* 渐出（下滑 + 缩小 + 淡出）：动画结束由 ui_popup_out 自己删。
@@ -328,17 +350,26 @@ static void modal_submit(lv_event_t *e)
 /*
  * 浮层销毁（异步删除或页面切走时都会来）：
  * 键盘挂在 lv_layer_top 上，不归浮层所有，所以这里只需要把指针清掉。
+ *
+ * ★ 这里同样要解绑（第二道保险）：`ao_modal_close()` 已经解过一次，正常路径走到这里
+ *   键盘指针已经是 NULL，`set_textarea(NULL)` 是空操作。留着是因为**万一**有别的路径
+ *   直接删了浮层（没走 close），下一次开浮层就会踩已释放的 textarea。
+ *   ⚠ 之所以在这里做是安全的：LVGL 的 `lv_obj_delete()` 是"**先给对象自己发
+ *     LV_EVENT_DELETE、之后才删子对象**"（`lv_obj_tree.c` 的 `obj_delete_core()`），
+ *     所以此刻 textarea 还活着，remove_state 不会踩空。
  */
 static void modal_on_delete(lv_event_t *e)
 {
     (void)e;
     s_modal = NULL;
     s_modal_ta = NULL;
-    if (s_ime) {
-        lv_pinyin_ime_hide(s_ime);
-    }
     if (s_kb) {
+        lv_keyboard_set_textarea(s_kb, NULL);
         lv_obj_add_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (s_ime) {
+        lv_pinyin_ime_attach(s_ime, NULL);
+        lv_pinyin_ime_hide(s_ime);
     }
 }
 
@@ -434,8 +465,13 @@ static void modal_build_keyboards(lv_obj_t *ta, bool search)
         return;
     }
 
-    /* 歌单 ID：字母数字就够，用 LVGL 自带键盘（自带数字行与 OK 键） */
+    /* 歌单 ID：纯数字就够 —— 键盘开成**数字键盘**（LVGL 自带的 NUMBER 布局：
+     * 0-9 + 退格 + ✓，见 kb_map_num），并且输入层也只接受数字。
+     * 两道都做：键盘解决"按键太大/找不着数字"，accepted_chars 解决"接上实体键盘
+     * 或切到字母布局时仍能打进字母"（那些键按了也不会进文本）。
+     * ⚠ 数字布局里那个 ⌨ 键会让键盘切回字母布局，所以输入层的过滤不能省。 */
     if (s_ime) {
+        lv_pinyin_ime_attach(s_ime, NULL);
         lv_pinyin_ime_hide(s_ime);
     }
     if (!s_kb) {
@@ -448,6 +484,7 @@ static void modal_build_keyboards(lv_obj_t *ta, bool search)
         lv_obj_add_event_cb(s_kb, [](lv_event_t *e) { (void)e; ao_modal_close(); },
                             LV_EVENT_CANCEL, NULL);
     }
+    lv_keyboard_set_mode(s_kb, LV_KEYBOARD_MODE_NUMBER);   /* ★ 打开就是数字键盘 */
     lv_keyboard_set_textarea(s_kb, ta);
     lv_obj_remove_flag(s_kb, LV_OBJ_FLAG_HIDDEN);
     /* 同上：歌单 ID 键盘也可能被后来新建的 scrim 压住 */
@@ -485,6 +522,11 @@ void ao_modal_open(int kind)
                                                 : "请输入歌单 ID"),
                                NULL);
     s_modal_ta = ta;
+    /* 歌单 ID 只能输数字（用户要求）：输入层直接挡掉非数字字符。
+     * 键盘侧还有一道 `LV_KEYBOARD_MODE_NUMBER`（见 modal_build_keyboards）。 */
+    if (!rename && !search) {
+        lv_textarea_set_accepted_chars(ta, "0123456789");
+    }
     /* 重命名：把当前名字（没有就填 ID）预填进去，用户改两个字就行 */
     if (rename && ao_pl_rename_idx() >= 0) {
         const char *nm = online_playlist_name((size_t)ao_pl_rename_idx());

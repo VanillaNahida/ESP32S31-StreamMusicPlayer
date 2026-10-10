@@ -348,10 +348,17 @@ void music_online_start_track(int idx)
      */
     music_view_player_set_buffering_hint();
 
-    music_view_player_cover_show(NULL, 0, 0);
-    music_cover_reap();
-    music_cover_request(idx);
-    music_cover_kick();
+    /*
+     * 封面：**只有真的换了一首才丢掉重来**（music_cover_needs_reload）。
+     * 同一首重起播（地址过期重连 / 加载中点了播放）时屏上那张就是对的，
+     * 丢掉它反而可能永久拿不回来 —— 在线封面的内存缓冲是一次性消费的。
+     */
+    if (music_cover_needs_reload(idx)) {
+        music_view_player_cover_show(NULL, 0, 0);
+        music_cover_reap();
+        music_cover_request(idx);
+        music_cover_kick();
+    }
 
     music_view_player_reset_progress();
     music_view_player_set_elapsed_text(0);

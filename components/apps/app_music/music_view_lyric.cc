@@ -39,6 +39,77 @@ static lv_obj_t *s_lyric_col;
 static lv_obj_t *s_lyric_labels[LYRIC_VIEW_MAX_LINES];
 static size_t    s_lyric_n;
 
+/*
+ * 上次居中时的两个"未平移"中心点（-1 = 还没居中过）。
+ * 用途：行号没变、但页面布局变了（进页面首帧、歌词区高度变化、长句换行数变了）时，
+ * 原来的平移量就不对了 —— tick 靠这两个值判断"要不要重贴一次"。
+ */
+static int32_t s_center_line_y = -1;
+static int32_t s_center_box_y  = -1;
+
+/*
+ * 把 `idx` 行**精确居中**。
+ *
+ * ★★ 2026-10 修（用户报"歌词高亮的位置不居中"，在线/本地都查）：
+ *   原算法是
+ *       target = 歌词框高/2 − 固定行高/2 − 行号 × 固定行高     （固定行高 = UI_PX_H(26)）
+ *   它假设"每行都一样高"。实际不成立：
+ *
+ *     1. 长句用 LV_LABEL_LONG_WRAP —— 一句占两行、三行都正常。
+ *        **网易云的在线歌词句子明显更长（还常带翻译/罗马音），所以在线比本地更容易看出来**；
+ *     2. 一行文本里带 `\n`（双语歌词合成一条）时也是多倍行高；
+ *     3. 高亮行字号是 UI_FONT_TEXT，比其余行的 UI_FONT_SMALL 大，行高本来就不同；
+ *     4. 行与行之间还有 pad_row(6 px)。
+ *
+ *   于是行号一大，累计误差就有几十~上百像素：高亮行跑到偏上/偏下，"不居中"。
+ *
+ * 现在按**真实几何**算：把 translate 归零 → 跑一次布局 → 直接比较
+ * "歌词框中心"与"当前行中心"（`obj->coords` 不含 translate，归零后测量绝对可靠）
+ * → 差值就是新的平移量。整列是刚性平移，一次到位，与行高/换行数都无关。
+ */
+static void lyric_center_on(int idx)
+{
+    if (idx < 0 || (size_t)idx >= s_lyric_n || !s_lyric_labels[idx] ||
+        !s_lyric_box || !s_lyric_col) {
+        return;
+    }
+    lv_obj_set_style_translate_y(s_lyric_col, 0, LV_PART_MAIN);
+    lv_obj_update_layout(s_lyric_box);      /* 字号/换行刚变过：必须先落地，坐标才是真的 */
+
+    lv_area_t box, line;
+    lv_obj_get_coords(s_lyric_box, &box);
+    lv_obj_get_coords(s_lyric_labels[idx], &line);
+
+    const int32_t box_cy  = (box.y1 + box.y2) / 2;
+    const int32_t line_cy = (line.y1 + line.y2) / 2;
+
+    lv_obj_set_style_translate_y(s_lyric_col, box_cy - line_cy, LV_PART_MAIN);
+    s_center_box_y  = box_cy;
+    s_center_line_y = line_cy;
+}
+
+/*
+ * 行号没变时用：布局变了（换行数/区高变化）就重贴一次，否则什么都不做。
+ * 每 500 ms 一次纯查询（无失效时 `lv_obj_update_layout` 立即返回），开销可忽略。
+ */
+static void lyric_recenter_if_stale(void)
+{
+    if (s_lyric_cur < 0 || (size_t)s_lyric_cur >= s_lyric_n ||
+        !s_lyric_labels[s_lyric_cur] || !s_lyric_box) {
+        return;
+    }
+    lv_obj_update_layout(s_lyric_box);
+    lv_area_t box, line;
+    lv_obj_get_coords(s_lyric_box, &box);
+    lv_obj_get_coords(s_lyric_labels[s_lyric_cur], &line);
+    const int32_t box_cy  = (box.y1 + box.y2) / 2;
+    const int32_t line_cy = (line.y1 + line.y2) / 2;
+    if (box_cy == s_center_box_y && line_cy == s_center_line_y) {
+        return;                             /* 没变：一个像素都不动 */
+    }
+    lyric_center_on(s_lyric_cur);
+}
+
 void music_view_lyric_bind(lv_obj_t *lyric_box, lv_obj_t *lyric_hint,
                            lv_obj_t *hint_row, lv_obj_t *buf_spin, lv_obj_t *lyric_col)
 {
@@ -112,6 +183,8 @@ void music_view_lyric_rebuild(void)
     }
     s_lyric_n = 0;
     s_lyric_cur = -1;
+    s_center_line_y = -1;          /* 行都是新建的：上次的居中基准作废 */
+    s_center_box_y  = -1;
     memset(s_lyric_labels, 0, sizeof(s_lyric_labels));
 
     if (!s_lyric_col) {
@@ -169,18 +242,11 @@ static void lyric_apply_cur(int idx)
     }
 
     /*
-     * 用 translate_y 把整列平移到"当前行居中"。
+     * 用整列的 translate_y 把"当前行"平移到歌词框正中（见 lyric_center_on）。
      * 居中基准必须是**歌词区自己的高度**：歌词区在封面右侧（右栏），
      * 用 UI_H/2 会把整列推到屏幕外 —— 这正是旧版"看不到歌词"的原因。
      */
-    if (idx >= 0 && idx < (int)s_lyric_n && s_lyric_box) {
-        lv_area_t a;
-        lv_obj_get_coords(s_lyric_box, &a);
-        const int32_t box_h  = lv_area_get_height(&a);
-        const int32_t line_h = UI_PX_H(26);
-        const int32_t target = box_h / 2 - line_h / 2 - (int32_t)idx * line_h;
-        lv_obj_set_style_translate_y(s_lyric_col, target, LV_PART_MAIN);
-    }
+    lyric_center_on(idx);
 }
 
 /* 定时器里用：位置变了才动（没变就一行都不碰） */
@@ -192,6 +258,9 @@ void music_view_lyric_tick(void)
     }
     const int idx = media_meta_lrc_index_at(&s_lrc, music_state()->elapsed_ms);
     if (idx == s_lyric_cur) {
+        /* 行号没变，但页面布局可能变了（进页面首帧、歌词区高度变化、长句换行数变了）——
+         * 那时旧的平移量就不对了：按需重贴一次，正常情况下它是空操作。 */
+        lyric_recenter_if_stale();
         return;
     }
     lyric_apply_cur(idx);
@@ -264,5 +333,7 @@ void music_view_lyric_on_page_delete(void)
     s_lyric_n    = 0;
     s_lyric_cur  = -1;
     s_lyric_mode = false;
+    s_center_line_y = -1;
+    s_center_box_y  = -1;
     memset(s_lyric_labels, 0, sizeof(s_lyric_labels));
 }

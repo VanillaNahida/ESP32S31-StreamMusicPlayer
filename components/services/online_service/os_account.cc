@@ -344,22 +344,32 @@ esp_err_t online_netease_daily_songs(online_song_t *out, size_t max, size_t *out
     return err;
 }
 
-esp_err_t online_netease_song_url(const char *song_id, char *out, size_t cap,
-                                  int64_t *out_bytes, uint32_t *out_dur_ms)
+/*
+ * 播放直链：**带当前登录 CK 请求自建中间件**（NeteaseCloudMusicApi 的 /song/url/v1）。
+ *
+ * ★ 这是本工程取"播放地址"的**唯一正路**（2026-10 用户要求）：
+ *   meting 的 `type=url` 是**匿名**请求 —— 会员 / 数字专辑歌曲只会下发
+ *   **30 秒试听片段**（真机实测 Content-Length 439 KB ≈ 128 kbps 的 27 秒，
+ *   元数据时长却是整首 → 曾经把 seek 映射和进度条一起带偏，见 audio_engine_bitrate
+ *   里那段说明）。带上账号 CK 之后，中间件返回的才是**完整**直链，会员歌能整首听。
+ *   meting 退居"辅助"：歌词 / 封面 / 歌单列表照旧走它。
+ *
+ * 等级：先 `standard`（128 kbps，任何账号都拿得到），拿不到 URL 再试一次
+ *   `exhigh`（320 kbps，VIP 有效）—— 有些歌只在更高等级下才有直链。
+ *   ⚠ 每次尝试都是一次 HTTP 往返，所以只在**第一次失败**时才多花这一次。
+ */
+#define NETEASE_URL_LEVEL_1  "standard"
+#define NETEASE_URL_LEVEL_2  "exhigh"
+
+/* 试一次 /song/url/v1。成功填 out/out_bytes/out_dur_ms 并返回 ESP_OK。 */
+static esp_err_t song_url_try(const char *song_id, const char *level,
+                              char *out, size_t cap, int64_t *out_bytes,
+                              uint32_t *out_dur_ms, bool *out_trial)
 {
-    if (!song_id || !song_id[0] || !out || cap == 0) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    out[0] = '\0';
-    if (out_bytes) {
-        *out_bytes = 0;
-    }
-    if (out_dur_ms) {
-        *out_dur_ms = 0;
-    }
+    *out_trial = false;
 
     char path[128];
-    int n = snprintf(path, sizeof(path), "/song/url/v1?id=%s&level=standard", song_id);
+    int n = snprintf(path, sizeof(path), "/song/url/v1?id=%s&level=%s", song_id, level);
     if (n <= 0 || n >= (int)sizeof(path)) {
         return ESP_ERR_INVALID_SIZE;
     }
@@ -378,6 +388,15 @@ esp_err_t online_netease_song_url(const char *song_id, char *out, size_t cap,
     const cJSON *arr = os_pick_array(root, "data");
     const cJSON *first = cJSON_IsArray(arr) ? arr->child : NULL;
     if (first) {
+        /*
+         * ★ 试听片段识别（免费账号 / 无版权时服务端就是这样回的）：
+         *   `freeTrialInfo` 非空 = 这首只给了片段（哪怕 url 是有的）。
+         *   把这个事实打出来，用户就知道"该开会员"而不是"播放器坏了"。
+         */
+        const cJSON *trial = cJSON_GetObjectItemCaseSensitive(first, "freeTrialInfo");
+        if (trial && !cJSON_IsNull(trial)) {
+            *out_trial = true;
+        }
         const cJSON *u = cJSON_GetObjectItemCaseSensitive(first, "url");
         if (cJSON_IsString(u) && u->valuestring && u->valuestring[0]) {
             snprintf(out, cap, "%.*s", (int)(cap - 1), u->valuestring);
@@ -395,12 +414,41 @@ esp_err_t online_netease_song_url(const char *song_id, char *out, size_t cap,
         }
     }
     cJSON_Delete(root);
+    return ret;
+}
+
+esp_err_t online_netease_song_url(const char *song_id, char *out, size_t cap,
+                                  int64_t *out_bytes, uint32_t *out_dur_ms)
+{
+    if (!song_id || !song_id[0] || !out || cap == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    out[0] = '\0';
+    if (out_bytes) {
+        *out_bytes = 0;
+    }
+    if (out_dur_ms) {
+        *out_dur_ms = 0;
+    }
+
+    bool trial = false;
+    esp_err_t ret = song_url_try(song_id, NETEASE_URL_LEVEL_1, out, cap,
+                                 out_bytes, out_dur_ms, &trial);
+    if (ret != ESP_OK) {
+        /* standard 拿不到：再试一次 exhigh（VIP 等级），失败就如实返回 */
+        ESP_LOGD(TAG, "song url %s: level=%s 无直链，重试 %s",
+                 song_id, NETEASE_URL_LEVEL_1, NETEASE_URL_LEVEL_2);
+        ret = song_url_try(song_id, NETEASE_URL_LEVEL_2, out, cap,
+                           out_bytes, out_dur_ms, &trial);
+    }
+
     if (ret == ESP_OK) {
-        ESP_LOGI(TAG, "song url %s: %lld bytes, %u ms", song_id,
+        ESP_LOGI(TAG, "song url %s: %lld bytes, %u ms%s", song_id,
                  (long long)(out_bytes ? *out_bytes : 0),
-                 (unsigned)(out_dur_ms ? *out_dur_ms : 0));
+                 (unsigned)(out_dur_ms ? *out_dur_ms : 0),
+                 trial ? " **试听片段(freeTrialInfo)**：该账号对这首没有完整版权" : "");
     } else {
-        ESP_LOGW(TAG, "song url %s: 没拿到直链（VIP / 版权 / cookie 失效）", song_id);
+        ESP_LOGW(TAG, "song url %s: 没拿到直链（cookie 失效 / 无版权 / 中间件不可达）", song_id);
     }
     return ret;
 }

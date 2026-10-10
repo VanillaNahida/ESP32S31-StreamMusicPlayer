@@ -39,6 +39,35 @@ typedef struct {
 
 static void cover_task(void *arg);   /* 前向声明：cover_kick 在它上面 */
 
+/*
+ * 屏上这张封面属于哪首（-1 = 没有）—— 只有 `music_cover_place()` 会写。
+ *
+ * 为什么需要它（2026-10 用户报"加载的时候点播放按钮，歌曲封面可能会丢失"）：
+ * 起播一首时会先 `cover_show(NULL,0,0)` 把屏上封面释放掉、再重新请求解码。而
+ * **同一首重起播**（在线地址过期重连、加载中点了播放导致重来一次）也走这条路径，
+ * 于是封面被白白丢掉；更糟的是在线封面的字节缓冲 `on_cover_data` 是**一次性消费**的
+ * （起播时已拷走/释放），重来一次就再也拿不到图片 → 封面**永久为空**。
+ * 有了这个下标，起播时就能判断"屏上这张就是目标曲目" → 原地留着，不动它。
+ */
+static int s_disp_idx = -1;
+
+/* 起播 `idx` 时问一句：需要重新解码封面吗？（false = 屏上那张就是它，别动） */
+bool music_cover_needs_reload(int idx)
+{
+    music_state_t *st = music_state();
+    if (idx < 0) {
+        return true;
+    }
+    if (s_disp_idx == idx && st->cover_dsc && st->cover_pixels) {
+        /* 屏上这张就是目标曲目：把可能排着的"别的下标"的请求也撤掉 */
+        if (st->cover_want != idx) {
+            st->cover_want = -1;
+        }
+        return false;
+    }
+    return true;
+}
+
 bool music_cover_have_pixels(void)
 {
     music_state_t *st = music_state();
@@ -212,6 +241,7 @@ void music_cover_place(uint8_t *px, int w, int h,
         media_meta_cover_free(st->cover_pixels);
         st->cover_pixels = NULL;
     }
+    s_disp_idx = -1;      /* 屏上没封面了（下面贴新图时会记上新的下标） */
 
     if (px && set_src && w > 0 && h > 0) {
         lv_image_dsc_t *dsc = (lv_image_dsc_t *)calloc(1, sizeof(lv_image_dsc_t));
@@ -231,6 +261,8 @@ void music_cover_place(uint8_t *px, int w, int h,
         dsc->data_size     = (uint32_t)w * 2u * (uint32_t)h;
         dsc->data          = st->cover_pixels;
         st->cover_dsc      = dsc;
+        /* 记下"屏上这张是谁的封面"：起播时靠它判断要不要重新解码（见文件头） */
+        s_disp_idx = st->index;
 
         set_src(user, dsc);
         if (set_visible) {

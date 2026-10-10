@@ -201,16 +201,20 @@ lv_obj_t *music_view_player_build(void)
     lv_obj_set_width(artist, LV_PCT(100));
     lv_label_set_long_mode(artist, LV_LABEL_LONG_DOT);
 
+    /* ★ 建完立刻登记进控件表：换曲时 music_view_player_set_now_playing() 要靠它刷新。
+     * 漏了这一步的表现是"首次进页面标题正常、之后换曲标题/歌手不动"（2026-10 的 bug）。 */
+    music_view_player_bind_now_playing(title, artist);
+
     if (st->on_mode && st->on_songs && st->index >= 0 && (size_t)st->index < st->on_count) {
         const online_song_t *song = &((const online_song_t *)st->on_songs)[st->index];
-        lv_label_set_text(title, song->title);                      /* 在线曲目 */
-        lv_label_set_text(artist, song->artist[0] ? song->artist : "未知歌手");
+        music_view_player_set_now_playing(song->title, song->artist);   /* 在线曲目 */
     } else {
         const track_t *t = (st->index >= 0) ? storage_service_track((size_t)st->index) : NULL;
-        lv_label_set_text(title, t ? t->title : "未在播放");
         if (st->index >= 0) {
-            lv_label_set_text(artist, (t && t->artist[0]) ? t->artist : "未知歌手");
+            music_view_player_set_now_playing(t ? t->title : "未在播放", t ? t->artist : NULL);
         } else {
+            /* 还没选过歌：标题给提示，歌手单独一句引导（见下） */
+            music_view_player_set_now_playing("未在播放", NULL);
             lv_label_set_text(artist, "请在「本地音乐」里选一首");
         }
     }

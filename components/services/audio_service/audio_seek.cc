@@ -83,6 +83,14 @@ static esp_err_t seek_stream(uint32_t pos_ms)
     ESP_LOGI(TAG, "stream seek -> %u ms = byte %llu (%u bps)", (unsigned)pos_ms,
              (unsigned long long)byte, (unsigned)bps);
 
+    /*
+     * 拖动前的播放位置：**重开失败时要回到这里**。
+     * 为什么必须回退：拖动会先把旧会话整个停掉，如果新会话起不来又不补救，
+     * 用户看到的就是"拖了一下 → 歌没了、彻底安静"（比"拖不动"糟糕得多）。
+     * 回退点用"送去硬件的字节 ÷ 192"算出来，就是耳朵刚才听到的位置。
+     */
+    const uint32_t back_ms = audio_output_position_ms();
+
     audio_core_lock();
 
     audio_engine_stop();                 /* 先彻底停掉旧会话（含输出任务收尾） */
@@ -94,13 +102,31 @@ static esp_err_t seek_stream(uint32_t pos_ms)
         err = audio_engine_start_stream(audio_http_format());
     }
 
-    audio_core_unlock();
-
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "stream seek failed: %s", esp_err_to_name(err));
-        audio_http_stop();
-        return err;
+        ESP_LOGW(TAG, "stream seek failed: %s -> 回退到拖动前的 %u ms",
+                 esp_err_to_name(err), (unsigned)back_ms);
+        /* 尽力把播放接回原位：目标位置 -> 拖动前的位置 -> 从头 */
+        const int fmt = audio_http_format();
+        const uint64_t back_byte = (uint64_t)back_ms * bps / 8000ull;
+        esp_err_t e2 = audio_http_start(back_byte);
+        if (e2 == ESP_OK && !audio_http_wait_ready(8000)) {
+            e2 = ESP_ERR_TIMEOUT;
+        }
+        if (e2 == ESP_OK) {
+            e2 = audio_engine_start_stream(fmt);
+        }
+        if (e2 == ESP_OK) {
+            audio_output_flush();
+            audio_output_note_seek(back_ms);     /* 时间轴也回到拖动前，界面不会停在假进度上 */
+        } else {
+            ESP_LOGE(TAG, "stream seek rollback failed too: %s", esp_err_to_name(e2));
+            audio_http_stop();
+        }
+        audio_core_unlock();
+        return err;                              /* 仍然如实告诉上层：这次拖动没成功 */
     }
+
+    audio_core_unlock();
 
     audio_output_flush();
     audio_output_note_seek(pos_ms);

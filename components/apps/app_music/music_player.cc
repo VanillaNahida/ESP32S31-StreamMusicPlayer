@@ -88,11 +88,15 @@ void music_player_start_track_at(int idx, uint32_t resume_ms)
     st->buf_show = false;          /* 本地文件：立刻出声，不要"缓冲中"提示 */
     st->seek_buf_pending = false;
 
-    /* 封面：先退回占位（别把上一首的封面留在屏上），再交给工作线程解 */
-    music_view_player_cover_show(NULL, 0, 0);
-    music_cover_reap();
-    music_cover_request(idx);
-    music_cover_kick();
+    /* 封面：先退回占位（别把上一首的封面留在屏上），再交给工作线程解。
+     * ★ 同一首重起播（暂停后重来 / 续播定位）时屏上那张就是对的，别动它 ——
+     *   丢掉重来有可能永久拿不回来（在线封面缓冲一次性消费，见 music_cover.h）。 */
+    if (music_cover_needs_reload(idx)) {
+        music_view_player_cover_show(NULL, 0, 0);
+        music_cover_reap();
+        music_cover_request(idx);
+        music_cover_kick();
+    }
 
     /*
      * 进度条归零：时长这时还不知道（要等服务报出信息），进度条先按 0 摆好。
@@ -174,11 +178,36 @@ void music_player_play_next(int dir)
     music_player_start_track(idx);
 }
 
+/*
+ * "加载中"判据 —— 用**状态**而不是控件。
+ * 视图层那个 `s_c.btn_busy` 只反映播放器页上的按钮，用户在别的页面用蓝牙媒体键
+ * 或音量键按播放时它是 false，那道门就漏了；两个判据的条件本身是同一个
+ * （解析在线地址/抓封面歌词 on_busy、缓冲 buf_show）。
+ */
+static bool music_loading(void)
+{
+    const music_state_t *st = music_state();
+    return st->on_busy || st->buf_show;
+}
+
 void music_player_on_play_pause(void)
 {
     music_state_t *st = music_state();
     if (st->index < 0) {
         ui_toast("请先在本地音乐里选一首", 1600);
+        return;
+    }
+    /*
+     * ★ 加载中不受理（按钮此刻是转圈 + 禁用，见 music_view_player_set_busy）。
+     *
+     * 为什么必须在这里再挡一道：加载时按播放会走 `audio_service_toggle()`，
+     * 而这时会话可能刚建到一半 —— toggle 失败后落到下面的"重新起播"分支，
+     * 重新起播会**释放屏上的封面再重新请求**，而那份封面数据可能已经被消费掉 →
+     * 封面就"没了"（2026-10 用户报的"加载时点播放，封面丢失"）。
+     * `LV_STATE_DISABLED` 只是"看起来禁用"，吃不吃点击别依赖它。
+     */
+    if (music_loading()) {
+        ui_toast("正在加载，请稍候", 1000);
         return;
     }
     /*
@@ -208,7 +237,9 @@ void music_player_stop(void)
 {
     music_state_t *st = music_state();
     audio_service_stop();
-    st->playing = false;
+    st->playing  = false;
+    st->buf_show = false;                     /* 停了就没有"加载中"了 */
+    music_view_player_set_busy(false);
     music_view_player_set_play_icon(false);
 }
 
@@ -305,6 +336,15 @@ bool music_player_seek_begin(uint32_t target)
      */
     if (music_track_seek_unsupported(st->track_path)) {
         ui_toast("这个格式不支持拖动定位", 2000);
+        return false;
+    }
+    /*
+     * 加载中不允许拖动：这时会话可能还没建起来（或正在重建），
+     * `audio_service_seek_supported()` 也多半是 false —— 与其弹"码率未知"这种
+     * 让人摸不着头脑的提示，不如直接说清"还在加载"。
+     */
+    if (music_loading()) {
+        ui_toast("正在加载，稍后再拖动", 1400);
         return false;
     }
     if (!audio_service_seek_supported()) {

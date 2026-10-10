@@ -46,6 +46,16 @@ static const char *TAG = "audio_http";
 #define HTTP_TIMEOUT_MS      8000
 #define HTTP_MAX_RETRY       5        /* 连续重连失败上限（成功读一次就清零） */
 #define SNIFF_BYTES          2048
+/**
+ * 起播前预读的字节数。
+ *
+ * 解码器 `open()` 必须能凑出一个完整容器帧，否则直接报 PARSE 起不来
+ * （MP3 一帧最大 1441 B @320 kbps；AAC/FLAC 的帧更小）。取一个读取块（8 KB）
+ * 有 5 倍余量，同时不会明显拖慢起播（慢网下还有 STREAM_PREBUF_TIMEOUT_MS 兜底）。
+ */
+#define STREAM_PREBUF_BYTES  AUDIO_STREAM_CHUNK
+/** 预读的最长等待：超时就用手里这些起播，别把用户卡在"缓冲中" */
+#define STREAM_PREBUF_TIMEOUT_MS  2500
 /** 速率统计窗口 */
 #define SPEED_WINDOW_MS      250
 
@@ -304,31 +314,63 @@ static void feed_task(void *arg)
     s_downloaded = (uint32_t)from_byte;
     s_eof = false;
 
-    /* ---- 嗅探：只在**首次**连接（from_byte == 0）做 ----
-     * 中途 seek 重开的连接是从歌中间开始的，那 2 KB 里没有容器头，
-     * 嗅出来的只能是垃圾（会把已经定好的格式改坏）。 */
-    if (from_byte == 0) {
+    /*
+     * ---- 起播前预读（**任何连接都要做**，包括 seek 重开的）----
+     *
+     * ★ 为什么必须（2026-10 真机定位）：MP3 解码器 open() 里是两步 ——
+     *     fill_valid_frame()  找同步字（可能是帧数据里的**假同步**）
+     *     decode_frame()      真正校验这一帧
+     *   而 open() 对 decode_frame() 的失败**没有重试**，直接返回 PARSE
+     *   （`begin_stream_rb failed: ESP_ERR_INVALID_RESPONSE (dec_err=-2)`）。
+     *   所以"解码器打开时手里数据太少、凑不出一个完整帧"= 这首歌起不来。
+     *   实测：首次连接预读过 2 KB 能起（320 kbps 一帧 1441 B 刚好塞得下），
+     *   而 seek 重开的连接当时**没有预读**，只剩几百字节 → 必然失败。
+     *
+     * 嗅探仍然只在**首次**连接做：seek 重开的连接是从歌中间开始的，
+     * 那几 KB 里没有容器头，嗅出来的只能是垃圾（会把已定好的格式改坏）。
+     */
+    {
         size_t got = 0;
-        while (got < SNIFF_BYTES && s_run) {
-            const int r = esp_http_client_read(cli, (char *)buf + got, (int)(SNIFF_BYTES - got));
+        bool sniffed = (from_byte != 0);   /* 非首次连接 = 不需要嗅探，直接算已完成 */
+        const uint32_t deadline =
+            (uint32_t)(esp_timer_get_time() / 1000) + STREAM_PREBUF_TIMEOUT_MS;
+
+        while (got < STREAM_PREBUF_BYTES && s_run) {
+            const int r = esp_http_client_read(cli, (char *)buf + got,
+                                               (int)(STREAM_PREBUF_BYTES - got));
             if (r <= 0) {
                 break;
             }
             got += (size_t)r;
+            if (!sniffed && got >= SNIFF_BYTES) {
+                const int s = sniff_format(buf, got);
+                if (s != ESPAUDIOCORE_FMT_UNKNOWN && s != s_fmt) {
+                    ESP_LOGW(TAG, "container sniffed as %d (扩展名猜的是 %d)，以嗅探为准",
+                             s, (int)s_fmt);
+                    s_fmt = s;
+                }
+                sniffed = true;
+            }
+            if ((uint32_t)(esp_timer_get_time() / 1000) >= deadline) {
+                break;      /* 慢网：有多少算多少，别把起播卡住 */
+            }
         }
+        /* 连 2 KB 都没凑齐就超时：用手里这些尽力嗅一次 */
+        if (!sniffed) {
+            const int s = sniff_format(buf, got);
+            if (s != ESPAUDIOCORE_FMT_UNKNOWN && s != s_fmt) {
+                s_fmt = s;
+            }
+        }
+
         if (got == 0) {
-            ESP_LOGE(TAG, "no data for sniffing");
+            ESP_LOGE(TAG, "no data for prebuffer (from %llu)",
+                     (unsigned long long)from_byte);
             s_conn_failed = true;
             s_ready = true;
             esp_http_client_cleanup(cli);
             free(buf);
             feed_exit();
-        }
-        const int sniffed = sniff_format(buf, got);
-        if (sniffed != ESPAUDIOCORE_FMT_UNKNOWN && sniffed != s_fmt) {
-            ESP_LOGW(TAG, "container sniffed as %d (扩展名猜的是 %d)，以嗅探为准",
-                     sniffed, (int)s_fmt);
-            s_fmt = sniffed;
         }
         s_downloaded += (uint32_t)got;
         speed_account(got);
@@ -337,7 +379,8 @@ static void feed_task(void *arg)
             free(buf);
             feed_exit();
         }
-        ESP_LOGI(TAG, "sniffed %u bytes -> format %d", (unsigned)got, (int)s_fmt);
+        ESP_LOGI(TAG, "prebuf %u bytes (from %llu) -> format %d", (unsigned)got,
+                 (unsigned long long)from_byte, (int)s_fmt);
     }
 
     s_ready = true;
@@ -512,11 +555,24 @@ void audio_http_stop(void)
     }
     s_run = false;
     /* 等任务自己退出（它可能正阻塞在 xRingbufferSend 的 200 ms 超时里） */
-    for (int i = 0; i < 100 && s_task; i++) {
+    for (int i = 0; i < 200 && s_task; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     if (s_task) {
-        ESP_LOGW(TAG, "feed task did not exit, killing");
+        /*
+         * 走到这里说明任务连 2 秒都没退 —— 它多半正阻塞在 socket 读里
+         * （网络卡住，esp_http_client_read 的超时是 8 s）。
+         *
+         * ⚠ 强制删除是**不得已**：任务若正持着 lwip/mbedtls 内部的锁被删掉，
+         * 那把锁就永远不还，网络栈会僵住。所以：
+         *   1) 等待时间给足（见上面的循环：2 s，覆盖"ringbuf 满 → 200 ms 超时退出"
+         *      与"socket 读被 8 s 超时打断"之间的绝大多数情况）；
+         *   2) 真删的时候把日志打醒，事后排查能看见；
+         *   3) 删之前先 s_run=false，任务即使被删也不会再主动用 s_ring/s_task。
+         * 想彻底避免就得把 socket 读改成带超时的非阻塞轮询（esp_http_client 没有
+         * 提供），那是另一个量级的改动，先按现状 + 醒目日志。
+         */
+        ESP_LOGW(TAG, "feed task did not exit in 2s, force delete (socket 可能未关闭)");
         vTaskDelete(s_task);
         s_task = NULL;
     }
@@ -551,6 +607,25 @@ bool audio_http_speed(int *kbps)
 uint64_t audio_http_downloaded(void)
 {
     return s_downloaded;
+}
+
+/*
+ * 环形缓冲里**还没被解码器取走**的字节数。
+ *
+ * 用途（见 audio_engine 的 measured_stream_bps）：算"这段流的真实码率"必须用
+ * **解码器已经吃掉的字节**，而不是"网络已经下到的字节" —— 下载前沿会跑在播放前面
+ * （4 MB 缓冲经常能把整首歌装下），拿下载量除以已播时长得到的是"越来越小的假码率"，
+ * 于是总时长会**一边播一边往上爬**（2026-10 用户报"在线总时长不对"就是这个）。
+ */
+uint64_t audio_http_ring_filled(void)
+{
+    if (!s_ring) {
+        return 0;
+    }
+    const size_t free_sz = xRingbufferGetCurFreeSize(s_ring);
+    return (free_sz >= (size_t)AUDIO_STREAM_RING_BYTES)
+               ? 0
+               : (uint64_t)((size_t)AUDIO_STREAM_RING_BYTES - free_sz);
 }
 
 uint64_t audio_http_total(void)

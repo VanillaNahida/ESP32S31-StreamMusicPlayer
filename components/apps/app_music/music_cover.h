@@ -37,6 +37,19 @@ bool music_cover_source_is_online(void);
 int  music_cover_want(void);
 void music_cover_request(int idx);
 
+/*
+ * 起播 `idx` 前的问询：屏上那张封面是不是**就是它**？
+ *
+ * 返回 false（= 不用重来）时，调用方**不要**调 cover_show(NULL) / request / kick ——
+ * 原地留着就行；返回 true 才照旧走"释放 + 重新请求"。
+ *
+ * 为什么需要：同一首**重起播**（在线地址过期重连、加载中点了播放导致重来一次）
+ * 也走"起播"路径。若无脑释放再请求，在线封面的内存缓冲是一次性消费的
+ * （起播时已转移/释放），重来就再也拿不到图 → **封面永久为空**
+ * （2026-10 用户报的"加载时点播放，封面丢失"）。
+ */
+bool music_cover_needs_reload(int idx);
+
 /* 有请求且空闲就起解码任务（必须在 LVGL 任务上下文调用）。
  * 起不来（没内存 / 任务创建失败）时静默返回，占位图兜底。 */
 void music_cover_kick(void);

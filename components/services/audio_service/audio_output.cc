@@ -93,10 +93,19 @@ static float             s_weight[2] = {1.0f, 1.0f};
 static uint8_t          *s_bt_stage;
 static size_t            s_bt_stage_cap;
 
+/**
+ * 重采样输出的暂存（按需增长）。**只属于输出任务**，引擎的会话拆除永远不碰它 ——
+ * 这样"写硬件"才能放到会话锁之外做（见 prepare_block 与 out_task 的注释）。
+ */
+static uint8_t          *s_stage;
+static size_t            s_stage_cap;
+
 /* 健康度统计 */
 static uint32_t s_stats_ms;
 static uint64_t s_stats_bytes;
 static uint64_t s_stats_codec_us;
+static uint64_t s_stats_asrc_us;
+static uint64_t s_stats_wait_us;
 static uint32_t s_stats_calls;
 static uint32_t s_stats_gap_max_ms;
 static uint32_t s_stats_last_ms;
@@ -163,6 +172,28 @@ static uint8_t *bt_stage(size_t need)
     return s_bt_stage;
 }
 
+/** 重采样输出暂存，按需增长（只被 out_task 调用） */
+static bool stage_ensure(size_t need)
+{
+    if (s_stage_cap >= need) {
+        return s_stage != NULL;
+    }
+    uint8_t *p = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!p) {
+        p = (uint8_t *)heap_caps_malloc(need, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    }
+    if (!p) {
+        ESP_LOGE(TAG, "stage alloc %u B failed", (unsigned)need);
+        return false;
+    }
+    if (s_stage) {
+        heap_caps_free(s_stage);
+    }
+    s_stage = p;
+    s_stage_cap = need;
+    return true;
+}
+
 /* ===========================================================================
  * 重采样（esp_asrc）
  * =========================================================================*/
@@ -170,8 +201,19 @@ static uint8_t *bt_stage(size_t need)
 static void asrc_close(void)
 {
     if (s_asrc) {
+        /*
+         * ⚠ 这两行是**崩溃定位专用**（2026-10 真机两次 tlsf 双重释放都发生在
+         * "拆除用过 ASRC 的会话"时）。esp_asrc 的软件路径最终落到**预编译库**
+         * `libesp_audio_effects.a` 的 `esp_ae_rate_cvt`，我们看不到它的 close 实现；
+         * 有了 "asrc close: h=…" 与 "asrc closed" 这一对，下次日志就能判断
+         * 崩溃到底发生在 `esp_asrc_close()` 里面（只有前一行）还是后面的某一步。
+         * 定位完成后可以降成 LOGD。
+         */
+        ESP_LOGI(TAG, "asrc close: h=%p (src %u Hz %uch)", s_asrc,
+                 (unsigned)s_src_rate, s_src_ch);
         esp_asrc_close(s_asrc);
         s_asrc = NULL;
+        ESP_LOGI(TAG, "asrc closed");
     }
     if (s_in_buf) {
         heap_caps_free(s_in_buf);
@@ -195,7 +237,21 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
     cfg.dest_info.channel        = AUDIO_OUT_CHANNELS;
     cfg.dest_info.bits_per_sample = AUDIO_OUT_BITS;
     cfg.perf_type = ESP_ASRC_PERF_TYPE_SW_SPEED;
-    cfg.complexity = 3;
+    /*
+     * complexity 1~3：3 = 质量最好、最慢；1 = 最快、质量最差。
+     *
+     * ⚠ esp_asrc 的软件路径其实就是 **esp_audio_effects 的 `esp_ae_rate_cvt`**
+     *   （`sw/src/asrc_sw_rate_cvt_ops.c` 只是薄封装）—— 也就是 GMF 时代被测出
+     *   "约 20% 实时"的同一个软件重采样器。2026-10 真机日志显示 complexity=3 时
+     *   它把整条链拖到 **97.8% 实时**（每 63 ms 音频要 64.5 ms 才产得出来），
+     *   表现就是"部分文件（需要重采样的 44.1k/32k/22.05k）一卡一卡"，同时它还占着
+     *   core 1 把 LVGL 挤掉三成 CPU。
+     *
+     * 取 2 是折中：比 3 明显省 CPU，质量损失在 44.1k→48k 这种比率上基本听不出来。
+     * 若日志里 `asrc` 那一列仍然很大，下一步是**换更省的重采样**（自研定点多相 FIR，
+     * 或按 esp_asrc.h 的官方对齐 API 走 S31 的硬件 ASRC），不要再往 1 降质量。
+     */
+    cfg.complexity = 2;
     cfg.timeout_ms = 1000;
     if (src_ch != AUDIO_OUT_CHANNELS) {
         /* 单声道 → 立体声：显式给权重，硬件路径也认这种配置 */
@@ -253,21 +309,17 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
  * 采样率/声道随时可能就绪或变化（解码器是异步打开的，AAC 甚至逐帧上报），
  * 所以每轮都问一次；只有真的变了才重建 ASRC。
  *
- * ⚠ **必须持会话锁**：`espaudiocore_get_format()` 读的是库内部的会话对象，
- * 而 `audio_engine_stop()` 会在持锁状态下把它释放掉。不持锁的话存在这样一条窗口：
- * 输出任务刚通过 flow gate 检查 → 引擎关闸并 `espaudiocore_stop()` 释放 ctx →
- * 输出任务才调 `get_format()` → **use-after-free**（现场是随机 LoadProhibited）。
- * 这一段只有几十条指令，锁竞争可以忽略。
+ * ⚠ **调用者必须已经持有会话锁**（`out_task` 就是这么做的）：
+ * `espaudiocore_get_format()` 读的是库内部的会话对象，而 `audio_engine_stop()` 会在
+ * 持锁状态下把它释放掉；同时这里还会 `asrc_close()/asrc_open()` 动 ASRC 与它的缓冲。
+ * 不持锁就会与那次拆除撞车（2026-10 真机 double-free，见 out_task 上面的长注释）。
  */
 static void pump_format(void)
 {
     uint32_t rate = 0;
     uint8_t ch = 0, bits = 0;
 
-    audio_core_lock();
     const esp_err_t ferr = espaudiocore_get_format(&rate, &ch, &bits);
-    audio_core_unlock();
-
     if (ferr != ESP_OK || rate == 0 || ch == 0) {
         return;
     }
@@ -290,9 +342,13 @@ static void pump_format(void)
  * 写硬件
  * =========================================================================*/
 
-static void write_out(const uint8_t *pcm, size_t bytes)
+/*
+ * 把一块 PCM 写到硬件。**必须在会话锁之外调用**（见 out_task 的说明）：
+ * 写 I2S/蓝牙会阻塞几十毫秒，锁里做会把 LVGL 一起卡住。
+ * route/vol 由调用方在锁内取好快照传进来（差一块的延迟无所谓）。
+ */
+static void write_out(const uint8_t *pcm, size_t bytes, audio_out_t route, int vol)
 {
-    const audio_out_t route = s_route;
     const int64_t t0 = esp_timer_get_time();
 
     if (route == AUDIO_OUT_SPEAKER) {
@@ -301,7 +357,6 @@ static void write_out(const uint8_t *pcm, size_t bytes)
             s_codec_err++;
         }
     } else if (route == AUDIO_OUT_BLUETOOTH) {
-        const int vol = s_volume;
         if (vol > 0) {
             if (vol < 100) {
                 /* 蓝牙路的音量只能软件做（ES8389 的寄存器对 A2DP 无效） */
@@ -343,7 +398,16 @@ static void write_out(const uint8_t *pcm, size_t bytes)
     s_stats_last_ms = now;
 }
 
-/** 每 5 秒一行播放健康度：确认"是不是真的在按时出声、卡在哪一段" */
+/**
+ * 每 5 秒一行播放健康度：确认"是不是真的在按时出声、卡在哪一段"。
+ *
+ * 关键一列是 `产 N ms / 墙 W ms`（交付的音频时长 ÷ 窗口时长）：
+ *   - ≈100%：跟得上；
+ *   - <99%：**产能不足**，DMA 会被慢慢抽干 → 一卡一卡。这时看后面三列定位：
+ *       `asrc` 大 ⇒ 重采样太贵（换更省的实现 / 提高 complexity 档位）；
+ *       `wait` 大 ⇒ 解码端供不上（SD/解码/任务被抢，常见于 Wi-Fi 在 core 0 忙）；
+ *       `codec` 接近 100% 而前两项都不大 ⇒ 正常（写硬件本来就是被 DMA 节流的）。
+ */
 static void stats_tick(void)
 {
     const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
@@ -356,18 +420,26 @@ static void stats_tick(void)
         return;
     }
     const uint32_t audio_ms = (uint32_t)(s_stats_bytes / AUDIO_OUT_BYTES_PER_MS);
+    const uint32_t permille = win ? (uint32_t)((uint64_t)audio_ms * 1000ull / win) : 0;
     const uint32_t kbps = (uint32_t)((uint64_t)s_stats_bytes * 1000ull / win / 1024ull);
-    ESP_LOGI(TAG, "play stats: PCM %u KB/s (%llu B in %u ms), audio %u ms, codec %llu ms, "
-                  "gap max %u ms, calls %u, route %d, src %u Hz %uch%s%s",
-             (unsigned)kbps, (unsigned long long)s_stats_bytes, (unsigned)win,
-             (unsigned)audio_ms, (unsigned long long)(s_stats_codec_us / 1000),
-             (unsigned)s_stats_gap_max_ms, (unsigned)s_stats_calls, (int)s_route,
-             (unsigned)s_src_rate, s_src_ch, s_asrc ? " (asrc)" : "",
+    const uint32_t ring_free = s_pcm_rb ? (uint32_t)xRingbufferGetCurFreeSize(s_pcm_rb) : 0;
+    ESP_LOGI(TAG, "play stats: PCM %u KB/s | 产 %u ms / 墙 %u ms (%u.%u%%) | codec %llu ms, "
+                  "asrc %llu ms, wait %llu ms | gap max %u ms, calls %u, ring free %u B, "
+                  "route %d, src %u Hz %uch%s%s",
+             (unsigned)kbps, (unsigned)audio_ms, (unsigned)win,
+             (unsigned)(permille / 10), (unsigned)(permille % 10),
+             (unsigned long long)(s_stats_codec_us / 1000),
+             (unsigned long long)(s_stats_asrc_us / 1000),
+             (unsigned long long)(s_stats_wait_us / 1000),
+             (unsigned)s_stats_gap_max_ms, (unsigned)s_stats_calls, (unsigned)ring_free,
+             (int)s_route, (unsigned)s_src_rate, s_src_ch, s_asrc ? " (asrc)" : "",
              s_codec_err ? " [codec write errors!]" : "");
 
     s_stats_ms = now;
     s_stats_bytes = 0;
     s_stats_codec_us = 0;
+    s_stats_asrc_us = 0;
+    s_stats_wait_us = 0;
     s_stats_calls = 0;
     s_stats_gap_max_ms = 0;
 }
@@ -376,36 +448,77 @@ static void stats_tick(void)
  * 输出任务
  * =========================================================================*/
 
-static void play_block(uint8_t *data, size_t bytes)
+/**
+ * 锁内调用：把一块源 PCM 变成"可以直接写硬件的 48k/16/2 PCM"。
+ *
+ * 返回的指针**在锁外使用也是安全的**：
+ *   - 直通（48k/2ch）时返回 ringbuf item 本身 —— 那块内存归 ringbuf 所有，
+ *     直到 out_task 调 `vRingbufferReturnItem` 才失效（写完之后才还）；
+ *   - 需要重采样时，把 ASRC 的输出**拷进 s_stage**（本任务私有、引擎永不释放），
+ *     而不是直接用 `s_out_buf`（它会被 `audio_output_session_end()` 释放）。
+ * 这一步就是为了"写硬件不用占着会话锁"——写 I2S/蓝牙要阻塞几十毫秒，
+ * 占锁会把 LVGL 线程一起拖住（就是之前"UI 卡死"的来源之一）。
+ */
+static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_bytes)
 {
     const size_t frame_bytes = (size_t)(s_src_ch ? s_src_ch : AUDIO_OUT_CHANNELS) * 2;
     bytes -= bytes % frame_bytes;      /* 半帧不处理（正常不会出现） */
     if (bytes == 0) {
-        return;
+        return NULL;
     }
-
-    const uint8_t *pcm = data;
-    size_t pcm_bytes = bytes;
 
     if (s_asrc && s_out_buf) {
         const uint32_t in_frames = (uint32_t)(bytes / frame_bytes);
         uint32_t out_frames = s_out_frames_cap;
-        if (esp_asrc_process(s_asrc, data, in_frames, s_out_buf, &out_frames) != ESP_ASRC_ERR_OK ||
-            out_frames == 0) {
+        const int64_t t0 = esp_timer_get_time();
+        const esp_asrc_err_t rc =
+            esp_asrc_process(s_asrc, data, in_frames, s_out_buf, &out_frames);
+        s_stats_asrc_us += (uint64_t)(esp_timer_get_time() - t0);
+        if (rc != ESP_ASRC_ERR_OK || out_frames == 0) {
             s_asrc_err = s_asrc_err + 1;      /* volatile 上不能用 ++（C++20 起 -Werror=volatile） */
             if ((s_asrc_err % 200) == 1) {
                 ESP_LOGW(TAG, "asrc process failed (%u in-frames, #%u)", (unsigned)in_frames,
                          (unsigned)s_asrc_err);
             }
-            return;
+            return NULL;
         }
-        pcm = s_out_buf;
-        pcm_bytes = (size_t)out_frames * s_out_smp_bytes;
+        const size_t n = (size_t)out_frames * s_out_smp_bytes;
+        if (!stage_ensure(n)) {
+            return NULL;
+        }
+        memcpy(s_stage, s_out_buf, n);
+        *out_bytes = n;
+        return s_stage;
     }
 
-    write_out(pcm, pcm_bytes);
+    *out_bytes = bytes;
+    return data;
 }
 
+/*
+ * 输出任务
+ *
+ * ★★ 2026-10 真机崩过一次（`assert failed: tlsf_free ... "block already marked as
+ * free"`，正好在"换曲"那一瞬间），根因就是这里**没有和会话拆除互斥**：
+ *
+ *   - 引擎在 `audio_engine_stop_locked()` 里持锁做 `espaudiocore_stop()`（释放库内部
+ *     的会话对象）→ `audio_output_session_end()` → `asrc_close()`（释放 ASRC 与它的
+ *     输入/输出缓冲）；
+ *   - 而本任务当时可能正在 `pump_format()` 里调 `espaudiocore_get_format()`
+ *     （读的正是那个被释放的对象），或者正在 `play_block()` 里用 `esp_asrc_process()`
+ *     跑同一份 ASRC 状态、往同一块 `s_out_buf` 里写。
+ *
+ * 两条都是 use-after-free / double-free。**光是"检查一下再调用"不够**：检查通过之后
+ * 对象仍可能被拆掉（TOCTOU）。所以规矩是：
+ *
+ *   凡是"读库 / 用 ASRC"的动作，**必须持会话锁，并在锁内重新确认会话还在**；
+ *   引擎侧的拆除本来就持着这把锁，于是两者被严格串行化，窗口彻底消失。
+ *
+ * ⚠ 但**写硬件不占锁**（2026-10 真机"UI 卡死"之后改的）：`esp_codec_dev_write()` /
+ *   `bt_service_write_pcm()` 会阻塞几十毫秒（被 DMA/链路节流），占着锁会把任何
+ *   顺手调 `audio_service_*` 的 LVGL 调用一起拖住 —— 表现就是界面卡住不动。
+ *   所以流程是：**锁内**取数 + 重采样（结果拷进本任务私有的 s_stage）→ **锁外**写硬件。
+ */
 static void out_task(void *arg)
 {
     (void)arg;
@@ -423,13 +536,14 @@ static void out_task(void *arg)
             continue;
         }
 
-        pump_format();
-
         size_t want = s_in_cap ? s_in_cap : 4096;
         size_t got = 0;
+        const int64_t tw = esp_timer_get_time();
         uint8_t *item = (uint8_t *)xRingbufferReceiveUpTo(s_pcm_rb, &got, pdMS_TO_TICKS(100), want);
         if (!item || got == 0) {
-            /* 取不到数据：如果是"解码已到末尾"，说明积压播完了 → 上报 FINISHED */
+            /* 取不到数据：统计"等数据"的耗时（这一列大 = 解码端供不上，不是重采样的锅） */
+            s_stats_wait_us += (uint64_t)(esp_timer_get_time() - tw);
+            /* 如果是"解码已到末尾"，说明积压播完了 → 上报 FINISHED */
             if (s_eos && gen == s_gen) {
                 s_eos = false;
                 audio_engine_output_drained(gen);
@@ -437,8 +551,31 @@ static void out_task(void *arg)
             stats_tick();
             continue;
         }
+        s_stats_wait_us += (uint64_t)(esp_timer_get_time() - tw);
 
-        play_block(item, got);
+        const uint8_t *pcm = NULL;
+        size_t pcm_bytes = 0;
+        audio_out_t route = AUDIO_OUT_SPEAKER;
+        int vol = 100;
+
+        audio_core_lock();
+        if (s_gen == gen && audio_engine_flow_gate()) {
+            pump_format();
+            /*
+             * 本地文件的"总时长兜底"：media_meta 的容器探测只覆盖 MP3/FLAC/WAV/ADTS，
+             * M4A / OGG / Opus 那些歌的时长一直是 0（界面 `--:--`、进度条不动）——
+             * 这里在锁内问一次解码库（它自己能算）。拿到后内部短路，不再重复问。
+             */
+            audio_engine_poll_duration();
+            pcm = prepare_block(item, got, &pcm_bytes);
+            route = s_route;
+            vol = s_volume;
+        }
+        audio_core_unlock();
+
+        if (pcm && pcm_bytes) {
+            write_out(pcm, pcm_bytes, route, vol);   /* ← 锁外：写几十毫秒也不拖 UI */
+        }
         vRingbufferReturnItem(s_pcm_rb, item);
         stats_tick();
     }
@@ -493,6 +630,8 @@ void audio_output_session_begin(uint32_t gen)
     s_stats_ms = 0;
     s_stats_bytes = 0;
     s_stats_codec_us = 0;
+    s_stats_asrc_us = 0;
+    s_stats_wait_us = 0;
     s_stats_calls = 0;
     s_stats_gap_max_ms = 0;
     s_stats_last_ms = 0;
@@ -505,12 +644,14 @@ void audio_output_session_begin(uint32_t gen)
 
 void audio_output_session_end(void)
 {
+    ESP_LOGI(TAG, "session end (gen %u): drain + asrc teardown", (unsigned)s_gen);
     s_gen = 0;
     s_eos = false;
     asrc_close();
     s_src_rate = 0;
     s_src_ch = 0;
     ring_drain();
+    ESP_LOGI(TAG, "session end done");
 }
 
 void audio_output_note_eos(uint32_t gen)
