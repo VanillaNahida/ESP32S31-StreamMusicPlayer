@@ -145,6 +145,13 @@ uint32_t audio_engine_duration_hint(void);
 uint32_t audio_engine_bitrate(void);
 
 /**
+ * 当前**解码源**格式（解码器上报值，不是探测值）：采样率 / 声道 / 位深。
+ * 在线与本地都有值（输出级每块都在刷）；还没就绪时返回 false。
+ * 用途：播放器页"歌曲信息"弹窗 —— 在线流的 `audio_service_get_info()` 是空的。
+ */
+bool audio_output_source_format(uint32_t *rate, uint8_t *channels, uint8_t *bits);
+
+/**
  * 本地文件：总时长未知时向**解码库**要一次（`espaudiocore_get_duration_ms()`）。
  *
  * 为什么需要：`media_meta` 的容器探测只覆盖 MP3/FLAC/WAV/ADTS，**M4A / OGG / Opus

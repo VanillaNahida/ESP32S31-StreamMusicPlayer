@@ -196,6 +196,7 @@ esp_err_t mm_probe_mp3(const char *audio_path, audio_probe_t *out)
     out->bitrate     = fr.bitrate;
     out->sample_rate = fr.sample_rate;
     out->channels    = (uint8_t)fr.channels;
+    out->bits        = 16;      /* MP3 没有位深字段，解码输出恒 16-bit */
 
     /* Xing / Info 头：帧头 4 字节（+2 CRC）+ side info 之后 */
     const size_t side = (fr.mpeg_ver == 3) ? (fr.channels == 1 ? 17u : 32u)
@@ -319,8 +320,8 @@ static esp_err_t probe_flac(FILE *f, long file_size, audio_probe_t *out)
             }
             out->sample_rate = sr;
             out->channels    = ch;
+            out->bits        = bits;      /* STREAMINFO 里的真实位深（24-bit 音源很常见） */
             if (bits) {
-                /* 位深不进 audio_probe_t（结构里没有），但可以据此提示调用方 */
                 ESP_LOGI(TAG, "flac: %u Hz %uch %ubit total %llu samples", (unsigned)sr,
                          (unsigned)ch, (unsigned)bits, (unsigned long long)total);
             }
@@ -453,6 +454,9 @@ static esp_err_t probe_wav(FILE *f, long file_size, audio_probe_t *out)
             out->channels    = (uint8_t)mm_le16(fmt + 2);
             out->sample_rate = mm_le32(fmt + 4);
             byte_rate        = mm_le32(fmt + 8);
+            if (want >= 16) {
+                out->bits = (uint8_t)mm_le16(fmt + 14);   /* wBitsPerSample */
+            }
             if (sz > want && fseek(f, (long)(sz - want), SEEK_CUR) != 0) {
                 break;
             }
@@ -509,6 +513,7 @@ static esp_err_t probe_adts_aac(FILE *f, long file_size, audio_probe_t *out)
     }
     out->sample_rate = sr;
     out->channels    = (uint8_t)((ch == 0) ? 2 : ch);   /* ADTS 里 0 表示"按 PCE"，通常 2ch */
+    out->bits        = 16;                              /* ADTS 没有位深字段，解码输出恒 16-bit */
     /* 每帧 1024 采样：帧字节数 ÷ (1024/采样率) = 瞬时码率；用它当平均码率够 seek 用 */
     out->bitrate     = (uint32_t)(((uint64_t)frame_len * 8ULL * sr) / 1024ULL);
     if (out->bitrate > 0) {

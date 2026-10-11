@@ -124,6 +124,27 @@ esp_err_t media_meta_image_mem_rgb565(const uint8_t *data, size_t len, int max_d
  */
 size_t media_meta_audio_data_offset(const char *audio_path);
 
+/* ------------------------------------------------------------------ 文本标签 */
+
+/*
+ * 标题 / 艺术家 / 专辑 / 作曲家（空串 = 这项没有）。
+ *
+ * 为什么要它：曲库索引（storage_service）只存了标题与艺术家（列表用），在线歌单
+ * 也没有专辑/作曲家 —— 而播放器页的"歌曲信息"弹窗要显示这两项。
+ *
+ * 覆盖：MP3(ID3v2) 与 FLAC(VORBIS_COMMENT)；其它容器返回 ESP_ERR_NOT_SUPPORTED，
+ * 调用方把对应行显示成 "—" 即可。**同步读文件**（只读标签，几 KB），别在 LVGL 任务里调。
+ */
+#define MEDIA_TAG_MAX 128
+typedef struct {
+    char title[MEDIA_TAG_MAX];
+    char artist[MEDIA_TAG_MAX];
+    char album[MEDIA_TAG_MAX];
+    char composer[MEDIA_TAG_MAX];
+} media_tags_t;
+
+esp_err_t media_meta_read_tags(const char *audio_path, media_tags_t *out);
+
 /* ------------------------------------------------------------------ 音频参数探测 */
 
 typedef struct {
@@ -131,6 +152,7 @@ typedef struct {
     uint32_t duration_ms;  /* 0 = 未知（有 Xing/Info 帧数时是准的，否则用大小/码率估） */
     uint32_t sample_rate;
     uint8_t  channels;     /* 1 / 2；0 = 未知 */
+    uint8_t  bits;         /* 位深：FLAC/WAV 是容器里写的真实值；MP3/AAC 恒 16；0 = 未知 */
 } audio_probe_t;
 
 /*

@@ -25,6 +25,7 @@
 
 #include "music_app.h"       /* music_view_player_ensure_timers（两个常驻定时器） */
 #include "music_cover.h"
+#include "music_info.h"
 #include "music_logic.h"
 #include "music_player.h"
 #include "music_state.h"
@@ -683,6 +684,7 @@ void music_view_player_on_delete(void)
 {
     /* 弹窗挂在 top layer 上，不随页面销毁：离开播放器页就显式关掉它 */
     music_view_output_on_page_delete();
+    music_info_on_page_delete();      /* 歌曲信息弹窗同理（含它的实时刷新定时器） */
     /* 歌词控件归 music_view_lyric.cc；只解绑，**歌词数据留着**（重进页面直接重建） */
     music_view_lyric_on_page_delete();
 

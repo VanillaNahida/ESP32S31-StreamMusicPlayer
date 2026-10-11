@@ -284,6 +284,18 @@ uint32_t audio_service_position_ms(void)
     return audio_output_position_ms();
 }
 
+/** 解码源格式（采样率/声道/位深）——"歌曲信息"弹窗用，在线也有值 */
+bool audio_service_source_format(uint32_t *rate, uint8_t *channels, uint8_t *bits)
+{
+    return audio_output_source_format(rate, channels, bits);
+}
+
+/** 平均码率（bit/s）：本地探测值 / 在线"总字节÷时长"（含实测纠偏） */
+uint32_t audio_service_bitrate(void)
+{
+    return audio_engine_bitrate();
+}
+
 /* ===========================================================================
  * 输出通道 / 音量
  * =========================================================================*/

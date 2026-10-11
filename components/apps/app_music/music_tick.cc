@@ -445,13 +445,11 @@ static void tick_resume_local(void)
         return;
     }
     const uint32_t target = st->resume_ms;
-    if (music_track_seek_unsupported(st->track_path)) {
-        /* 随机访问容器（M4A/OGG…）按字节 seek 后解码器对不上帧 → 只能从头放 */
-        st->resume_ms  = 0;
-        st->elapsed_ms = 0;
-        ESP_LOGW(TAG, "resume unsupported for this container, start from 0");
-        return;
-    }
+    /*
+     * ⚠ 这里**不再**按容器拦（2026-10：原先用"流式容器名单"挡掉了 m4a/ogg/opus 的
+     *   续播，导致这些格式的进度记忆形同虚设）。本地文件都实现了 seek_ms()，
+     *   让下面的 `audio_service_seek_ms()` 自己去判；失败就从头放（else 分支）。
+     */
     audio_info_t info;
     const bool info_ok = audio_service_get_info(&info) && info.bitrate > 0;
     if (++st->resume_wait > MUSIC_RESUME_WAIT_MAX_TICKS) {

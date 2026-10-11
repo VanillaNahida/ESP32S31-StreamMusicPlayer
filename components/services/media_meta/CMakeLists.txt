@@ -6,6 +6,7 @@ idf_component_register(
          "mm_cover.cc"          # 封面提取编排 + 独立图文件 / 内存缓冲入口
          "mm_image.cc"          # JPEG/PNG → RGB565 + 盒式降采样
          "mm_probe.cc"          # MP3/FLAC/WAV/ADTS 参数探测 + 魔数分派
+         "mm_tags.cc"           # 文本标签：MP3(ID3v2) / FLAC(VORBIS_COMMENT) 的专辑·作曲家
          "mm_lyrics_file.cc"    # 歌词三级查找 + /lrc 落盘
          "gbk_table.c"
     INCLUDE_DIRS "include"

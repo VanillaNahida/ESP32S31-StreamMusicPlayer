@@ -18,6 +18,7 @@
 #include "ui_metrics.h"      /* UI_FONT_TEXT（输入法借用本工程的位图字体） */
 #include "lvgl_pinyin_ime/lv_pinyin_ime.h"
 #include "splash.h"
+#include "console_cmds.h"      /* 串口诊断命令：songinfo / songscan / playstat */
 #include "audio_service.h"
 #include "storage_service.h"   /* 本地曲库 + SD 热插拔监控任务的启动点 */
 #include "app_music.h"
@@ -322,6 +323,14 @@ extern "C" void app_main(void)
      */
     xTaskCreatePinnedToCore(radio_init_task, "radio_init", 10 * 1024, NULL, 3, NULL,
                             CONFIG_BT_BLUEDROID_PINNED_TO_CORE);
+
+    /*
+     * 串口诊断命令（songinfo / songscan / playstat，见 main/console_cmds.cc）。
+     * 放在最后：命令要用 media_meta / audio_service / SD，这些此刻都已就绪。
+     * 内部用 IDF 6.1 的 stdio REPL，与日志共用 console UART（115200）。
+     * 起不来（stdio 后端不支持等）只打一条警告，不影响其它功能。
+     */
+    (void)console_cmds_init();
 
     ESP_LOGI(TAG, "M1 bring-up done");
 }

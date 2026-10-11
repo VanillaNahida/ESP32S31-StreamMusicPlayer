@@ -60,7 +60,24 @@ void music_buffer_hint_text(bool has_speed, int kbps, int pct, char *buf, size_t
     }
 }
 
-bool music_track_seek_unsupported(const char *path)
+/*
+ * 这张表回答的是"**顺序流**接不接得上"，**不是**"能不能拖进度条" —— 这两件事原先
+ * 被混在同一个函数里，结果本地文件也被一起挡住了（2026-10 用户问
+ * "opus / wav / ogg 为什么不能拖动定位"）。
+ *
+ * 事实（查过 vendored 库的源码，不是推测）：
+ *   - **本地文件**：`AudioSourceFs::can_seek()` 为真，而每个解码器都实现了
+ *     `seek_ms()` —— WAV 按字节率算偏移、Vorbis 走 `ov_pcm_seek()`、
+ *     Opus 走 `op_pcm_seek()`、M4A 走 mp4 demuxer、FLAC/MP3 各有实现。
+ *     所以**本地文件全都能拖**；权威判据是 `audio_service_seek_supported()`
+ *     （本地恒真），失败时 `audio_service_seek_ms()` 会如实返回错误。
+ *   - **在线顺序流**：从流中间重开时，M4A/MP4 缺 moov 索引、OGG/Opus 缺每个逻辑流
+ *     开头的 codec setup 头 → 解码器**根本打不开**（不只是不能拖）。
+ *     所以这些容器不能边下边解，`online_prepare_task` 据此改走"先下载到 SD 再当
+ *     本地文件播"；下载之后它就是本地文件，于是又能拖了。
+ *     MP3/ADTS/WAV/FLAC 的帧自带同步字、头部很小，能流式解 → 也就能重开定位。
+ */
+bool music_container_needs_seekable_source(const char *path)
 {
     if (!path) {
         return false;

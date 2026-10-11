@@ -179,6 +179,21 @@ bool audio_service_output_active(void);
  */
 uint32_t audio_service_position_ms(void);
 
+/*
+ * 当前**解码源**格式：采样率 / 声道 / 位深（0 = 该项未知）。
+ *
+ * 与 `audio_service_get_info()` 的区别：那个是"**文件/流的信息**"（本地来自
+ * media_meta 探测、码率是平均值），**在线流那几项是空的**；这个是**解码器实际上报**
+ * 的格式，在线/本地只要有声音就有值 —— 播放器页的"歌曲信息"弹窗用它。
+ *
+ * 注意 `bits` 是**源**位深（24 表示音源是 24-bit），而送给 codec 的 PCM 恒为 16-bit
+ * （ringbuf 与 ASRC 都在 16-bit 域，见 audio-stack.md §2）。
+ */
+bool audio_service_source_format(uint32_t *rate, uint8_t *channels, uint8_t *bits);
+
+/* 平均码率（bit/s，0 = 未知）：本地来自探测、在线来自"总字节 ÷ 时长"（含实测纠偏） */
+uint32_t audio_service_bitrate(void);
+
 #ifdef __cplusplus
 }
 #endif

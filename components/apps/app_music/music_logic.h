@@ -69,23 +69,24 @@ void music_buffer_hint_text(bool has_speed, int kbps, int pct, char *buf, size_t
 /* ------------------------------------------------------------------ 容器 / 队列 */
 
 /*
- * 按字节 seek 之后"解码器能不能自己重新对上帧"决定了这个容器能不能拖。
+ * 这个容器**能不能从"顺序流"的中间接上**？
  *
- *   MP3 / AAC / TS / FLAC —— 帧头自带同步码，从中间接上就行
- *       （FLAC 的 STREAMINFO 解码器在打开时已经拿到，中途 seek 不需要重读）；
+ *   MP3 / AAC / TS / FLAC / WAV —— 帧头自带同步码或头部很小，从中间接上就行；
  *   MP4 / M4A —— 必须有 moov 里的 sample table 才能解释字节流，按字节跳过去就是杂音；
  *   OGG / Opus —— 每个逻辑流开头有 codec setup 头，中途接上解不出来。
  *
- * ⚠ 名单以外一律"允许拖"：错了顶多听起来对不上，而挡住一个本来能拖的格式
- *   会直接废掉功能。要改名单先在真机上试一遍。
+ * ⚠ 它**不是**"能不能拖进度条"的判据（这两件事原先混在一个函数里，把本地文件也
+ *   一起挡住了，2026-10 用户问"opus/wav/ogg 为什么不能拖"）：
+ *     - **本地文件**：源码里每个解码器都实现了 `seek_ms()`（WAV 字节率 / Vorbis
+ *       `ov_pcm_seek` / Opus `op_pcm_seek` / M4A 走 mp4 demuxer / FLAC、MP3 各有实现），
+ *       所以**本地全都能拖**；权威判据是 `audio_service_seek_supported()`；
+ *     - **在线顺序流**：上面那三种容器从中间重开时解码器**根本打不开** →
+ *       不能边下边解 → `online_prepare_task` 据此改走"先下载到 SD 再当本地文件播"
+ *       （下载后是本地文件，就又能拖了）。
  *
- * ⚠ 这道判断现在是**第二道关**：audio_service_seek_supported() 才是权威判据
- *   （本地文件恒真；在线只在容器是 MP3/ADTS-AAC 且已知总长+时长时为真）。
- *   名单保留是因为它同时被 online_prepare_task 复用 —— 换解码库后
- *   **不能边下边解的容器**（m4a/mp4/ogg/opus）要改走"先下载到 SD 再当本地文件播"，
- *   判据与这里同一张名单、原因也是同一个（"需要可 seek 的源"）。
+ * 目前唯一的调用点是"在线歌要不要先下载再播"，见 music_online.cc。
  */
-bool music_track_seek_unsupported(const char *path);
+bool music_container_needs_seekable_source(const char *path);
 
 /* 本地队列换曲：返回目标下标。dir=+1/-1 顺序走；随机模式由调用方先掷骰子传入 rand_idx。 */
 int music_next_index(int cur, int dir, size_t n);

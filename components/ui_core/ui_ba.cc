@@ -61,6 +61,11 @@ typedef struct {
     bool  closing;
 } ba_ctx_t;
 
+/* 按下反馈 + "复原后才派发"的回调挂载（实现在文件后半的"按下反馈"一节）。
+ * ⚠ 前置声明必须放在**卡片创建之前**：卡片右上角的 ✕（ui_ba_open_in 里）就要用。 */
+static void ba_attach_press_feedback(lv_obj_t *obj);
+static void ba_attach_click(lv_obj_t *obj, lv_event_cb_t cb, void *user);
+
 static ba_ctx_t *ba_ctx_of(lv_obj_t *scrim)
 {
     return scrim ? (ba_ctx_t *)lv_obj_get_user_data(scrim) : NULL;
@@ -374,7 +379,9 @@ ui_ba_dialog_t ui_ba_open_in(lv_obj_t *parent, const char *title, int width_pct,
     lv_obj_set_style_text_color(xl, lv_color_hex(BA_TEXT_DIM), LV_PART_MAIN);
     lv_label_set_text(xl, LV_SYMBOL_CLOSE);
     lv_obj_center(xl);
-    lv_obj_add_event_cb(close, ba_close_clicked, LV_EVENT_CLICKED, scrim);
+    /* 右上角 ✕ 也走同一套按下反馈（它不走 ui_ba_btn，得自己挂） */
+    ba_attach_click(close, ba_close_clicked, scrim);
+    ba_attach_press_feedback(close);
 
     /* ---------------- 内容区 ---------------- */
     lv_obj_t *body = lv_obj_create(card);
@@ -461,7 +468,110 @@ void ui_ba_on_close(ui_ba_dialog_t *d, void (*cb)(void *user), void *user)
     }
 }
 
+/* ------------------------------------------------------------------ 按下反馈
+ *
+ * 需求（2026-10 用户）：BA 按钮**按住时渐进式缩小**，松手后**先复原、再执行事件**。
+ *
+ * 实现要点（三条都别改，改了就变形）：
+ *   1. 缩放用 `transform_scale_x/y`（LVGL 的单位是 **1/256**，256 = 原尺寸）。
+ *      它是**绘制期变换**、不参与布局 —— 所以按钮缩小不会把旁边的按钮挤动，
+ *      也不会触发整卡片重排（用宽高做动画就会）。
+ *   2. **用户回调不再挂 CLICKED**，改挂一个自定义事件码：
+ *      真实 CLICKED 在松手**那一瞬间**就来，用它直接执行就等于"先执行、后复原"，
+ *      与需求相反。所以：PRESSED → 缩小；RELEASED → 放大，动画**跑完**再派发自定义
+ *      事件；PRESS_LOST（手指滑出按钮）→ 只复原、不派发。
+ *      自定义事件派发时 `lv_event_get_target()/_get_user_data()` 都是正常的，
+ *      所以各调用点的写法（含用 user_data 传参的，如 WiFi 密码浮层）不用改。
+ *   3. 起动画前先 `lv_anim_delete(var, exec_cb)`：连点/快速点两次不会叠加，
+ *      而且**从当前实际缩放值**起步（中途打断也不会跳一下）。
+ */
+#define BA_SCALE_NORM   256      /* 100% */
+#define BA_SCALE_PRESS  236      /* 按住时 ≈92% */
+#define BA_PRESS_MS     120
+#define BA_RELEASE_MS   150
+
+static lv_event_code_t s_ba_click_evt;   /* 懒注册：= "动画跑完的那次点击" */
+static bool            s_ba_click_reg;
+
+static void ba_btn_scale_anim(void *var, int32_t v)
+{
+    lv_obj_t *b = (lv_obj_t *)var;
+    lv_obj_set_style_transform_scale_x(b, v, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(b, v, LV_PART_MAIN);
+}
+
+static void ba_btn_restore_done(lv_anim_t *a)
+{
+    if ((uintptr_t)lv_anim_get_user_data(a) != 0 && s_ba_click_reg) {
+        lv_obj_send_event((lv_obj_t *)a->var, s_ba_click_evt, NULL);
+    }
+}
+
+static void ba_btn_scale_to(lv_obj_t *b, int32_t to, uint32_t ms, bool fire)
+{
+    const int32_t from = lv_obj_get_style_transform_scale_x(b, LV_PART_MAIN);
+    if (from == to && !fire) {
+        return;
+    }
+    lv_anim_delete(b, ba_btn_scale_anim);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, b);
+    lv_anim_set_exec_cb(&a, ba_btn_scale_anim);
+    lv_anim_set_values(&a, from, to);
+    lv_anim_set_duration(&a, ms);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_user_data(&a, (void *)(uintptr_t)(fire ? 1u : 0u));
+    lv_anim_set_completed_cb(&a, ba_btn_restore_done);
+    lv_anim_start(&a);
+}
+
+static void ba_btn_pressed_cb(lv_event_t *e)
+{
+    ba_btn_scale_to((lv_obj_t *)lv_event_get_current_target(e), BA_SCALE_PRESS,
+                    BA_PRESS_MS, false);
+}
+
+static void ba_btn_released_cb(lv_event_t *e)
+{
+    ba_btn_scale_to((lv_obj_t *)lv_event_get_current_target(e), BA_SCALE_NORM,
+                    BA_RELEASE_MS, lv_event_get_code(e) == LV_EVENT_RELEASED);
+}
+
+/* 给任意可点对象挂上"按下缩小 + 复原后派发"（按钮、选项行、✕ 共用一套） */
+static void ba_attach_press_feedback(lv_obj_t *obj)
+{
+    /* 缩放的枢轴放正中：LVGL 默认也是中心，这里写明，免得以后被别处改掉 */
+    lv_obj_set_style_transform_pivot_x(obj, LV_PCT(50), LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_y(obj, LV_PCT(50), LV_PART_MAIN);
+    /* 起始缩放**显式**写成 100%：别依赖默认值 —— `ba_btn_scale_to()` 会读当前值当动画
+     * 起点，默认值若不是 256，第一次按下的动画就会从错误的比例开始（跳一下）。 */
+    lv_obj_set_style_transform_scale_x(obj, BA_SCALE_NORM, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(obj, BA_SCALE_NORM, LV_PART_MAIN);
+    lv_obj_add_event_cb(obj, ba_btn_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(obj, ba_btn_released_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(obj, ba_btn_released_cb, LV_EVENT_PRESS_LOST, NULL);
+}
+
+/* 登记用户回调：挂到自定义事件码上（见上面第 2 条），动画完成后由我们派发 */
+static void ba_attach_click(lv_obj_t *obj, lv_event_cb_t cb, void *user)
+{
+    if (!obj || !cb) {
+        return;
+    }
+    if (!s_ba_click_reg) {
+        s_ba_click_evt = (lv_event_code_t)lv_event_register_id();
+        s_ba_click_reg = true;
+    }
+    lv_obj_add_event_cb(obj, cb, s_ba_click_evt, user);
+}
+
 /* ------------------------------------------------------------------ 卡片内控件 */
+
+/* 按下反馈 + "复原后才派发"的回调挂载（实现见文件后半的"按下反馈"一节；
+ * 这里先前置声明：卡片右上角的 ✕ 在本节就要用） */
+static void ba_attach_press_feedback(lv_obj_t *obj);
+static void ba_attach_click(lv_obj_t *obj, lv_event_cb_t cb, void *user);
 
 lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style,
                            lv_event_cb_t cb, void *user)
@@ -527,8 +637,9 @@ lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style,
      */
 
     if (cb) {
-        lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user);
+        ba_attach_click(btn, cb, user);      /* 按下反馈见文件头"按下反馈"一节 */
     }
+    ba_attach_press_feedback(btn);
     return btn;
 }
 
@@ -565,8 +676,9 @@ lv_obj_t *ui_ba_opt_row(lv_obj_t *col, const char *text, uint32_t accent,
     lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
 
     if (cb) {
-        lv_obj_add_event_cb(r, cb, LV_EVENT_CLICKED, user);
+        ba_attach_click(r, cb, user);        /* 选项行同样给按下反馈 */
     }
+    ba_attach_press_feedback(r);
     return r;
 }
 

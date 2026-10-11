@@ -23,6 +23,7 @@
 #include "ui_metrics.h"
 
 #include "music_cover.h"
+#include "music_info.h"
 #include "music_player.h"
 #include "music_state.h"
 #include "music_view_internal.h"
@@ -30,6 +31,13 @@
 #include "music_view_output.h"
 
 static const char *TAG = "app_music";
+
+/* ⓘ（歌曲信息）按钮：只开弹窗，不做别的（弹窗内容见 music_info.cc） */
+static void info_btn_clicked(lv_event_t *e)
+{
+    (void)e;
+    music_info_open();
+}
 
 /* ------------------------------------------------------------------ 左栏：封面 */
 
@@ -286,6 +294,12 @@ lv_obj_t *music_view_player_build(void)
     lv_obj_set_flex_flow(ctl, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(ctl, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_remove_flag(ctl, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 歌曲信息：ⓘ（这里用列表图标）→ 弹窗列出标题/专辑/码率/路径等，可滑动查看。
+     * 位置按需求放在**循环模式按钮左边**。 */
+    lv_obj_t *info_btn = music_view_make_round_btn(ctl, LV_SYMBOL_LIST, NULL,
+                                                  UI_COLOR_PILL, UI_COLOR_FG);
+    lv_obj_add_event_cb(info_btn, info_btn_clicked, LV_EVENT_CLICKED, NULL);
 
     /* 循环模式：点击在 列表循环/单曲循环/随机循环 之间切换（图标 + Toast） */
     lv_obj_t *mode_btn = music_view_make_round_btn(ctl, LV_SYMBOL_LOOP,

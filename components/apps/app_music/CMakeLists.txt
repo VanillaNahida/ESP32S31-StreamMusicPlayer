@@ -13,6 +13,7 @@ idf_component_register(
         "music_view_lyric.cc"     # 歌词引擎：数据 + 渲染（高亮/居中不变式）
         "music_view_local.cc"     # 本地音乐列表页
         "music_view_output.cc"    # 输出设备按钮 / 选择弹窗 / 音量键
+        "music_info.cc"           # 歌曲信息弹窗（ⓘ 按钮：标签/参数/路径，可滑动）
     INCLUDE_DIRS "include"
     REQUIRES
         lvgl

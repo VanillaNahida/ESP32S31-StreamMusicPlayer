@@ -45,6 +45,80 @@ static uint32_t s_asrc_probe;     /* 前几次 ASRC 转换的"进/出"探测日�
 static int64_t  s_tx_t0;          /* 吞吐统计窗口起点（us） */
 static uint32_t s_last_drop_log_ms;/* 环形缓冲满的上次告警时刻 */
 
+/* ------------------------------------------------------------------ 媒体时钟节拍
+ *
+ * ★★ 2026-10 修：**切到蓝牙后整条链跑到 3.8 倍实时，并把 CPU1 的 IDLE 饿死**。
+ *
+ * 现场日志：
+ *   a2dp tx: 149000 frames, 1301 f/s (need 345 f/s), ... acq_retry 0, rel_to 0, idle 0, ring 62464 B
+ *   play stats: PCM 708 KB/s | 产 18880 ms / 墙 5000 ms (377.6%) | route 1
+ *   task_wdt: IDLE1 (CPU 1) 没喂狗；CPU 1 正在跑 bt_feed
+ *
+ * 根因：这条链原来的节拍**完全依赖 A2DP 协议栈回压**（`acquire_write` 拿不到发送窗口
+ * 就等）。而协议栈只保证"不超过链路能力"，**不保证"就是媒体速率"** —— 链路有余量时
+ * 它照单全收（2.4 GHz 空闲时 ACL 能扛 ~1 Mbps 以上，SBC 只要 ~250 kbps）。
+ * 于是 feed 全速编码发送 → 环形缓冲一直被抽干 → 上游（解码/输出）被拖着全速跑：
+ *   - 对端收到 3.8 倍的帧，多余的只能丢 → 听感是噪音/变调；
+ *   - 上游 PCM 708 KB/s，IDLE 被饿死 → task_wdt（10 s 阈值）刷寄存器；
+ *   - 环形缓冲永远是满的，端到端白白多出 ~340 ms 延迟。
+ * （以前"卡顿"那轮把"没数据就睡 5 ms"改掉是对的，但那只解决了"发不够"；
+ *   "发太多"这一侧一直没有节拍。）
+ *
+ * 现在**自己按媒体时钟发**：每秒 bts_rate ÷ 每帧采样数 帧。实现用 tick 槽 + 累加器
+ * （1000 Hz 下 345 f/s = 0.345 帧/tick → 大多数槽 0 帧、偶尔 1 帧），长期精确到帧，
+ * 且每帧只睡 1 ms（us 级忙等会把一个核烧掉，不能用）。
+ * 编码器还没就绪（帧率未知）时不限制，退回原行为。
+ */
+static uint32_t   s_media_fps;      /* 对端帧率（帧/秒）；0 = 未知/不限制 */
+static TickType_t s_pace_tick;      /* 上次结算的 tick */
+static uint32_t   s_pace_acc;       /* 帧率累加器（单位：帧 × TICK_HZ） */
+static uint32_t   s_pace_quota;     /* 本 tick 剩下的发送额度（帧） */
+
+/** 编码器刚就绪时调一次：按协商结果算对端帧率 */
+static void bts_pace_init(void)
+{
+    const uint32_t per_frame = (uint32_t)(bts_enc_in_bytes /
+                                (bts_channels > 0 ? bts_channels * 2 : 2));
+    s_media_fps  = (per_frame && bts_rate > 0) ? ((uint32_t)bts_rate / per_frame) : 0;
+    s_pace_tick  = 0;
+    s_pace_acc   = 0;
+    s_pace_quota = 0;
+    if (s_media_fps) {
+        ESP_LOGI(TAG, "media clock: %u f/s (每 %u us 一帧)", (unsigned)s_media_fps,
+                 (unsigned)(1000000u / s_media_fps));
+    }
+}
+
+/** 取一个"发送额度"；额度用完返回 false（调用方睡到下一个 tick） */
+static bool bts_pace_take(void)
+{
+    if (s_media_fps == 0) {
+        return true;                     /* 帧率未知：不限制 */
+    }
+    const TickType_t now = xTaskGetTickCount();
+    if (now != s_pace_tick) {
+        s_pace_tick  = now;
+        s_pace_acc  += s_media_fps;                       /* 本槽应发 acc / TICK_HZ 帧 */
+        s_pace_quota = s_pace_acc / configTICK_RATE_HZ;
+        s_pace_acc  -= s_pace_quota * configTICK_RATE_HZ; /* 余数留给下一槽 → 长期不漂 */
+        /*
+         * 卡顿（刚开编码器、被抢 CPU、对端暂停）之后**不许攒额度**：
+         * 上限 = 每槽均值 + 2 帧。否则一次卡顿会换来一串"补发"的突发，
+         * 对端那边就是一段噪音。
+         */
+        const uint32_t cap = s_media_fps / configTICK_RATE_HZ + 2;
+        if (s_pace_quota > cap) {
+            s_pace_quota = cap;
+            s_pace_acc   = 0;
+        }
+    }
+    if (s_pace_quota == 0) {
+        return false;
+    }
+    s_pace_quota--;
+    return true;
+}
+
 /* 编码暂存区里的一帧并交给 A2DP 源（一包 = 一个编码帧） */
 static void bts_send_one_frame(esp_bt_audio_stream_handle_t h)
 {
@@ -144,6 +218,7 @@ static void feed_task(void *arg)
             if (bts_enc) {
                 bts_audio_close();
             }
+            s_media_fps = 0;             /* 编码器没了：节拍状态一并作废 */
             vTaskDelay(pdMS_TO_TICKS(20));
             continue;
         }
@@ -151,9 +226,17 @@ static void feed_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(50));
             continue;
         }
+        if (s_media_fps == 0) {
+            bts_pace_init();             /* 编码器刚就绪（或刚重建）：算对端帧率 */
+        }
 
-        /* 暂存里够一个编码帧就先编码发送 */
+        /* 暂存里够一个编码帧就先编码发送 —— 但要**按媒体时钟**发（见 bts_pace_take）：
+         * 协议栈不会按实时速率回压，不自己节拍就会全速发送（真机实测 3.8 倍）。 */
         if (bts_stage_len >= (uint32_t)bts_enc_in_bytes) {
+            if (!bts_pace_take()) {
+                vTaskDelay(1);           /* 额度用完：让出 1 ms（FREERTOS_HZ=1000） */
+                continue;
+            }
             bts_send_one_frame(h);
             continue;
         }

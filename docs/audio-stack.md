@@ -179,6 +179,30 @@ ringbuf（网络流）源不可 seek，永远走不到这里 —— 以流式为
 拿不到调用栈。有效手段是**在拆除路径上加逐段日志**（`session stop: …` / `teardown: delete dec`
 / `asrc close: h=…`），让"崩溃前最后一行"把范围缩到某一次 free。
 
+## 7.2 总时长（duration）从哪来：一张表说清，别再各写一套
+
+界面上的"总时长"只有一个出口：**app 侧的 `music_state.dur_ms`**。引擎侧另有一份
+`s_info.duration_ms` / `s_dur_hint_ms`，通过 `audio_service_get_info()` 暴露给 app。
+
+| 场景 | 来源 | 谁填 | 备注 |
+| --- | --- | --- | --- |
+| 在线（CK 直链 / 中间件） | `/song/url/v1` 的 `size` × 8 ÷ `br` | `os_account.cc` → `online_song_stream_info()` → app → `set_duration_ms()` | **准确**（服务端自己报的字节数与码率） |
+| 在线（meting 兜底） | Content-Length × 8 ÷ 首帧码率（读 4 KB 前缀估） | 同上 | VBR 会偏 → 靠下面的"实测纠偏"修 |
+| 在线（纠偏，起播 5 s 后一次） | **解码器已吃掉的字节** ÷ 已播毫秒，再乘回总字节 | `audio_engine_bitrate()` 覆盖 `s_info.duration_ms` | app 侧 `tick_adopt_stream_duration()` 采纳（差 >5% 才改） |
+| 本地 MP3/FLAC/WAV/ADTS | `media_meta_probe_audio()`（Xing / STREAMINFO / 字节率 / 帧长） | `engine_start_file()` 的探测 → app `tick_derive_duration()` | 探测值优先 |
+| 本地 M4A/OGG/Opus | **`espaudiocore_get_duration_ms()`** | `audio_engine_poll_duration()`（输出任务、会话锁内、拿到就短路） | 容器探测没覆盖这些格式；顺带 `stat()` 文件大小补出平均码率，**seek 因此也能用了** |
+| 本地（有码率没时长） | 文件字节 × 8 ÷ 码率 | app `tick_derive_duration()` | 原有兜底 |
+
+⚠⚠ **在线"实测码率"必须是"解码器已吃掉的字节"**，不是"已下到的字节"：
+下载前沿跑在播放前面（4 MB 缓冲经常整首装下），拿 `audio_http_downloaded()` 除以已播时长
+得到的是**越来越小**的假码率 —— 乘回总字节算时长，界面上的总时长就会**一边播一边往上爬**
+（2026-10 用户报"在线总时长不对"就是这个；它还会把 app 的"提前结束"判据一起带偏）。
+正确算法：`consumed = audio_http_downloaded() − audio_http_ring_filled()`。
+
+⚠ **纠偏只对在线流生效**（`s_is_stream`）、且**每会话只做一次**（`s_stream_dur_fixed`）：
+本地绝不能走这段 —— 探测失败时（M4A/OGG）`s_probe_bps` 是 0，而 HTTP 层里可能还留着
+**上一次在线播放**的 total/downloaded，拿它算"实测码率"会把本地时长改成垃圾值。
+
 ## 8. 真机验证清单（换库后必须走一遍）
 
 代码只做到"编译通过 + 逻辑自洽"，**音频链路必须真机听**。按下面顺序走，

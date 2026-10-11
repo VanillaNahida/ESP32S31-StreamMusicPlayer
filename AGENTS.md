@@ -222,6 +222,10 @@ AMOLED、ES8311。
 ## 10. 验证方式
 
 - 改完必须 `idf.py build` 通过（贴出结果摘要，不只说"已完成"）
+- **串口诊断命令**（`songinfo <路径>` / `songscan [目录]` / `playstat`，实现见
+  `main/console_cmds.cc`、用法见 [`docs/serial-commands.md`](docs/serial-commands.md)）：
+  想知道"这个文件到底是什么参数 / 当前播放状态如何"，**先跑命令拿事实**，别靠猜。
+  与日志共用 console UART（115200），提示符会和日志交错，属正常。
 - 涉及 UI 的改动要在模拟器 `simulator/index.html` 或真机截图确认
 - 纯逻辑（LRC / ID3 / JSON / 路径处理）抽成不依赖硬件的模块，便于 host 侧单测
 - 改完大文件（`app_online.cc` / `online_service.cc`）先跑一遍括号/引号配平自查
@@ -349,7 +353,7 @@ E ESP_GMF_IO: esp_gmf_io_open failed   →   E audio_svc: player error state
 | 时间 → 字节 | 码率优先级：① 本地 `media_meta` 探测的平均码率（MUSIC_INFO 处理时已换过）② **在线 `Content-Length ÷ 时长`**（就是"(目标时间/总时长)×总字节数"）③ 兜底解码器第一帧码率。②的时长由 `audio_service_set_duration_ms()` 告知（GMF 的 MUSIC_INFO 里 duration 恒为 0），**必须在 `play_uri()` 之后调**（换曲会清零） |
 | 出声标志 | `audio_service_seek_ms()` 里把 `s_out_flowing` 清零：UI 靠 `audio_service_output_active()` 判"缓冲结束、撤掉'缓冲中…'"，不清零的话提示刚挂上就被撤掉，用户只看到"进度条跳过去了但没声音" |
 | 卡死看门狗 | seek 后必须复位 `s_stall_kicks/s_stall_ticks`：重新缓冲正是它盯的特征（声称在播但没 PCM），不复位它 10 s 后会去 pause/resume 搅局 |
-| 容器白名单 | `app_music` 的 `track_seek_unsupported()`：**mp3/aac/ts/flac 能拖**（帧自带同步字；FLAC 的 STREAMINFO 解码器打开时已拿到）；**m4a/mp4/ogg/opus 挡掉**（要 moov 索引 / 要 codec setup 头）。认扩展名时先切掉在线 URL 的 `?vuutv=...` 签名串，只看文件名部分 |
+| 容器白名单 | ⚠ **已改（2026-10）**：现在**不按扩展名挡拖动** —— 本地文件恒可拖（各解码器都实现了 `seek_ms()`：WAV 字节率 / Vorbis `ov_pcm_seek` / Opus `op_pcm_seek` / M4A mp4 demuxer / FLAC / MP3），权威判据是 `audio_service_seek_supported()`。那张名单改名成 `music_container_needs_seekable_source()`，**只**用于"在线歌要不要先下载再播"（m4a/mp4/ogg/opus 不能从流中间打开）。在线可拖的容器只有 MP3/ADTS-AAC（`fmt_stream_seekable()`） |
 | 已知误差 | 流上 `s_data_offset = 0`（不扣 ID3v2 头）→ 中段定位会**早到几秒**（标签越大越明显）；网易云下发的流标签很小（封面走单独接口），实测可忽略 |
 | 暂停时拖动 | 不挂"缓冲中"提示（那时不会有 PCM，提示会永远留在屏上）；在线拖动的进度**不写进度记忆**（URL 带时效签名，存了没用） |
 

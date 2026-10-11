@@ -329,26 +329,29 @@ bool music_player_seek_begin(uint32_t target)
 {
     music_state_t *st = music_state();
     /*
-     * 两道关都要给用户一句解释 —— 进度条是"活的"（拇指跟手），要是拖完什么都不发生，
-     * 用户只会以为界面卡了（2026-10 用户报的原话就是"点了没反应"）。
-     *   1) 容器：MP4/M4A/OGG 这类要索引/setup 头的格式，按字节跳过去解码器对不上帧；
-     *   2) 位置算不算得出来：本地要有探测到的平均码率，在线要有"总字节 + 时长"。
-     */
-    if (music_track_seek_unsupported(st->track_path)) {
-        ui_toast("这个格式不支持拖动定位", 2000);
-        return false;
-    }
-    /*
-     * 加载中不允许拖动：这时会话可能还没建起来（或正在重建），
-     * `audio_service_seek_supported()` 也多半是 false —— 与其弹"码率未知"这种
-     * 让人摸不着头脑的提示，不如直接说清"还在加载"。
+     * 能不能拖**只问服务**（`audio_service_seek_supported()`），不再按扩展名预拦：
+     *   - **本地文件恒真** —— vendored 库里每个解码器都实现了 `seek_ms()`
+     *     （WAV 按字节率、Vorbis `ov_pcm_seek`、Opus `op_pcm_seek`、M4A 走 mp4 demuxer、
+     *     FLAC/MP3 各有实现），所以 **wav / ogg / opus / m4a 本地也能拖**；
+     *     万一某个容器解不了，`audio_service_seek_ms()` 会返回错误，下面那句
+     *     "定位失败：…" 会如实告诉用户，而不是提前把功能挡掉。
+     *   - 在线流要求"容器能从流中间重开 + 已知总长与时长"（见 audio_seek.cc）。
+     *
+     * ⚠ 2026-10 用户问"opus/wav/ogg 为什么不能拖" —— 根因就是这里原先把
+     *   `music_track_seek_unsupported()`（一张**流式**容器名单）也用来挡本地文件。
+     *   那张名单现在改名为 `music_container_needs_seekable_source()`，
+     *   只用于"在线歌要不要先下载再播"。
      */
     if (music_loading()) {
         ui_toast("正在加载，稍后再拖动", 1400);
         return false;
     }
     if (!audio_service_seek_supported()) {
-        ui_toast("定位失败：码率未知", 1800);
+        /* 在线 vs 本地给不同的话：在线的限制来自"容器能不能从流中间重开 / 总长与时长
+         * 有没有就绪"，说成"码率未知"会让人摸不着头脑（FLAC 流就是被容器挡的）。 */
+        const bool streamed = (st->on_mode && !st->on_stream_local);
+        ui_toast(streamed ? "这首在线歌暂不能拖动（需先完整缓冲）"
+                          : "定位失败：时长或码率未知", 1800);
         return false;
     }
 

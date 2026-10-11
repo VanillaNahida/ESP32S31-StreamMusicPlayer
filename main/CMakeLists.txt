@@ -1,11 +1,12 @@
 idf_component_register(
-    SRCS "cxx_heap.cc" "main.cc" "splash.cc" "ime_dict_stub.c"
+    SRCS "cxx_heap.cc" "main.cc" "splash.cc" "ime_dict_stub.c" "console_cmds.cc"
     INCLUDE_DIRS "."
     REQUIRES
         nvs_flash
         lvgl
         esp_lvgl_adapter
         esp_timer
+        console          # 串口诊断命令（songinfo / songscan / playstat）
         bsp
         ui_core
         media_meta

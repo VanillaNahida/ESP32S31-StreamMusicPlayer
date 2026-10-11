@@ -79,13 +79,15 @@ static volatile int      s_volume = 55;
 static esp_asrc_handle_t s_asrc;
 static uint32_t          s_src_rate;
 static uint8_t           s_src_ch;
+static uint8_t           s_src_bits;   /**< 解码源位深（24 表示源是 24-bit，ringbuf 仍是 16-bit） */
 static uint16_t          s_in_smp_bytes;   /**< 源：每帧字节数（ch×2） */
 static uint16_t          s_out_smp_bytes;  /**< 目标：每帧字节数（恒 4） */
 static uint8_t          *s_in_buf;
 static size_t            s_in_cap;         /**< ASRC 输入缓冲容量（字节） */
 static uint8_t          *s_out_buf;
 static uint32_t          s_out_frames_cap;
-static uint32_t          s_asrc_err;
+static uint32_t          s_asrc_err;       /**< esp_asrc_process 失败次数 */
+static uint32_t          s_asrc_sat;       /**< 输出缓冲被写满（样本被截断）的次数 */
 /** mono→stereo 的权重：esp_asrc 硬件路径要求显式给 {1,1} 才认这条路 */
 static float             s_weight[2] = {1.0f, 1.0f};
 
@@ -279,6 +281,27 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
         asrc_close();
         return false;
     }
+    /*
+     * ★★ 输出缓冲容量**自己算一遍、取较大者**（2026-10 修"部分高品质 FLAC 卡顿 /
+     *    速度不对"）。
+     *
+     * `esp_asrc_get_out_sample_num()` 只是转发 `esp_ae_rate_cvt_get_max_out_sample_num()`，
+     * 而那个头文件的说明自相矛盾：函数名写 max，文档却写
+     * *"Get the **minimum** required sample number for the output frame buffer"*。
+     * 一旦这个值比实际产出小，`esp_asrc_process()` 只会写到 `out_sample_num` 那么多
+     * 就**静默截断**（不报错、我们这边完全看不出来）—— 表现正是"每块丢几个样本"：
+     * 轻则细微咔哒/卡顿，重则整首歌**速度不对**（单位时间放出的音频比源短）。
+     *
+     * 理想值 = 输入帧 × 目标率 ÷ 源率（向上取整）+ 128 帧余量（覆盖重采样器内部的
+     * 分数延迟与相位余量）。与库给的值取较大者，截断风险归零。
+     */
+    const uint32_t ideal = (uint32_t)(((uint64_t)ASRC_MAX_FRAMES * AUDIO_OUT_RATE +
+                                       src_rate - 1) / src_rate) + 128;
+    if (out_frames < ideal) {
+        ESP_LOGW(TAG, "asrc out cap %u < ideal %u (%u Hz -> %d Hz): 用理想值兜底",
+                 (unsigned)out_frames, (unsigned)ideal, (unsigned)src_rate, AUDIO_OUT_RATE);
+        out_frames = ideal;
+    }
     /* 非整数比时输出帧数会浮动，留一点余量 */
     s_out_frames_cap = out_frames + 64;
     s_in_cap = (size_t)ASRC_MAX_FRAMES * s_in_smp_bytes;
@@ -299,9 +322,11 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
         return false;
     }
 
-    ESP_LOGI(TAG, "asrc ready (sw): %u Hz %uch -> %d Hz %dch, %u frames/call",
+    /* 把"进/出帧数"一起打出来：非整数比时 out/in 应当 ≈ 目标率 ÷ 源率
+     * （44.1k→48k ≈ 1.088）。这个比值不对 = 重采样配置错了，声音必然不对。 */
+    ESP_LOGI(TAG, "asrc ready (sw): %u Hz %uch -> %d Hz %dch, in %u frames -> out cap %u frames",
              (unsigned)src_rate, src_ch, AUDIO_OUT_RATE, AUDIO_OUT_CHANNELS,
-             (unsigned)ASRC_MAX_FRAMES);
+             (unsigned)ASRC_MAX_FRAMES, (unsigned)s_out_frames_cap);
     return true;
 }
 
@@ -330,6 +355,7 @@ static void pump_format(void)
     asrc_close();
     s_src_rate = rate;
     s_src_ch = ch;
+    s_src_bits = bits;
     ESP_LOGI(TAG, "source format: %u Hz %uch (bits=%u; ringbuf 恒为 16-bit)", (unsigned)rate, ch, bits);
 
     if (rate == AUDIO_OUT_RATE && ch == AUDIO_OUT_CHANNELS) {
@@ -482,6 +508,19 @@ static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_byt
             }
             return NULL;
         }
+        /*
+         * ★ 截断自检（2026-10 加）：`esp_asrc_process()` 若"产出正好等于容量"，说明
+         *   缓冲区被写满、**多出来的样本被静默丢掉** —— 那正是"卡顿 / 速度不对"的
+         *   来源之一。撞上就报出来（限频），并在 asrc_open 里用理想值兜底。
+         */
+        if (out_frames >= s_out_frames_cap) {
+            s_asrc_sat = s_asrc_sat + 1;
+            if ((s_asrc_sat % 200) == 1) {
+                ESP_LOGW(TAG, "asrc output saturated (%u in-frames -> cap %u, #%u)："
+                              "本块样本被截断", (unsigned)in_frames,
+                         (unsigned)s_out_frames_cap, (unsigned)s_asrc_sat);
+            }
+        }
         const size_t n = (size_t)out_frames * s_out_smp_bytes;
         if (!stage_ensure(n)) {
             return NULL;
@@ -627,6 +666,7 @@ void audio_output_session_begin(uint32_t gen)
     s_played_bytes = 0;
     s_tl_base_ms = 0;
     s_asrc_err = 0;
+    s_asrc_sat = 0;
     s_stats_ms = 0;
     s_stats_bytes = 0;
     s_stats_codec_us = 0;
@@ -677,6 +717,31 @@ void audio_output_note_seek(uint32_t pos_ms)
 uint32_t audio_output_position_ms(void)
 {
     return s_tl_base_ms + (uint32_t)(s_played_bytes / AUDIO_OUT_BYTES_PER_MS);
+}
+
+/*
+ * 当前解码源格式（解码器上报的，不是探测值）——"歌曲信息"弹窗用。
+ *
+ * 为什么要这个而不是 `audio_service_get_info()`：本地文件的 info 来自 media_meta 探测，
+ * 而**在线流的 info 是空的**（探测只对文件做）—— 弹窗里采样率/声道/位深就会显示
+ * "--"。这里读的是输出级每块都在刷的 `s_src_*`（`pump_format()` 写的），在线/本地
+ * 都有值。纯读，不加锁（它是几个字节的写，读到半新半旧也只是显示上的一帧）。
+ */
+bool audio_output_source_format(uint32_t *rate, uint8_t *channels, uint8_t *bits)
+{
+    if (!s_src_rate) {
+        return false;
+    }
+    if (rate) {
+        *rate = s_src_rate;
+    }
+    if (channels) {
+        *channels = s_src_ch;
+    }
+    if (bits) {
+        *bits = s_src_bits;
+    }
+    return true;
 }
 
 void audio_output_set_route(audio_out_t out)

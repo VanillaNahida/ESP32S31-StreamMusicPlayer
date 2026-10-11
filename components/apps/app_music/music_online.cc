@@ -181,10 +181,12 @@ static void online_prepare_task(void *arg)
      * 返回"不支持"。这类歌必须先整首下载到 SD 再当本地文件播（本地文件源可 seek，
      * 那三种容器就都能解）。
      *
-     * 判据与 music_track_seek_unsupported() 同一张名单，原因也是同一个
-     * （"需要可 seek 的源"），所以直接复用，别再维护第二份扩展名表。
+     * 判据是 `music_container_needs_seekable_source()`（那张"顺序流接不上"的名单）。
+     * ⚠ 它**只**服务于这个决定（在线要不要先下载）。"能不能拖进度条"是另一件事，
+     *   由 `audio_service_seek_supported()` 判 —— 本地文件全都能拖（各解码器都实现了
+     *   seek_ms），别拿这张名单去挡拖动（2026-10 就是这么挡错的）。
      */
-    if (ret == ESP_OK && music_track_seek_unsupported(stream)) {
+    if (ret == ESP_OK && music_container_needs_seekable_source(stream)) {
         ESP_LOGI(TAG, "容器不支持流式解码，改走先下载再播: %s", stream);
         ret = online_song_prepare(&req->song, path, sizeof(path));
         local_only = 1;
