@@ -21,6 +21,7 @@ idf_component_register(
         ui_core
         app_music
         audio_service
+        voice_service
         online_service
         media_meta
         wifi_service

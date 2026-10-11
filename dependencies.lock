@@ -412,6 +412,16 @@ dependencies:
     - esp32c61
     - esp32s31
     version: 2.5.0
+  espressif/esp_websocket_client:
+    component_hash: dc00233af846f3a744ada283a300e0d586040aadc3ee67361645ecdce4523672
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.8.0
   espressif/freetype:
     component_hash: aa9f7657a69b2b1c1f49044017fc424081d4e0fe6e97834cb43883548d44e3ca
     dependencies:
@@ -577,11 +587,12 @@ direct_dependencies:
 - espressif/esp_lcd_touch
 - espressif/esp_lcd_touch_gt1151
 - espressif/esp_lvgl_adapter
+- espressif/esp_websocket_client
 - espressif/led_strip
 - espressif/libpng
 - idf
 - lvgl/lvgl
 - lvgl_pinyin_ime
-manifest_hash: 7e4c883e6b9e2e19e22cf86a237687a5b0832058451b4196d30c26ea63eda033
+manifest_hash: 366c4c030875b03ccab6ea0a430b6bdd1569c13f5fe8c75e9cdb60274cb79844
 target: esp32s31
 version: 3.0.0

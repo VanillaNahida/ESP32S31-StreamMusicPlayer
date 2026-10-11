@@ -46,3 +46,6 @@ dependencies:
   # ---- 自研拼音输入法（开发期用 override_path，改代码免重新拉依赖） ----
   lvgl_pinyin_ime:
     override_path: "../../lvgl_pinyin_ime"
+  # ---- 语音输入的 WebSocket 客户端（宿主层用到，见 components/services/voice_service）----
+  # 组件本身只做讯飞协议，网络由应用提供；这里就是那个"应用"要用的客户端。
+  espressif/esp_websocket_client: "^1.2.0"

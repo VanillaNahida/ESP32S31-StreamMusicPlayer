@@ -19,6 +19,7 @@
 #include "lvgl_pinyin_ime/lv_pinyin_ime.h"
 #include "splash.h"
 #include "console_cmds.h"      /* 串口诊断命令：songinfo / songscan / playstat */
+#include "voice_service.h"     /* 语音输入宿主：WebSocket + 麦克风 + 自动暂停播放 */
 #include "audio_service.h"
 #include "storage_service.h"   /* 本地曲库 + SD 热插拔监控任务的启动点 */
 #include "app_music.h"
@@ -331,6 +332,10 @@ extern "C" void app_main(void)
      * 起不来（stdio 后端不支持等）只打一条警告，不影响其它功能。
      */
     (void)console_cmds_init();
+
+    /* 语音输入宿主层（WebSocket + 板载麦克风 + 识别期间自动暂停播放）。
+     * 密钥来自 menuconfig（Component config → lvgl_pinyin_ime → Voice input）。*/
+    (void)voice_service_init();
 
     ESP_LOGI(TAG, "M1 bring-up done");
 }

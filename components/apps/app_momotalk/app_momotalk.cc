@@ -34,6 +34,7 @@
 #include "ui_icons.h"
 
 #include "lvgl_pinyin_ime/lv_pinyin_ime.h"
+#include "voice_service.h"       /* 语音输入宿主：WS + 麦克风接上这把键盘 */
 
 static const char *TAG = "app_momotalk";
 
@@ -551,6 +552,8 @@ static void mt_ime_show(void)
     }
     lv_obj_align(s_ime_box, LV_ALIGN_BOTTOM_MID, 0, -UI_PX_H(2));
     lv_pinyin_ime_attach(s_ime, s_ta);
+    /* ★ 语音输入宿主（WebSocket + 板载麦克风）；必须在 attach 之后，见 voice_service.cc */
+    voice_service_attach_ime(s_ime);
     lv_pinyin_ime_show(s_ime);
     /* 键盘挂在 lv_layer_top 上、只建一次：提到最前，保证它压在页面之上 */
     lv_obj_move_foreground(s_ime_box);

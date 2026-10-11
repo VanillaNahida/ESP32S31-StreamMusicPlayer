@@ -226,3 +226,17 @@ CONFIG_ONLINE_NETEASE_API_TOKEN="sk-kP0pF3yD4gF6aP2qW3lJ2wD8gV9zO"
 # ⚠ 这份 cookie 等于账号凭证，别连同 assets/ncm-ck.txt 一起提交到公开仓库。
 # ---------------------------------------------------------------------------
 CONFIG_ONLINE_NETEASE_CK_FILE="assets/ncm-ck.txt"
+
+# ---------------------------------------------------------------------------
+# 语音输入（lvgl_pinyin_ime 的讯飞语音听写）—— 2026-10
+#
+# menuconfig 路径：Component config -> lvgl_pinyin_ime -> Voice input (iFlytek IAT)
+# 组件 Kconfig 里可配：ENABLE / APPID / APIKEY / APISECRET / ENDPOINT / LANGUAGE /
+# DOMAIN / ACCENT / SAMPLE_RATE / EOS_MS / DWA / PUNCTUATION / LIVE_PREVIEW /
+# COMMIT_MODE（追加|替换）/ TAP_MODE（切换|对讲|两者）/ KEY_K9。
+#
+# ⚠ 密钥写在这里 = 跟着固件一起发布，拿到固件就能提取出来。
+#   量产/分享固件请只留 ENABLE 与端点，三个密钥在运行时用
+#   lv_pinyin_ime_voice_set_config() 从 NVS / 服务器下发。
+# ---------------------------------------------------------------------------
+CONFIG_LV_PINYIN_IME_VOICE_ENABLE=y

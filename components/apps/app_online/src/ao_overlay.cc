@@ -33,6 +33,7 @@
 #include "ui_metrics.h"
 
 #include "lvgl_pinyin_ime/lv_pinyin_ime.h"
+#include "voice_service.h"       /* 语音输入宿主：WS + 麦克风接上这把键盘 */
 
 #include "ao_account.h"
 #include "ao_model.h"
@@ -453,6 +454,12 @@ static void modal_build_keyboards(lv_obj_t *ta, bool search)
         if (s_ime) {
             lv_obj_align(s_ime_box, LV_ALIGN_BOTTOM_MID, 0, -UI_PX_H(4));
             lv_pinyin_ime_attach(s_ime, ta);
+    /*
+     * ★ 语音输入：把宿主（WebSocket + 板载麦克风）接到这把键盘上。
+     *   必须在 attach(ime, ta) **之后** —— 组件要先有会话，我们再补 host 回调；
+     *   识别期间会自动暂停播放（见 voice_service.cc 的 on_voice_state）。
+     */
+    voice_service_attach_ime(s_ime);
             lv_pinyin_ime_show(s_ime);
             /*
              * ★ 键盘挂在 lv_layer_top() 上、只建一次；而**每次开浮层都会新建一个
