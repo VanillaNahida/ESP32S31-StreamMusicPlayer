@@ -226,8 +226,7 @@ lv_obj_t *page_bt(void)
     lv_obj_set_style_text_color(note, UI_COLOR_FG_DIM, LV_PART_MAIN);
     lv_obj_set_width(note, LV_PCT(100));
     lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-    lv_label_set_text(note, "说明：本机可搜索/配对/解除配对；音频串流（A2DP）还没接入，"
-                            "所以暂时不能把声音送到耳机。");
+    lv_label_set_text(note, "可在此搜索并连接蓝牙音频设备");
 
     s_bt_list = lv_obj_create(body);
     lv_obj_remove_style_all(s_bt_list);

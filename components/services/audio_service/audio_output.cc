@@ -51,8 +51,34 @@
 
 static const char *TAG = "audio_out";
 
-/** 一次 ASRC 处理的最大帧数（1024 帧 ≈ 23 ms @44.1k，正好对齐 ringbuf 的块） */
-#define ASRC_MAX_FRAMES   2048
+/*
+ * 一次读 ringbuf / 喂 ASRC 的**最大**帧数。
+ *
+ * ★★ 2026-10 修（真机"44.1k 的 FLAC 板载播放异常卡顿"）：这个值直接决定
+ *    "硬件会不会断粮"，**不能往大改**。
+ *
+ * 现场日志（44100 Hz/2ch/16bit FLAC，route 0）：
+ *     play stats: 产 5015/5015 ms (100.0%) | codec 4019 ms, asrc 962 ms, wait 7 ms,
+ *                 calls 108
+ * 每行 108 次调用 / 5015 ms → **每次迭代 46.4 ms**：读 8192 B（= 2048 帧 @44.1k
+ * = 46.4 ms 音频）→ ASRC 8.9 ms（软件重采样 44.1k→48k）→ 阻塞写 37.2 ms。
+ * 写成 37.2 ms 就能收下 46.4 ms 的音频，反推硬件侧（I2S DMA + codec_dev 内部缓冲）
+ * **总深度只有 46.4 − 37.2 ≈ 9.2 ms**。
+ *
+ * 于是一次迭代里：硬件缓冲在开头是满的（9.2 ms），接着 8.9 ms 全花在 ASRC 计算上，
+ * 这期间**一点新数据都喂不进去** → 缓冲被排到只剩 0.3 ms → 任何抖动都打穿 DMA。
+ * 每 46 ms 断一次粮（≈21 次/秒）就是听感上的"异常卡顿"。
+ * （也解释了为什么只有需要重采样的 44.1k/32k/22.05k 卡：48k 直通时 asrc = 0 ms。）
+ *
+ * 所以判据是 **每次迭代的 ASRC 计算时间 << 9.2 ms 的硬件余量**：
+ *     2048 帧 → 8.9 ms   ← 余量 0.3 ms，等于没有（旧值）
+ *      512 帧 → 2.2 ms   ← 余量 7.0 ms
+ *      256 帧 → 1.1 ms   ← 余量 8.1 ms（迭代次数更多，固定开销开始显出来）
+ * 取 512：余量足够，迭代次数（≈86 次/秒）带来的固定开销仍然可忽略。
+ *
+ * ⚠ 想改大之前先看 stats 里的 `asrc` 列：它必须明显小于 (迭代时长 − codec 时长)。
+ */
+#define ASRC_MAX_FRAMES   512
 /** 健康度日志窗口 */
 #define STATS_WINDOW_MS   5000
 /** 输出任务栈（只做 memcpy/重采样/写 codec，不要大） */
@@ -282,26 +308,24 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
         return false;
     }
     /*
-     * ★★ 输出缓冲容量**自己算一遍、取较大者**（2026-10 修"部分高品质 FLAC 卡顿 /
-     *    速度不对"）。
+     * ★★ 2026-10 **回退**：这里曾经"自己算一遍、取较大者"（理想值兜底），结果真机上
+     *    把 SW 重采样器害得空转：
      *
-     * `esp_asrc_get_out_sample_num()` 只是转发 `esp_ae_rate_cvt_get_max_out_sample_num()`，
-     * 而那个头文件的说明自相矛盾：函数名写 max，文档却写
-     * *"Get the **minimum** required sample number for the output frame buffer"*。
-     * 一旦这个值比实际产出小，`esp_asrc_process()` 只会写到 `out_sample_num` 那么多
-     * 就**静默截断**（不报错、我们这边完全看不出来）—— 表现正是"每块丢几个样本"：
-     * 轻则细微咔哒/卡顿，重则整首歌**速度不对**（单位时间放出的音频比源短）。
+     *      W audio_out: asrc out cap 2357 < ideal 2358 (44100 Hz -> 48000 Hz): 用理想值兜底
+     *      I audio_out: asrc ready (sw): 44100 Hz 2ch -> 48000 Hz 2ch, in 2048 frames -> out cap 2422
+     *      I audio_out: play stats: PCM 41 KB/s | 产 1143/5115 ms (22.3%) | asrc 5166 ms
+     *      E task_wdt: IDLE1 did not reset ... CPU 1: audio_out
+     *      --- fa_resample_process  ← 一直卡在重采样里
      *
-     * 理想值 = 输入帧 × 目标率 ÷ 源率（向上取整）+ 128 帧余量（覆盖重采样器内部的
-     * 分数延迟与相位余量）。与库给的值取较大者，截断风险归零。
+     *    容量给大之后，这个库会**试图填满整个输出缓冲**（而不是"按输入算该出多少"），
+     *    于是每块都多跑一大截、100% 占核 → 生产端只剩 22%、蓝牙侧 `7 f/s`。
+     *    教训：这个值的语义是"库自己算好的**最大**需要多少"，比它大并不安全。
+     *
+     *    所以：**一律用库给的值**。当年怀疑它偏小（怕静默截断）的顾虑，改由下面
+     *    `esp_asrc_process()` 之后的**饱和自检**（`out_frames >= cap` 时打日志）来兜 ——
+     *    真截断了我们能从日志看见，而不是靠猜着放大缓冲。
      */
-    const uint32_t ideal = (uint32_t)(((uint64_t)ASRC_MAX_FRAMES * AUDIO_OUT_RATE +
-                                       src_rate - 1) / src_rate) + 128;
-    if (out_frames < ideal) {
-        ESP_LOGW(TAG, "asrc out cap %u < ideal %u (%u Hz -> %d Hz): 用理想值兜底",
-                 (unsigned)out_frames, (unsigned)ideal, (unsigned)src_rate, AUDIO_OUT_RATE);
-        out_frames = ideal;
-    }
+    (void)src_rate;
     /* 非整数比时输出帧数会浮动，留一点余量 */
     s_out_frames_cap = out_frames + 64;
     s_in_cap = (size_t)ASRC_MAX_FRAMES * s_in_smp_bytes;

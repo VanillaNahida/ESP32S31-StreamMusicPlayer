@@ -27,6 +27,12 @@ extern "C" {
 #define A2DP_PCM_RATE   (48000)
 #define A2DP_PCM_CH     (2)
 #define A2DP_PCM_BITS   (16)
+/*
+ * 一帧立体声 PCM 的字节数。**写进 PCM 环形缓冲的字节数必须是它的整数倍**：
+ * 那个缓冲是字节流（FreeRTOS StreamBuffer），写进非整数倍会让后面读出的所有 16-bit
+ * 样本整体错位（高低字节互换）—— 听感就是持续的沙沙声。见 bts_feed.cc 的 write_pcm。
+ */
+#define A2DP_PCM_FRAME_BYTES (A2DP_PCM_CH * (A2DP_PCM_BITS / 8))
 /* 一次喂给 ASRC 的采样帧数 = 一个 SBC 帧的时长（128 采样 @48k ≈ 2.7 ms） */
 #define ASRC_IN_FRAMES  (128)
 /* 重采样后的暂存区：够放"上一次的余量 + 一次 ASRC 的输出"就行 */
