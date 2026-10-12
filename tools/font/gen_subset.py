@@ -129,6 +129,17 @@ def dict_charset(dict_dir: Path) -> set:
       拼音/数字/控制字节自然被过滤掉 ✓。
     """
     chars = set()
+    # 用户自定义补充表（同目录下的 extra_chars.txt）：里面写什么就收什么 ✓
+    extra = dict_dir / "extra_chars.txt"
+    if extra.exists():
+        txt = extra.read_text(encoding="utf-8", errors="ignore")
+        before = len(chars)
+        for line in txt.splitlines():
+            line = line.split("#", 1)[0]          # `#` 起是注释
+            for ch in line:
+                if not ch.isspace():              # 空白本来就有字形，不用收
+                    chars.add(ch)
+        print(f"  {extra.name:38s} {extra.stat().st_size / 1024:8.1f} KB → 补充 {len(chars) - before} 字（自定义）")
     files = [
         dict_dir / "rawdict_utf16_65105_freq.txt",
         dict_dir / "valid_utf16.txt",
@@ -178,8 +189,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="为 LVGL 位图字体切子集 TTF（主字体 / 日文补充 / 输入法词典生僻字）")
     ap.add_argument("--dict-dir", type=Path, default=DICT_DIR_DEFAULT,
-                    help="lvgl_pinyin_ime 的 data/dict 目录（默认按仓库布局推导：%s）"
-                         % DICT_DIR_DEFAULT)
+                    help=("lvgl_pinyin_ime 的 data/dict 目录（默认按仓库布局推导："
+                          f"{DICT_DIR_DEFAULT}）；同目录下的 extra_chars.txt 是用户"
+                          "自定义补充字符表，会被一并读入"))
     ap.add_argument("--no-dict", action="store_true",
                     help="不并入输入法词典里的生僻字（只切 GB2312 + 日文）")
     args = ap.parse_args()
