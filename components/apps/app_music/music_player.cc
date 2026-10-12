@@ -329,6 +329,93 @@ bool music_player_seek_begin(uint32_t target)
 {
     music_state_t *st = music_state();
     /*
+     * ★★ 2026-10 修（真机："这个 MP3 一拖进度条就立刻切下一曲"）：
+     *
+     * 现象链：探不出时长 → 用「文件大小 ÷ 码率」估出**偏大**的时长 → 用户拖到最右
+     *        → 落点越过文件尾 → 解码器立即 EOF → 引擎判定"放完" → app 切下一曲。
+     * 实证（同一个文件）：
+     *   I media_meta: mp3 probe: 128000 bps, 0 ms, 44100 Hz, 2ch     ← 探测 0 ms
+     *   I espaudiocore: MP3 Xing: duration=55.25s                    ← 解码器：55.25 s
+     *   I audio_seek: local seek -> 63842 ms                         ← 却拖到 63.8 s
+     *   I espaudiocore: decode finished: end of stream               ← 立刻 EOF
+     * 63.8 s 的来源就是"整文件 ÷ 128 kbps"，而这个文件带了 **33972 字节的 ID3v2**
+     * （封面等），把它算进音频长度就偏大了 ✗。
+     *
+     * 所以：**时长以解码器/引擎报的为准**（`audio_service_get_info()` 里那个是
+     * `espaudiocore_get_duration_ms()`，Xing/STREAMINFO 算出来的，准确），并把落点
+     * 夹到"离末尾 1 秒"以内 —— 宁可少拖一秒，也不能正好落在 EOF 上被当成播完。
+     */
+    {
+        const bool streamed = (st->on_mode && !st->on_stream_local);
+        uint32_t dur = 0;
+        audio_info_t info = {};
+        const bool info_ok = audio_service_get_info(&info);
+        if (info_ok && info.duration_ms > 0) {
+            dur = info.duration_ms;          /* 解码器/引擎给的最可信（Xing/STREAMINFO 算的） */
+        } else if (st->dur_ms > 0) {
+            /*
+             * ★ 退回**应用已知的时长**（探测值，或"文件大小 ÷ 码率"的估算）。
+             *   上一版这里只信解码器、它报 0 就直接拒绝，结果把这个文件也挡了 ✗：
+             *     W app_music: 时长未知（app=87217 ms, decoder=0 ms），拒绝定位
+             *   —— 而 app=87217 ms 恰恰是**对的**（PC 侧逐帧解剖真值 87.04 s ✓，
+             *   这个文件是无 Xing 头的标准 CBR，估算法本来就算得准 ✓）。
+             *   解码库对"无 Xing"文件不做估时（`duration` 返回 -1/0），所以**必须**
+             *   用应用侧的值兜住，否则这类文件永远拖不动。
+             */
+            dur = st->dur_ms;
+        }
+        if (dur > 2000) {
+            if (target > dur - 1000) {
+                ESP_LOGW(TAG, "seek 目标 %u ms 超出本曲时长 %u ms，夹到 %u ms",
+                         (unsigned)target, (unsigned)dur, (unsigned)(dur - 1000));
+                target = dur - 1000;         /* 离末尾留 1 秒，绝不正好落在 EOF 上 */
+            }
+        } else if (!streamed) {
+            /*
+             * 连应用侧也没有时长（真未知）：才拒绝这次拖动，而不是拿瞎猜的值去赌 ✗。
+             * 这类文件多是 VBR + 无 Xing 头（首帧标称码率远高于平均 ⇒ 估算成倍偏大 ✗）。
+             */
+            ESP_LOGW(TAG, "时长未知（app=%u ms, decoder=%d ms），拒绝定位：%s",
+                     (unsigned)st->dur_ms, (int)(info_ok ? info.duration_ms : -1),
+                     st->track_path);
+            ui_toast("这首读不出总时长，暂不支持拖动定位", 2000);
+            return false;
+        }
+    }
+    /*
+     * ★★ A 方案（2026-10，用户报"一拖进度条就立刻切下一曲"）：
+     *
+     *   会话**已经结束/正在收尾**时（歌刚好放完，你这时松手提交拖动 ✗），
+     *   光让库挪一下读位置是没用的 —— 解码任务已经 EOF 退出，没人再解码 ⇒
+     *   输出始终是空的 ⇒ 引擎照旧走"播放完成"分支 ⇒ 切下一曲 ✗。
+     *   实测日志顺序（`local seek` 明明返回 OK 却表现为失败）：
+     *
+     *     I espaudiocore: decode finished: end of stream          ← ① 先 EOF
+     *     I audio_eng: end of stream (waiting for output drain)
+     *     I audio_seek: local seek -> 41864 ms                    ← ② seek 提交，返回 ESP_OK ✓
+     *     I espaudiocore: decode task exiting
+     *     I audio_eng: playback finished (gen 7)                  ← ③ 按"放完"处理 → 切歌 ✗
+     *
+     *   正确做法就是用户的意图："我要听 41.9 秒那里" ⇒ **按目标位置重新起播这首歌**。
+     *   复用现成入口 `music_player_start_track_at(idx, resume_ms)`（它内部就是
+     *   "起播 + 就绪后定位"，与进度记忆续播同一条路径 ✓，不新增状态 ✗）。
+     *
+     *   ⚠ 必须在下面的 `audio_service_seek_supported()` 那道门**之前**判断：
+     *     会话已经结束 ⇒ `audio_engine_session_active()` 为假 ⇒ 那道门会给
+     *     "定位失败：时长或码率未知" ✗，根本走不到这里 ✗。
+     *   ⚠ 只对**本地播放**这么做：在线曲目不在本地下标里，`st->index` 指向的是别的歌 ✗。
+     */
+    {
+        const bool local_now = (!st->on_mode || st->on_stream_local);
+        if (local_now && st->index >= 0 && !music_loading() && !audio_service_is_playing()) {
+            ESP_LOGW(TAG, "seek 落在已结束的会话上：按目标 %u ms 重新起播（idx=%d）",
+                     (unsigned)target, st->index);
+            ui_toast("重新播放并定位…", 1200);
+            music_player_start_track_at(st->index, target);
+            return true;
+        }
+    }
+    /*
      * 能不能拖**只问服务**（`audio_service_seek_supported()`），不再按扩展名预拦：
      *   - **本地文件恒真** —— vendored 库里每个解码器都实现了 `seek_ms()`
      *     （WAV 按字节率、Vorbis `ov_pcm_seek`、Opus `op_pcm_seek`、M4A 走 mp4 demuxer、

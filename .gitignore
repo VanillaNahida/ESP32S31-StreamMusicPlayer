@@ -13,3 +13,6 @@ QQMusicApi/
 QQMusicPythonApi/
 docs/pdf/
 sdkconfig.old
+assets/fonts/DreamHanSansSC-W17-jp1.ttf
+assets/fonts/DreamHanSansSC-W17-jp2.ttf
+assets/fonts/DreamHanSansSC-W17-subset.ttf

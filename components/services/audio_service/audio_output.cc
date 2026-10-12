@@ -541,42 +541,73 @@ static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_byt
     }
 
     if (s_asrc && s_out_buf) {
-        const uint32_t in_frames = (uint32_t)(bytes / frame_bytes);
-        uint32_t out_frames = s_out_frames_cap;
-        const int64_t t0 = esp_timer_get_time();
-        const uint32_t c0 = esp_cpu_get_cycle_count();
-        const esp_asrc_err_t rc =
-            esp_asrc_process(s_asrc, data, in_frames, s_out_buf, &out_frames);
-        /* 周期只统计"这颗核真的执行了"的时间（被抢占的时段不计），见 s_stats_asrc_cyc */
-        s_stats_asrc_cyc += (uint32_t)(esp_cpu_get_cycle_count() - c0);
-        s_stats_asrc_us += (uint64_t)(esp_timer_get_time() - t0);
-        if (rc != ESP_ASRC_ERR_OK || out_frames == 0) {
-            s_asrc_err = s_asrc_err + 1;      /* volatile 上不能用 ++（C++20 起 -Werror=volatile） */
-            if ((s_asrc_err % 200) == 1) {
-                ESP_LOGW(TAG, "asrc process failed (%u in-frames, #%u)", (unsigned)in_frames,
-                         (unsigned)s_asrc_err);
-            }
-            return NULL;
-        }
         /*
-         * ★ 截断自检（2026-10 加）：`esp_asrc_process()` 若"产出正好等于容量"，说明
-         *   缓冲区被写满、**多出来的样本被静默丢掉** —— 那正是"卡顿 / 速度不对"的
-         *   来源之一。撞上就报出来（限频），并在 asrc_open 里用理想值兜底。
+         * ★★ 2026-10 修（真机现象："放久了卡顿 → asrc 100% CPU → task_wdt"）：
+         *
+         *   `s_out_frames_cap` 是 asrc_open() 按 **ASRC_MAX_FRAMES(=512) 个输入帧**
+         *   向库要来的容量（日志 `asrc ready ... in 512 frames -> out cap 749 frames`），
+         *   而 ringbuf 一次交给我们的块可能是 **1024 帧**。直接整块喂进去，库当场拒绝：
+         *     E ESP_AE_RATE_CVT: The output resample sample buffer is too small(749).
+         *     W audio_out: asrc process failed (1024 in-frames, #1)
+         *   更要命的是：**这个实例一旦失败过就不再恢复** —— 之后每次都空转
+         *   （`asrc 4985 ms / 5003 ms` ≈ 100% 一个核）→ 生产端只剩 40% → 卡顿 →
+         *   两个 IDLE 都喂不到狗 → `task_wdt`。
+         *
+         *   所以：**按库声明的块大小分片喂**（每片输入帧数 = 要容量时用的那个数），
+         *   容量就永远够、永远不会踩上面那条错误。
          */
-        if (out_frames >= s_out_frames_cap) {
-            s_asrc_sat = s_asrc_sat + 1;
-            if ((s_asrc_sat % 200) == 1) {
-                ESP_LOGW(TAG, "asrc output saturated (%u in-frames -> cap %u, #%u)："
-                              "本块样本被截断", (unsigned)in_frames,
-                         (unsigned)s_out_frames_cap, (unsigned)s_asrc_sat);
+        const uint32_t chunk_max_bytes = (uint32_t)ASRC_MAX_FRAMES * (uint32_t)frame_bytes;
+        size_t done     = 0;      /* 已处理的输入字节数 */
+        size_t produced = 0;      /* 已写进 s_stage 的输出字节数 */
+
+        while (done < bytes) {
+            const size_t left  = bytes - done;
+            const size_t chunk = (left > chunk_max_bytes) ? chunk_max_bytes : left;
+            const uint32_t in_frames = (uint32_t)(chunk / frame_bytes);
+            uint32_t out_frames = s_out_frames_cap;
+
+            const int64_t  t0 = esp_timer_get_time();
+            const uint32_t c0 = esp_cpu_get_cycle_count();
+            const esp_asrc_err_t rc = esp_asrc_process(s_asrc, data + done, in_frames,
+                                                      s_out_buf, &out_frames);
+            /* 周期只统计"这颗核真的执行了"的时间（被抢占的时段不计），见 s_stats_asrc_cyc */
+            s_stats_asrc_cyc += (uint32_t)(esp_cpu_get_cycle_count() - c0);
+            s_stats_asrc_us  += (uint64_t)(esp_timer_get_time() - t0);
+
+            if (rc != ESP_ASRC_ERR_OK || out_frames == 0) {
+                s_asrc_err = s_asrc_err + 1;  /* volatile 上不能用 ++（C++20 起 -Werror=volatile） */
+                if ((s_asrc_err % 200) == 1) {
+                    ESP_LOGW(TAG, "asrc process failed (%u in-frames, cap %u, #%u)",
+                             (unsigned)in_frames, (unsigned)s_out_frames_cap,
+                             (unsigned)s_asrc_err);
+                }
+                return NULL;      /* 这一块丢掉：宁可少一块，也绝不让它在失败态里空转 */
             }
+
+            /*
+             * ★ 截断自检（2026-10 加）：`esp_asrc_process()` 若"产出正好等于容量"，说明
+             *   缓冲区被写满、**多出来的样本被静默丢掉** —— 那正是"卡顿 / 速度不对"的
+             *   来源之一。撞上就报出来（限频）。
+             */
+            if (out_frames >= s_out_frames_cap) {
+                s_asrc_sat = s_asrc_sat + 1;
+                if ((s_asrc_sat % 200) == 1) {
+                    ESP_LOGW(TAG, "asrc output saturated (%u in-frames -> cap %u, #%u)："
+                                  "本块样本被截断", (unsigned)in_frames,
+                             (unsigned)s_out_frames_cap, (unsigned)s_asrc_sat);
+                }
+            }
+
+            const size_t n = (size_t)out_frames * s_out_smp_bytes;
+            if (!stage_ensure(produced + n)) {
+                return NULL;
+            }
+            memcpy(s_stage + produced, s_out_buf, n);
+            produced += n;
+            done     += chunk;
         }
-        const size_t n = (size_t)out_frames * s_out_smp_bytes;
-        if (!stage_ensure(n)) {
-            return NULL;
-        }
-        memcpy(s_stage, s_out_buf, n);
-        *out_bytes = n;
+
+        *out_bytes = produced;
         return s_stage;
     }
 

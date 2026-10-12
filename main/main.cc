@@ -16,6 +16,7 @@
 #include "bsp.h"
 #include "ui_core.h"
 #include "ui_metrics.h"      /* UI_FONT_TEXT（输入法借用本工程的位图字体） */
+#include "ui_font.h"         /* ui_font_text：本工程的位图字体（含 fallback 链，见下）*/
 #include "lvgl_pinyin_ime/lv_pinyin_ime.h"
 #include "splash.h"
 #include "console_cmds.h"      /* 串口诊断命令：songinfo / songscan / playstat */
@@ -335,6 +336,11 @@ extern "C" void app_main(void)
 
     /* 语音输入宿主层（WebSocket + 板载麦克风 + 识别期间自动暂停播放）。
      * 密钥来自 menuconfig（Component config → lvgl_pinyin_ime → Voice input）。*/
+    /* 注：拼音输入法的字体已经在上面那句 lv_pinyin_ime_set_fonts(UI_FONT_TEXT, …)
+     * 里传过了（必须在任何 lv_pinyin_ime_create() 之前 ✓）。这次不再重复调用 ✗；
+     * 缺字的根治在字库生成侧：tools/font/gen_subset.py 的 dict_charset() 会把
+     * lvgl_pinyin_ime 两个词典里的 16465 个 CJK 字（其中 9716 个 GB2312 没有）
+     * 一并收进字库 ✓。 */
     (void)voice_service_init();
 
     ESP_LOGI(TAG, "M1 bring-up done");

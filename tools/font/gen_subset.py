@@ -36,6 +36,7 @@ app 分区只剩 ~335 KB。合并成一个 4 bpp 大字体需要 +384 KB（放�
 用法（务必用本工程 tools/font/venv，禁止全局 pip）：
     tools\\font\\venv\\Scripts\\python.exe tools\\font\\gen_subset.py
 """
+import argparse
 import sys
 from pathlib import Path
 
@@ -47,6 +48,13 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17.ttf"
+# 输入法词典目录（决定候选词里会出现哪些字；见 dict_charset()）。
+#
+# ⚠ **不要在这里写死绝对路径** ✗（原来写过 `D:\Codes\lvgl_pinyin_ime\...`，换机器就废 ✗）。
+#   默认值按仓库布局推导：本工程用 `override_path: ../../lvgl_pinyin_ime` 引输入法组件 ✓，
+#   所以 ROOT 的**同级目录**就是它 ✓。要换位置用命令行参数：
+#       python tools/font/gen_subset.py --dict-dir /path/to/lvgl_pinyin_ime/data/dict
+DICT_DIR_DEFAULT = ROOT.parent / "lvgl_pinyin_ime" / "data" / "dict"
 DST = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-subset.ttf"
 DST_JP1 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-jp1.ttf"
 DST_JP2 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-jp2.ttf"
@@ -107,6 +115,41 @@ def jis_level2() -> set:
     return euc_jp_rows(0xD0, 0xF4)
 
 
+def dict_charset(dict_dir: Path) -> set:
+    """从 **lvgl_pinyin_ime 的词典文件**里提取所有需要显示的字符。
+
+    为什么必须带进来：主字体原来只有 GB2312 + JIS，而输入法的候选词来自
+    `rawdict_utf16_65105_freq.txt`（google 拼音词库）+ `valid_utf16.txt` ——
+    里面含 GB2312/JIS 之外的**生僻字**，缺字形时屏幕上就是方框/空白
+    （真机 2026-10 用户报"有些字符不会显示"✗）。
+
+    ⚠ 编码坑（我踩过 ✗）：这两个文件是 **UTF-16**（另有一个 `.be` 变体是**大端**），
+      而且每行的后半段（拼音/词频）是 **GBK 字节** ✗ ——
+      所以这里用 `utf-16-le` + `errors="ignore"` 容错解码，再**只收 CJK 区**的字符，
+      拼音/数字/控制字节自然被过滤掉 ✓。
+    """
+    chars = set()
+    files = [
+        dict_dir / "rawdict_utf16_65105_freq.txt",
+        dict_dir / "valid_utf16.txt",
+    ]
+    for f in files:
+        if not f.exists():
+            print(f"  ⚠ 词典不存在，跳过：{f}")
+            continue
+        raw = f.read_bytes()
+        text = raw.decode("utf-16-le", errors="ignore")
+        got = 0
+        for ch in text:
+            o = ord(ch)
+            if (0x3400 <= o <= 0x9FFF) or (0xF900 <= o <= 0xFAFF) or (0x20000 <= o <= 0x2FA1F):
+                if ch not in chars:
+                    chars.add(ch)
+            got += 0
+        print(f"  {f.name:38s} {f.stat().st_size / 1024:8.1f} KB → 累计 CJK {len(chars)} 字")
+    return chars
+
+
 def make_subset(chars: set, dst: Path) -> int:
     """按字符集生成一个子集字体，返回字节数。"""
     text = "".join(sorted(chars))
@@ -132,6 +175,15 @@ def make_subset(chars: set, dst: Path) -> int:
 
 
 def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="为 LVGL 位图字体切子集 TTF（主字体 / 日文补充 / 输入法词典生僻字）")
+    ap.add_argument("--dict-dir", type=Path, default=DICT_DIR_DEFAULT,
+                    help="lvgl_pinyin_ime 的 data/dict 目录（默认按仓库布局推导：%s）"
+                         % DICT_DIR_DEFAULT)
+    ap.add_argument("--no-dict", action="store_true",
+                    help="不并入输入法词典里的生僻字（只切 GB2312 + 日文）")
+    args = ap.parse_args()
+
     if not SRC.exists():
         sys.exit(f"找不到源字体：{SRC}")
 
@@ -139,7 +191,11 @@ def main() -> int:
     DST.parent.mkdir(parents=True, exist_ok=True)
 
     gb = gb2312_charset()
-    print(f"\n[1/3] 主字体（GB2312 + ASCII + 符号）：{len(gb)} 个字符")
+    print(f"\n[1/3] 主字体（GB2312 + ASCII + 符号）")
+    print("  从输入法词典补字（生僻字：候选词里会出现，原来会显示成方框 ✗）：")
+    if not args.no_dict:
+        gb |= dict_charset(args.dict_dir)
+    print(f"  合并后 {len(gb)} 个字符")
     make_subset(gb, DST)
 
     # 日文补充：只留 GB2312 没有的部分（增量），避免和主字体重复占体积
