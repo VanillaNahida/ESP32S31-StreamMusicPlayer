@@ -317,7 +317,24 @@ esp_err_t bts_feed_start(void)
         }
     }
     if (!s_feed_task) {
-        xTaskCreate(feed_task, "bt_feed", FEED_TASK_STACK, NULL, 6, &s_feed_task);
+        /*
+         * ★★ 2026-10：**钉到 core 0**（原来是 `xTaskCreate`，不钉核）。
+         *
+         * 真机日志（蓝牙播 44.1k 的 MP3）：
+         *     audio_out: play stats: 产 2135/5033 ms (42.4%) | asrc 5063 ms, calls 47, route 1
+         *     task_wdt: IDLE1 (CPU 1) 没喂狗；CPU 1 正在跑 audio_out（MEPC 在 fa_resample_process）
+         * 而 BT 控制器/Bluedroid/Wi-Fi/main **全都钉在 core 0**（见 sdkconfig），
+         * 也就是说 core 1 上除了 LVGL（prio 4）就只有 audio_out（prio 6）—— 而本任务
+         * 优先级也是 6 且不钉核，完全可能落到 core 1 上和输出任务**同优先级分时抢 CPU**
+         * （文件头那段老注释里就记过 "CPU 1 正在跑 bt_feed"）。
+         *
+         * 这条链上有两个软件重采样（audio_out 44.1k→48k、本任务的 48k→44.1k）+ SBC 编码，
+         * 让它们挤在同一个核上互相分时是没道理的：core 0 还有余量（WDT 里 IDLE0 正常），
+         * 输出任务所在的 core 1 才是紧的那个。所以把 feed 钉到 core 0，与解码任务同核
+         * （同一优先级、都有大缓冲兜着），彻底不给"跟输出任务抢 core 1"留机会。
+         */
+        xTaskCreatePinnedToCore(feed_task, "bt_feed", FEED_TASK_STACK, NULL, 6,
+                                &s_feed_task, 0);
     }
     return ESP_OK;
 }

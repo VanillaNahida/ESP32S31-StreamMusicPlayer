@@ -38,6 +38,7 @@
 #include <string.h>
 
 #include "esp_asrc.h"
+#include "esp_cpu.h"        /* esp_cpu_get_cycle_count()：区分"被抢 CPU"还是"自己变慢" */
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -114,6 +115,20 @@ static uint8_t          *s_out_buf;
 static uint32_t          s_out_frames_cap;
 static uint32_t          s_asrc_err;       /**< esp_asrc_process 失败次数 */
 static uint32_t          s_asrc_sat;       /**< 输出缓冲被写满（样本被截断）的次数 */
+/**
+ * ASRC 累计消耗的 **CPU 周期**。
+ *
+ * ★★ 2026-10 加：用来区分"重采样被抢了 CPU"和"重采样自己变慢了"。
+ *   这是真机上唯一能分清两者的量：`s_stats_asrc_us` 是**墙钟**，任务被抢占时它照样走；
+ *   周期计数只算这颗核真正执行过的周期。于是
+ *       墙钟 107 ms / 周期折算 9 ms  → 92% 的时间在被别人抢（去找抢占者）
+ *       墙钟 107 ms / 周期折算 103 ms → 代码真的慢 12 倍（cache/总线/库的问题）
+ *   背景日志（蓝牙播 44.1k MP3）：
+ *       play stats: 产 2135/5033 ms (42.4%) | asrc 5063 ms, calls 47, route 1
+ *       task_wdt: IDLE1 (CPU 1) 没喂狗；MEPC 在 fa_resample_process
+ *   板载输出同一份 ASRC 只要 8.9 ms/次 —— 差 12 倍，必须量一下才知道是哪种。
+ */
+static volatile uint64_t s_stats_asrc_cyc;
 /** mono→stereo 的权重：esp_asrc 硬件路径要求显式给 {1,1} 才认这条路 */
 static float             s_weight[2] = {1.0f, 1.0f};
 
@@ -454,7 +469,9 @@ static void write_out(const uint8_t *pcm, size_t bytes, audio_out_t route, int v
  * 关键一列是 `产 N ms / 墙 W ms`（交付的音频时长 ÷ 窗口时长）：
  *   - ≈100%：跟得上；
  *   - <99%：**产能不足**，DMA 会被慢慢抽干 → 一卡一卡。这时看后面三列定位：
- *       `asrc` 大 ⇒ 重采样太贵（换更省的实现 / 提高 complexity 档位）；
+ *       `asrc` 大 ⇒ 重采样太贵。★ 再看它括号里的 `cpu`：
+ *                  `asrc` ≈ `cpu` ⇒ 重采样本身就这么慢（换更省的实现 / 降 complexity）；
+ *                  `asrc` ≫ `cpu` ⇒ **CPU 被同核的别人抢走了**（去找那个任务/中断）；
  *       `wait` 大 ⇒ 解码端供不上（SD/解码/任务被抢，常见于 Wi-Fi 在 core 0 忙）；
  *       `codec` 接近 100% 而前两项都不大 ⇒ 正常（写硬件本来就是被 DMA 节流的）。
  */
@@ -473,13 +490,18 @@ static void stats_tick(void)
     const uint32_t permille = win ? (uint32_t)((uint64_t)audio_ms * 1000ull / win) : 0;
     const uint32_t kbps = (uint32_t)((uint64_t)s_stats_bytes * 1000ull / win / 1024ull);
     const uint32_t ring_free = s_pcm_rb ? (uint32_t)xRingbufferGetCurFreeSize(s_pcm_rb) : 0;
+    /* ASRC 真正吃掉的 CPU 时间（周期数换算；被抢占的时段不计）。
+     * 频率用编译期常量：本项目 CONFIG_PM_ENABLE 没开（无 DFS），CPU 一直跑在这个频率上。 */
+    const uint32_t cpu_khz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000u;
+    const uint64_t asrc_cpu_ms = cpu_khz ? (s_stats_asrc_cyc / cpu_khz) : 0;
     ESP_LOGI(TAG, "play stats: PCM %u KB/s | 产 %u ms / 墙 %u ms (%u.%u%%) | codec %llu ms, "
-                  "asrc %llu ms, wait %llu ms | gap max %u ms, calls %u, ring free %u B, "
-                  "route %d, src %u Hz %uch%s%s",
+                  "asrc %llu ms (cpu %llu ms), wait %llu ms | gap max %u ms, calls %u, "
+                  "ring free %u B, route %d, src %u Hz %uch%s%s",
              (unsigned)kbps, (unsigned)audio_ms, (unsigned)win,
              (unsigned)(permille / 10), (unsigned)(permille % 10),
              (unsigned long long)(s_stats_codec_us / 1000),
              (unsigned long long)(s_stats_asrc_us / 1000),
+             (unsigned long long)asrc_cpu_ms,
              (unsigned long long)(s_stats_wait_us / 1000),
              (unsigned)s_stats_gap_max_ms, (unsigned)s_stats_calls, (unsigned)ring_free,
              (int)s_route, (unsigned)s_src_rate, s_src_ch, s_asrc ? " (asrc)" : "",
@@ -489,6 +511,7 @@ static void stats_tick(void)
     s_stats_bytes = 0;
     s_stats_codec_us = 0;
     s_stats_asrc_us = 0;
+    s_stats_asrc_cyc = 0;
     s_stats_wait_us = 0;
     s_stats_calls = 0;
     s_stats_gap_max_ms = 0;
@@ -521,8 +544,11 @@ static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_byt
         const uint32_t in_frames = (uint32_t)(bytes / frame_bytes);
         uint32_t out_frames = s_out_frames_cap;
         const int64_t t0 = esp_timer_get_time();
+        const uint32_t c0 = esp_cpu_get_cycle_count();
         const esp_asrc_err_t rc =
             esp_asrc_process(s_asrc, data, in_frames, s_out_buf, &out_frames);
+        /* 周期只统计"这颗核真的执行了"的时间（被抢占的时段不计），见 s_stats_asrc_cyc */
+        s_stats_asrc_cyc += (uint32_t)(esp_cpu_get_cycle_count() - c0);
         s_stats_asrc_us += (uint64_t)(esp_timer_get_time() - t0);
         if (rc != ESP_ASRC_ERR_OK || out_frames == 0) {
             s_asrc_err = s_asrc_err + 1;      /* volatile 上不能用 ++（C++20 起 -Werror=volatile） */
@@ -695,6 +721,7 @@ void audio_output_session_begin(uint32_t gen)
     s_stats_bytes = 0;
     s_stats_codec_us = 0;
     s_stats_asrc_us = 0;
+    s_stats_asrc_cyc = 0;
     s_stats_wait_us = 0;
     s_stats_calls = 0;
     s_stats_gap_max_ms = 0;
