@@ -30,7 +30,16 @@ extern "C" {
 #endif
 
 /* ---------------------------------------------------------------- 常量 */
-#define HTTP_TIMEOUT_MS    15000
+/*
+ * 单次 HTTP 超时（ms）。
+ *
+ * ⚠ esp_http_client_perform() 里这个值的语义是"**两次读到数据之间**最多等多久"，
+ *   不是"整个请求最多多久" —— 中途一次长空档就让整条请求报 ESP_ERR_HTTP_EAGAIN
+ *   （`Connection timed out before data was ready!`）。歌单分页一页 JSON ≈250 KB，
+ *   设备又在同时跑 WiFi 音频与蓝牙，15 s 会被偶发打满（真机 2026-10）。
+ *   调 30 s；并且 os_account.cc 的分页会重试，两层一起兜。
+ */
+#define HTTP_TIMEOUT_MS    30000
 #define HTTP_BUF           2048
 /* 单个 JSON 响应上限（歌单 1000 首 ≈ 300 KB），别让一个坏响应吃光内存 */
 #define JSON_MAX_LEN       (1024u * 1024u)

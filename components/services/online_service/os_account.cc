@@ -16,6 +16,7 @@
  *   net_api_get_ex → os_net_api_get_ex、s_last_err 读取 → os_state_last_error()。
  * URL、查询串、"每日推荐 cookie 体检"那一行日志文案全部原样。
  */
+#include "esp_http_client.h"   /* ESP_ERR_HTTP_EAGAIN / ESP_ERR_TIMEOUT 在这里定义（分页重试要用）*/
 #include "internal/os_account.h"
 
 #include <stdio.h>
@@ -268,7 +269,29 @@ esp_err_t online_netease_playlist_page(const char *pl_id, size_t offset,
             return ESP_ERR_INVALID_SIZE;
         }
         char *js = NULL;
-        const esp_err_t err = os_net_api_get_ex(path, true, &js);
+        /*
+         * ★ 瞬时网络错误就**重试这一页**（2026-10 用户报"加载在线歌单有概率失败"）。
+         *
+         * 根因：os_net_api_get_ex() 里用 esp_http_client_perform()，而它的 timeout_ms
+         * 是"两次读到数据之间"的上限 —— 一页 ≈250 KB 的歌单 JSON，在 WiFi 音频/蓝牙
+         * 同时跑的时候会被偶发打满，报 ESP_ERR_HTTP_EAGAIN（日志
+         * `W HTTP_CLIENT: Connection timed out before data was ready!`）。
+         * 这类错误重一次基本就过；非瞬时错误（解析失败、404…）不浪费三次。
+         * 不加延时：失败的请求本身已经耗掉好几秒，立刻重发即可（也免得多引一个头文件）。
+         */
+        esp_err_t err = ESP_FAIL;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            js = NULL;
+            err = os_net_api_get_ex(path, true, &js);
+            if (err == ESP_OK) {
+                break;
+            }
+            if (err != ESP_ERR_HTTP_EAGAIN && err != ESP_ERR_TIMEOUT) {
+                break;
+            }
+            ESP_LOGW(TAG, "playlist page @%u retry %d/3 (%s)",
+                     (unsigned)(offset + got_total), attempt + 1, esp_err_to_name(err));
+        }
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "playlist %s page @%u failed: %s (%s)", pl_id,
                      (unsigned)(offset + got_total), esp_err_to_name(err),
