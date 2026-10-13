@@ -12,10 +12,15 @@
  *
  *   Wi-Fi：开关关着 → **不显示**；开着但没连上 → wifi_off（暗）；
  *          已连接 → 按 RSSI 选 wifi_s1..s4（亮）
- *   蓝牙 ：开关关着 → **不显示**；已连接/推流中 → bt_connected（强调色）；
+ *   蓝牙 ：开关关着 → **不显示**；已连接/推流中 → bt_connected（**蓝**）；
  *          搜索中 → bt_searching（亮）；其余（空闲）→ bt_idle（暗）
- *   SD   ：没插卡 → **不显示**；插着且挂上了 → sd_ok（暗）；
- *          卡在但读不出来 → sd_warn（强调色）
+ *   SD   ：没插卡 → **不显示**；插着且挂上了 → sd_ok（**白**）；
+ *          卡在但读不出来 → sd_warn（橙，强调色）
+ *
+ * 配色口径（都在 ui_metrics.h 的"状态栏图标配色"那一块）：
+ *   橙是**警告色**，只给 SD 读不出来这种"要注意的事"；蓝牙连接成功是正常状态，
+ *   所以用蓝（UI_COLOR_STATUS_BT_LINK）。sd_ok 用白而不是灰 —— 那个字形是空心
+ *   描边，配灰色会比旁边实心的 Wi-Fi / 蓝牙暗一档，看着像"没点亮"。
  *
  * 三张图都是**单色位图**（assets/icons 下的 SVG 按白色烘进 ui_icons.c），
  * 颜色由 lv_obj_set_style_image_recolor() 决定 —— 这就是"同一个图标既能画成
@@ -149,7 +154,8 @@ static void apply_bt(void)
     }
     const bt_state_t st = bt_service_state();
     if (st == BT_ST_CONNECTED || st == BT_ST_STREAMING || bt_service_is_connected()) {
-        icon_set(s_bt, &bt_connected, UI_COLOR_ACCENT);
+        /* 蓝色（不是强调色橙）：橙是"警告"色，留给 sd_warn / 音量条那一类 */
+        icon_set(s_bt, &bt_connected, UI_COLOR_STATUS_BT_LINK);
     } else if (st == BT_ST_DISCOVERING || bt_service_is_discovering()) {
         icon_set(s_bt, &bt_searching, UI_COLOR_FG);
     } else {
@@ -164,7 +170,9 @@ static void apply_sd(void)
 {
     switch (storage_service_sd_state()) {
     case SD_STATE_READY:
-        icon_set(s_sd, &sd_ok, UI_COLOR_FG_DIM);
+        /* 白色（= UI_COLOR_FG，和 Wi-Fi 已连接同色）：sd_card 是空心描边字形，
+         * 用灰色（FG_DIM）会比旁边实心的图标明显暗一档，像"没点亮" */
+        icon_set(s_sd, &sd_ok, UI_COLOR_FG);
         break;
     case SD_STATE_ERROR:
         /* 卡在但读不出来：用强调色（橙）—— 这是要用户看一眼的颜色 */

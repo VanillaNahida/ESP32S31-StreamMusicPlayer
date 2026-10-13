@@ -1365,11 +1365,29 @@ cfg.io_cfg.buffer_cfg.buffer_size = 64 * 1024;
    拿到 "slot already initialized" —— 这就是"换了卡也得重启才认"的根因。
    `sdmmc_host_init()` 自己是幂等的（已建就返回旧句柄），关键在 **slot** 有没有被拆。
 3. **轮询任务**：`storage_service` 里 `sd_monitor_task`（4 KB 栈、优先级 2）——
-   已挂载时每 1 s 探一次，未挂载时每 1.5 s 试着挂一次（连续失败退到 5 s，
-   免得没插卡时每 1.5 秒初始化一次卡）。挂/卸都过一把互斥锁，设置页的
+   已挂载时每 `SD_PROBE_MS`(1 s) 探一次，未挂载时每 `SD_MOUNT_RETRY_MS`(1.5 s)
+   试着挂一次（连续失败 `SD_MOUNT_SLOW_AFTER`(8) 次后退到 `SD_MOUNT_SLOW_MS`(3 s)，
+   免得空槽每 1.5 秒初始化一次卡）。挂/卸都过一把互斥锁，设置页的
    「重新检测」（`storage_service_sd_rescan()`）走同一个入口，两边不会同时
    init/deinit 同一个设备。
-4. **★ 电源控制（2026-10 补，热插拔真正生效的关键）**：`SD_CTRL`=GPIO39 是
+   ⚠⚠ **连续失败计数的清零点写错位置 = 整个热插拔形同不存在**（2026-10 踩过，
+   用户报"SD 卡拔掉后没有轮询去检测新插入的卡"就是这个）。老代码是
+
+   ```c
+   for (;;) {
+       if (bsp_sdcard_is_mounted()) {
+           fail = 0;                       /* ← 错在这里：每轮循环都清零 */
+           if (bsp_sdcard_probe() != ESP_OK) {
+               if (++fail >= SD_PROBE_FAIL_MAX) { ... sd_drop_mount(); }
+           }
+   ```
+
+   一轮只探一次卡，所以 `++fail` **永远只到 1**，阈值 2 永远达不到 →
+   `sd_drop_mount()` 一次都不会被调用 → `s_mounted` 恒为 true → 监控任务永远走
+   "已挂载"这一支，**再也不会去试挂新插入的卡**（而且界面一直显示"已挂载"）。
+   现在清零只在**探到卡**时做（`probe_fail = 0;` 放在 `probe()` 成功的分支里）。
+   动这段逻辑前，先确认"计数真的能累加上去"。
+4. **★ 电源控制（2026-10 补）**：`SD_CTRL`=GPIO39 是
    **低电平使能**的卡供电，板级 `sdcard_power_ctrl` 设备管着它。问题是板级管理器
    **只在"设备 init 时"自动上电一次**，而它的电源设备**引用计数一旦 ≥1 就再也
    不会重新 init**、init 失败也不回退 —— 于是连续失败几次之后卡上一直有电，
@@ -1388,6 +1406,17 @@ cfg.io_cfg.buffer_cfg.buffer_size = 64 * 1024;
    才算没插卡**，其它错误是"卡在但读不出来"。
    ⚠ 只在**未挂载**时调；⚠ 卸载路径里必须**先探卡再断电**（断电后探谁都无应答）。
    ⚠ `sdmmc_card_t` 一千多字节，探卡那次是 `calloc` 的，别放栈上（监控任务栈 4 KB）。
+6. **"挂载成功"要体检（2026-10 补）**：`esp_board_device_init()` 在
+   `handle->device_handle != NULL` 时走 "already initialized" 分支 —— **直接返回
+   ESP_OK，什么都不做**。而 handle 没被清掉只有一种可能：上一次 deinit 失败了
+   （它会把 ref_count 加回去、handle 留着）。那种情况下我们会一路"成功"下去，
+   拿到的 `fat->card` 是上一次卸载时已 free 的内存（悬垂），监控任务却以为挂着、
+   再也不重试。现在两头都堵住：
+   - `bsp_sdcard_mount()` 挂完后做一次 `stat(挂载点)`，不是目录就报错 +
+     强制 deinit + 返回失败（让上层继续重试）；
+   - `bsp_sdcard_unmount()` **检查板级 deinit 的返回值并打 ERROR**
+     （这行不会被后台压日志的窗口吞掉 —— `sd_drop_mount` 不在窗口里）。
+     看到它就去查板级/驱动层，别再怀疑状态机。
 
 **UI 怎么跟上**：状态每变一次 `storage_service_sd_generation()` **+1**（多处 UI
 各记自己上次见到的代次，比"事件队列"好，不存在谁消费掉了）。用它的有三处：
@@ -1522,9 +1551,15 @@ System.Drawing，只做格式转换，不改内容）——
 
 | 图标 | 显示规则 |
 | --- | --- |
-| Wi-Fi | 开关关着 → **不显示**；开着没连上 → `wifi_off`（暗）；已连接 → `wifi_s1..s4` 按 RSSI 分档（`rssi_to_level()`，未知(0) 按满格） |
-| 蓝牙 | 开关关着 → **不显示**；已连接/推流 → `bt_connected`（强调色）；搜索中 → `bt_searching`；其余 → `bt_idle`（暗） |
-| SD | `storage_service_sd_state()`：`ABSENT` → 不显示；`READY` → `sd_ok`；`ERROR` → `sd_warn`（强调色） |
+| Wi-Fi | 开关关着 → **不显示**；开着没连上 → `wifi_off`（暗 `FG_DIM`）；已连接 → `wifi_s1..s4` 按 RSSI 分档（`rssi_to_level()`，未知(0) 按满格），白色 `FG` |
+| 蓝牙 | 开关关着 → **不显示**；已连接/推流 → `bt_connected`（**蓝** `UI_COLOR_STATUS_BT_LINK` = 0x64B5F6）；搜索中 → `bt_searching`（白）；其余 → `bt_idle`（暗） |
+| SD | `storage_service_sd_state()`：`ABSENT` → 不显示；`READY` → `sd_ok`（**白**）；`ERROR` → `sd_warn`（橙 `ACCENT`） |
+
+- **配色口径**（2026-10 用户要求改过一次）：**橙 = 警告**，只给"要注意的事"
+  （`sd_warn`、音量条转弧），所以"蓝牙已连接"这种**正常**状态**不用橙而用蓝**；
+  `sd_ok` 用**白**不用灰 —— `sd_card` 那个字形是**空心描边**，配 `FG_DIM`(0x8C8C97)
+  会比旁边实心的 Wi-Fi / 蓝牙暗一档，看着像"这格没点亮"。
+  蓝取 Material Blue 300 而不是首页那支 0x4A6FA5：状态栏底色接近纯黑，深蓝偏暗。
 
 - 图标排在一条 **flex row** 里，隐藏用 `LV_OBJ_FLAG_HIDDEN` —— LVGL 的 flex
   **跳过隐藏子对象**，所以关掉 Wi-Fi 时右边几个会自动收拢，不会留空洞

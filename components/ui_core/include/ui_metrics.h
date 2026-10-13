@@ -89,6 +89,19 @@
 #define UI_COLOR_ICON_SETTINGS lv_color_hex(0x6E6E78)
 
 /*
+ * 状态栏图标配色（ui_status_bar.cc —— 单色位图 + image_recolor 上色）
+ *
+ * 为什么另开一组，不直接拿 ACCENT / FG_DIM 用：
+ *   - **橙（ACCENT）留给"要注意的事"**：SD 读不出来（sd_warn）、音量条转弧。
+ *     蓝牙"已连接"是**一切正常**的状态，也用橙会和警告撞色 —— 所以改成蓝色。
+ *   - 蓝取 Material Blue 300（0x64B5F6），比首页图标那支 0x4A6FA5 **亮一档**：
+ *     状态栏底色接近纯黑（0x08080C），偏深的蓝在那上面看着像"这格没点亮"。
+ *   - **SD 可用用白**（与 Wi-Fi 已连接同色 FG）：sd_card 那个字形本身是**空心描边**，
+ *     再配 FG_DIM(0x8C8C97) 会比旁边实心的 Wi-Fi / 蓝牙明显暗一档（用户反馈过）。
+ */
+#define UI_COLOR_STATUS_BT_LINK  lv_color_hex(0x64B5F6)
+
+/*
  * 字体：
  *
  * UI 文本用 components/ui_font 里的位图字体（由 tools/font/gen_lvgl_font.py 生成，
