@@ -23,6 +23,9 @@ LV_FONT_DECLARE(ui_font_jp2_16)
 static lv_font_t s_jp1;
 /* 主字体的可写副本：UI_FONT_* 全部指向它 */
 lv_font_t ui_font_text;
+// 链尾的"生僻字"字体副本（要改 fallback 指针，见文件头说明：不能改 flash 里的原件）
+static lv_font_t s_jp2;
+static lv_font_t s_dict;
 
 void ui_font_init(void)
 {
@@ -31,7 +34,14 @@ void ui_font_init(void)
     ui_font_text = ui_font_sc16;
 
     s_jp1 = ui_font_jp1_16;
-    s_jp1.fallback = &ui_font_jp2_16;
+    /*
+ * 链条（2026-10 拆成四份，每份都压在 1 MB 的 20 位索引上限内 ✓）：
+ *   sc16(常用中文,4bpp) → jp1(常用日文,4bpp) → jp2(生僻日文,2bpp) → dict16(生僻字+补充表,2bpp)
+ */
+s_jp2 = ui_font_jp2_16;
+s_dict = ui_font_dict16;
+s_jp2.fallback = &s_dict;
+s_jp1.fallback = &s_jp2;
 
     ui_font_text.fallback = &s_jp1;
 }

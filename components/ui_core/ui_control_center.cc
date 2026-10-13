@@ -1,5 +1,5 @@
 /*
- * ui_control_center.cc —— 控制中心（下拉，iOS 药丸风格）+ 右侧功能抽屉
+ * ui_control_center.cc —— 控制中心（下拉，iOS 药丸风格）
  *
  * 三段式（开发指南 5.6，800x480 横屏）：
  *   行1 连接模块药丸（2x2 圆钮）+ 媒体药丸（封面/歌名/歌手/播放暂停）+ 两个小药丸
@@ -7,6 +7,10 @@
  *   行3 一排圆形快捷按钮：主界面 / 在线搜索 / 设置 / 息屏
  *
  * 每次打开重新渲染状态（避免陈旧显示）；拖动中只更新填充，不重建控件树。
+ *
+ * ⚠ 2026-10 需求：**移除右侧左滑功能抽屉**。抽屉那套（第二个弹簧 + 右边缘热区 +
+ *   UI_DRAWER_W）整体删掉了；"从右边缘向左滑"现在不再被热区吃掉，直接落给页面
+ *   控件（列表横滑等）。控制中心本身不变。
  */
 #include "ui_core.h"
 #include "ui_internal.h"
@@ -21,10 +25,9 @@
 
 static const char *TAG = "ui_cc";
 
-static lv_obj_t  *s_root;        /* 药丸与抽屉的共同父容器（top layer） */
+static lv_obj_t  *s_root;        /* 控制中心面板的父容器（top layer） */
 static lv_obj_t  *s_cc;          /* 控制中心面板 */
 static lv_obj_t  *s_scrim;       /* 遮罩：点击关闭 + 压暗下层 */
-static lv_obj_t  *s_drawer;      /* 右侧功能抽屉 */
 static lv_obj_t  *s_bri_fill;
 static lv_obj_t  *s_vol_fill;
 static lv_obj_t  *s_media_title;
@@ -33,14 +36,12 @@ static lv_obj_t  *s_media_btn_label;
 static lv_obj_t  *s_out_label;
 static lv_obj_t  *s_sd_label;
 static bool       s_cc_open;
-static bool       s_drawer_open;
 static int        s_bri = 80;
 static int        s_vol = 55;
 static bool       s_muted;
 
 lv_obj_t *ui_sheet_root(void) { return s_root; }
 bool ui_cc_state(void)        { return s_cc_open; }
-bool ui_drawer_state(void)    { return s_drawer_open; }
 
 /* ------------------------------------------------------------------ 通用小部件 */
 
@@ -118,9 +119,6 @@ static void on_scrim_click(lv_event_t *e)
     (void)e;
     if (s_cc_open) {
         ui_cc_close();
-    }
-    if (s_drawer_open) {
-        ui_drawer_close();
     }
 }
 
@@ -242,46 +240,38 @@ static void on_cc_any_touch(lv_event_t *e) { (void)e; /* 展开时报告活动�
 /* ================================================================== 动画层
  *
  * 按 docs/UI-suggest.md 的建议：**不做"停掉动画 A → 新建动画 B"**，
- * 而是常驻两个弹簧，任何时刻只改 target，由物理继续推进：
+ * 而是常驻一个弹簧，任何时刻只改 target，由物理继续推进：
  *
- *   s_spr_cc      值 = 面板 y 坐标   -UI_CC_PANEL_H（关） → 0（开）
- *   s_spr_drawer  值 = 抽屉 x 坐标   UI_W（关）           → UI_W-UI_DRAWER_W（开）
+ *   s_spr_cc  值 = 面板 y 坐标   -UI_CC_PANEL_H（关） → 0（开）
  *
- * 位置/速度连续 ⇒ 打断不回跳、松手不顿；两个弹簧共用一个 apply 回调，
- * 遮罩浓淡、可见性、可点性全部由**同一次求值**派生 ⇒ 物理上不可能失配。
- * 由此彻底消灭了旧实现里"关闭动画被打断 → 透明遮罩残留吞触摸"的卡死路径。
+ * 位置/速度连续 ⇒ 打断不回跳、松手不顿；遮罩浓淡、可见性、可点性全部由
+ * **同一次求值**派生 ⇒ 物理上不可能失配。由此彻底消灭了旧实现里
+ * "关闭动画被打断 → 透明遮罩残留吞触摸"的卡死路径。
  */
 
 static ui_spring_t s_spr_cc;
-static ui_spring_t s_spr_drawer;
 static bool       s_gesture_suspended;   /* 手势热区当前是否已挂起（避免每帧改 flag） */
 
 /*
  * 派生视觉的唯一出口：
- *   面板 y / 抽屉 x 直接取弹簧值；遮罩浓度与可点性取两者中较大的"展开度"。
+ *   面板 y 直接取弹簧值；遮罩浓度与可点性取面板的"展开度"。
  *
  * 遮罩必须用 **BG_OPA** 而不是对象级 OPA：对象级 OPA < 255 会让 LVGL 为这个
  * 800x480 的全屏对象每帧分配约 750 KB 中间图层（framebuffer 已占 PSRAM）。
  */
 static void sheet_visual_sync(void)
 {
-    float cc_v = ui_spring_value(&s_spr_cc);
-    float dr_v = ui_spring_value(&s_spr_drawer);
+    const float cc_v = ui_spring_value(&s_spr_cc);
 
     if (s_cc) {
         lv_obj_set_y(s_cc, (int32_t)lroundf(cc_v));
-    }
-    if (s_drawer) {
-        lv_obj_set_x(s_drawer, (int32_t)lroundf(dr_v));
     }
     if (!s_scrim) {
         return;
     }
 
     /* 展开度：0 = 完全关闭，1 = 完全展开 */
-    float cc_p = (cc_v + (float)UI_CC_PANEL_H) / (float)UI_CC_PANEL_H;
-    float dr_p = ((float)UI_W - dr_v) / (float)UI_DRAWER_W;
-    float p    = cc_p > dr_p ? cc_p : dr_p;
+    float p = (cc_v + (float)UI_CC_PANEL_H) / (float)UI_CC_PANEL_H;
     if (p < 0.0f) p = 0.0f;
     if (p > 1.0f) p = 1.0f;
 
@@ -299,7 +289,7 @@ static void sheet_visual_sync(void)
 
     /* 热区在 z 序上高于遮罩：只要面板还有一点露头就必须整体让路，
      * 否则点最左/最右 24 px 关不掉面板，看起来也像卡死 */
-    bool want_suspend = p > 0.001f;
+    const bool want_suspend = p > 0.001f;
     if (want_suspend != s_gesture_suspended) {
         s_gesture_suspended = want_suspend;
         ui_gesture_suspend(want_suspend);
@@ -307,12 +297,6 @@ static void sheet_visual_sync(void)
 }
 
 static void cc_apply_cb(float v, void *user)
-{
-    (void)v; (void)user;
-    sheet_visual_sync();
-}
-
-static void drawer_apply_cb(float v, void *user)
 {
     (void)v; (void)user;
     sheet_visual_sync();
@@ -332,9 +316,7 @@ static void cc_refresh_content(void)
 /* ------------------------------------------------------------------ 跟手拖动 */
 
 static bool  s_cc_dragging;
-static bool  s_drawer_dragging;
 static float s_cc_drag_base;
-static float s_drawer_drag_base;
 
 /* 松手判决用的速度门限（px/s）：超过它就直接按甩动方向定胜负 */
 #define SHEET_FLING_VEL  350.0f
@@ -383,49 +365,6 @@ void ui_cc_drag_end(int dy, int vel)
              (double)v, (double)sp, open ? "open" : "close");
 }
 
-void ui_drawer_drag(int dx)
-{
-    if (!s_drawer) {
-        return;
-    }
-    if (!s_drawer_dragging) {
-        s_drawer_dragging  = true;
-        ui_spring_hold(&s_spr_drawer);
-        s_drawer_drag_base = ui_spring_value(&s_spr_drawer);
-        s_drawer_open      = true;
-        lv_obj_move_foreground(s_scrim);
-        lv_obj_move_foreground(s_drawer);
-    }
-    ui_spring_set_value(&s_spr_drawer, s_drawer_drag_base + (float)dx);
-    ESP_LOGD(TAG, "drawer drag dx=%d x=%.0f", dx, (double)ui_spring_value(&s_spr_drawer));
-}
-
-void ui_drawer_drag_end(int dx, int vel)
-{
-    (void)dx; (void)vel;
-    if (!s_drawer || !s_drawer_dragging) {
-        return;
-    }
-    s_drawer_dragging = false;
-
-    float v  = ui_spring_value(&s_spr_drawer);
-    float sp = s_spr_drawer.velocity;
-    float open_x = (float)(UI_W - UI_DRAWER_W);
-    bool open;
-    /* 注意抽屉的 x 越小越"开"，速度符号与直觉相反 */
-    if (sp < -SHEET_FLING_VEL) {
-        open = true;
-    } else if (sp > SHEET_FLING_VEL) {
-        open = false;
-    } else {
-        open = v < ((float)UI_W + open_x) * 0.5f;
-    }
-    s_drawer_open = open;
-    ui_spring_release(&s_spr_drawer, open ? open_x : (float)UI_W);
-    ESP_LOGD(TAG, "drawer drag_end x=%.0f v=%.0f -> %s",
-             (double)v, (double)sp, open ? "open" : "close");
-}
-
 /* ------------------------------------------------------------------ 打开 / 关闭 */
 
 /* animate 参数保留只是为了不改动既有调用签名：现在所有运动都交给弹簧，
@@ -446,24 +385,6 @@ void ui_cc_apply_open(bool open, bool animate)
         ui_spring_set_target(&s_spr_cc, open ? 0.0f : -(float)UI_CC_PANEL_H);
     }
     ESP_LOGD(TAG, "cc %s", open ? "open" : "close");
-}
-
-void ui_drawer_apply_open(bool open, bool animate)
-{
-    (void)animate;
-    if (!s_drawer) {
-        return;
-    }
-    s_drawer_open = open;
-    if (open) {
-        lv_obj_move_foreground(s_scrim);
-        lv_obj_move_foreground(s_drawer);
-    }
-    if (!s_drawer_dragging) {
-        ui_spring_set_target(&s_spr_drawer,
-                             open ? (float)(UI_W - UI_DRAWER_W) : (float)UI_W);
-    }
-    ESP_LOGD(TAG, "drawer %s", open ? "open" : "close");
 }
 
 /* ------------------------------------------------------------------ 构建 */
@@ -666,29 +587,11 @@ lv_obj_t *ui_cc_create(lv_obj_t *parent)
     /* 行3：快捷圆钮 */
     build_quick_row(s_cc);
 
-    /* 右侧功能抽屉（默认在屏幕外） */
-    s_drawer = lv_obj_create(parent);
-    lv_obj_remove_style_all(s_drawer);
-    lv_obj_set_size(s_drawer, UI_DRAWER_W, UI_H);
-    lv_obj_set_style_bg_color(s_drawer, UI_COLOR_BG_ALT, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(s_drawer, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_x(s_drawer, UI_W);
-    lv_obj_set_y(s_drawer, 0);
-
-    lv_obj_t *dt = lv_label_create(s_drawer);
-    lv_obj_set_style_text_font(dt, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(dt, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(dt, "功能抽屉\n（M2 起接入播放队列）");
-    lv_obj_align(dt, LV_ALIGN_CENTER, 0, 0);
-
-    /* 弹簧必须在两个面板都建好之后再初始化：init 会立刻 apply 一次，
+    /* 弹簧必须在面板建好之后初始化：init 会立刻 apply 一次，
      * 由 sheet_visual_sync() 把初始视觉（面板在屏幕外、遮罩不可见）落地 */
     ui_spring_init(&s_spr_cc, -(float)UI_CC_PANEL_H,
                    -(float)UI_CC_PANEL_H, 0.0f, cc_apply_cb, NULL);
-    ui_spring_init(&s_spr_drawer, (float)UI_W,
-                   (float)(UI_W - UI_DRAWER_W), (float)UI_W, drawer_apply_cb, NULL);
 
-    ESP_LOGI(TAG, "control center built (panel_h=%d drawer_w=%d)",
-             (int)UI_CC_PANEL_H, (int)UI_DRAWER_W);
+    ESP_LOGI(TAG, "control center built (panel_h=%d)", (int)UI_CC_PANEL_H);
     return s_cc;
 }

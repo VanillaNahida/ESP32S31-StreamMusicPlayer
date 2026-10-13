@@ -58,6 +58,12 @@ DICT_DIR_DEFAULT = ROOT.parent / "lvgl_pinyin_ime" / "data" / "dict"
 DST = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-subset.ttf"
 DST_JP1 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-jp1.ttf"
 DST_JP2 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-jp2.ttf"
+# ★ 生僻字/补充表**单独一份**（不进主字体）：
+#   LVGL 紧凑字形描述符的 bitmap_index 只有 **20 位** ⇒ 单份字体的字形数据上限 1 MB ✗。
+#   主字体（GB2312+ASCII+符号，4bpp）已经 ~950 KB，再并入 1 万多字会溢出
+#   （真机报 `error: #error "Too large font or glyphs in UI_FONT_SC16"` ✓）。
+#   所以拆分：主字体只放常用字，这一份放"词典新增字 + extra_chars.txt"，用 2bpp。
+DST_DICT = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-dict.ttf"
 
 
 def gb2312_charset() -> set:
@@ -203,23 +209,28 @@ def main() -> int:
     DST.parent.mkdir(parents=True, exist_ok=True)
 
     gb = gb2312_charset()
-    print(f"\n[1/3] 主字体（GB2312 + ASCII + 符号）")
-    print("  从输入法词典补字（生僻字：候选词里会出现，原来会显示成方框 ✗）：")
-    if not args.no_dict:
-        gb |= dict_charset(args.dict_dir)
-    print(f"  合并后 {len(gb)} 个字符")
+    print(f"\n[1/4] 主字体（GB2312 + ASCII + 符号）: {len(gb)} 个字符")
     make_subset(gb, DST)
 
+    # ---- 生僻字/补充表单独一份（2bpp，见 DST_DICT 的说明）----
+    extra = set()
+    if not args.no_dict:
+        extra = dict_charset(args.dict_dir)
+    extra -= gb                      # 主字体已有的不要重复占体积
+    print(f"\n[2/4] 生僻字补充（词典 + extra_chars.txt，减去主字体）: {len(extra)} 个字符")
+    make_subset(extra, DST_DICT)
+
     # 日文补充：只留 GB2312 没有的部分（增量），避免和主字体重复占体积
-    jp1 = (jis_symbols() | jis_level1()) - gb
-    print(f"\n[2/3] 日文常用补充（JIS 区 1~8 记号 + 第 1 水準，减去 GB2312）：{len(jp1)} 个字符")
+    covered = gb | extra
+    jp1 = (jis_symbols() | jis_level1()) - covered
+    print(f"\n[3/4] 日文常用补充（JIS 区 1~8 记号 + 第 1 水準，减去 GB2312）：{len(jp1)} 个字符")
     make_subset(jp1, DST_JP1)
 
-    jp2 = jis_level2() - gb - jp1
-    print(f"\n[3/3] 日文生僻补充（JIS 第 2 水準，减去 GB2312）：{len(jp2)} 个字符")
+    jp2 = jis_level2() - covered - jp1
+    print(f"\n[4/4] 日文生僻补充（JIS 第 2 水準，减去 GB2312）：{len(jp2)} 个字符")
     make_subset(jp2, DST_JP2)
 
-    print("\n下一步 : 运行 tools/font/gen_lvgl_font.py 生成三个 LVGL 字体")
+    print("\n下一步 : 运行 tools/font/gen_lvgl_font.py 生成四个 LVGL 字体（含 dict16）")
     return 0
 
 

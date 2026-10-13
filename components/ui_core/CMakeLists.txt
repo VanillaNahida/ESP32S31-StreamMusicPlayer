@@ -24,6 +24,8 @@ idf_component_register(
         audio_service
         media_meta
         storage_service
+        wifi_service       # 状态栏的 Wi-Fi 图标（只看状态，不直接碰 esp_wifi）
+        bt_service         # 状态栏的蓝牙图标
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)

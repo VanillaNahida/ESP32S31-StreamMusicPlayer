@@ -61,6 +61,26 @@ uint32_t storage_service_sd_generation(void);
 bool storage_service_sd_is_mounted(void);
 
 /*
+ * SD 卡的**三态**（状态栏图标就是照它画的）。
+ *
+ * 板子没有卡检测脚，"卡在不在"只能靠探：挂载失败时再跑一次纯协议层探卡
+ * （bsp_sdcard_presence_probe()，不挂 FATFS）来区分"没插卡"和"插着卡但读不出来"。
+ *
+ *   ABSENT —— 探卡无应答：**没插卡**（状态栏不画 SD 图标）
+ *   READY  —— 已挂载且探得通：**可用**（sd_card_OK）
+ *   ERROR  —— 卡有应答但挂不上，或已挂载的卡不再应答：**卡有问题**（sd_card_WARN）
+ *
+ * ERROR 是**粘**的：只要卡还在（探卡有应答）就一直报 ERROR，直到挂载成功或拔卡。
+ */
+typedef enum {
+    SD_STATE_ABSENT = 0,
+    SD_STATE_READY,
+    SD_STATE_ERROR,
+} sd_state_t;
+
+sd_state_t storage_service_sd_state(void);
+
+/*
  * 立刻重试一次（"设置 → 存储"的「重新检测」按钮用）。
  *
  * 是**同步**的：会尝试挂载并更新代次，返回是否已挂载。调用方在 LVGL 任务里，

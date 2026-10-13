@@ -1,9 +1,13 @@
 /*
- * ui_icons.h —— 烘进固件的位图图标（由 PNG 生成，不要手改分毫）
+ * ui_icons.h —— 烘进固件的位图图标（由 PNG/SVG 生成，不要手改分毫）
  *
  * 生成方式（清单在 assets/icons/icons.txt，一次生成全部）：
  *   tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
  *       --manifest assets/icons/icons.txt -o components/ui_core/ui_icons.c
+ *
+ * 想肉眼看一眼烘出来长什么样（另存 PNG，不参与构建）：
+ *   tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
+ *       --manifest assets/icons/icons.txt --preview build/icons_preview
  *
  * 单个图标也可以临时生成（只写这一个，会覆盖整个 ui_icons.c）：
  *   tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
@@ -24,6 +28,10 @@
  * 桌面就会用位图代替 symbol 文字（见 ui_home.cc 的图标块）；页面里直接
  * `lv_image_set_src(img, &momotalk_icon)` 即可，**尺寸已按显示尺寸烘好**，
  * 不要再让 LVGL 运行期缩放（那是每帧都要重算的）。
+ *
+ * ⚠ 状态栏那批（wifi_s1..sd_warn）是**单色**位图（SVG 按白色烘），显示颜色由
+ *   `lv_obj_set_style_image_recolor()` + `image_recolor_opa = LV_OPA_COVER`
+ *   决定（见 ui_status_bar.cc 的 icon_set()）。别把它们当彩色图用。
  */
 #pragma once
 
@@ -46,6 +54,26 @@ LV_IMAGE_DECLARE(momotalk_icon);
 LV_IMAGE_DECLARE(momotalk_avatar);
 /* 右上角退出 ✕，40x40（来自 MomoTalk.html 那段内联 SVG，按 4 倍重绘后缩小） */
 LV_IMAGE_DECLARE(momotalk_close);
+
+/* ------------------------------------------------------------------ 状态栏（22x22）
+ *
+ * 边长必须与 ui_metrics.h 的 UI_STATUS_ICON 一致（22）：烘好的位图**就是**显示
+ * 尺寸，LVGL 不再做运行期缩放。改尺寸要同时改 icons.txt 并重新生成。
+ */
+/* Wi-Fi 信号 1~4 格（已连接时按 RSSI 选） */
+LV_IMAGE_DECLARE(wifi_s1);
+LV_IMAGE_DECLARE(wifi_s2);
+LV_IMAGE_DECLARE(wifi_s3);
+LV_IMAGE_DECLARE(wifi_s4);
+/* Wi-Fi 开着但没连上（断开 / 连接中 / 失败） */
+LV_IMAGE_DECLARE(wifi_off);
+/* 蓝牙：空闲 / 搜索中 / 已连接 */
+LV_IMAGE_DECLARE(bt_idle);
+LV_IMAGE_DECLARE(bt_searching);
+LV_IMAGE_DECLARE(bt_connected);
+/* microSD：可用 / 异常（未插卡时状态栏不显示任何 SD 图标） */
+LV_IMAGE_DECLARE(sd_ok);
+LV_IMAGE_DECLARE(sd_warn);
 
 #ifdef __cplusplus
 }

@@ -261,25 +261,43 @@ esp_err_t storage_service_init(void)
  *   - 未挂载：每 SD_MOUNT_RETRY_MS 试挂一次，连续失败就退到 SD_MOUNT_SLOW_MS
  *     （没插卡时没必要每 1.5 秒去初始化一次卡）。
  *
+ * ★ 2026-10 改：每次挂载尝试前先给卡做一次**断电重启**
+ * （bsp_sdcard_power_cycle()），拔卡/卸载后立刻断电。原因是板级管理器的电源
+ * 控制只在"设备 init 时"自动上电一次、失败不回退，它的电源设备引用计数一旦
+ * ≥1 就再也不重新 init —— 于是连着失败几次之后卡上一直有电，插拔时卡内部的
+ * 上电初始化序列根本没重跑，SDMMC/FATFS 两边就都停在半初始化状态（用户看到
+ * 的就是"插拔没反应、换卡得重启"）。硬件上 SD_CTRL(GPIO39) 本来就是干这个的。
+ *
  * 状态变化才 +1 代次、才打日志：UI 靠代次判断"要不要刷新"，日志也不刷屏。
  *
- * 并发：挂/卸载都在 s_sd_lock 里做（监控任务 vs 设置页"重新检测"）。CMD13 探针
+ * 并发：挂/卸载/断电都在 s_sd_lock 里做（监控任务 vs 设置页"重新检测"）。CMD13 探针
  * 不需要这把锁 —— IDF 的 SDMMC 驱动自己在每条事务外面就拿了控制器的 mutex
  * （sd_trans_sdmmc.c 的 sd_host_slot_sdmmc_do_transaction() 开头），所以探测和
  * 播放中的 FATFS 读不会撞车，最多互相等一会儿。
  */
 #define SD_PROBE_MS           1000
 #define SD_PROBE_FAIL_MAX     2
+/*
+ * 未挂载时的重试节奏。
+ *
+ * 慢档从 5000 ms 收到 **3000 ms**、门槛从 4 次放到 8 次（2026-10 改）：
+ * 拔卡之后用户去电脑拷完文件再插回来，往往已经过去十几秒 —— 那时早就落进慢档了，
+ * 而"插进去要等 5 秒才认"和"插进去没反应"在体感上没什么区别。
+ * 慢档 3 s = 插卡最迟 ~3.2 s 被发现（快档 1.5 s），代价只是空槽多跑几次
+ * 断电重启 + 探卡（每次几十毫秒，且绝大部分是 vTaskDelay）。
+ */
 #define SD_MOUNT_RETRY_MS     1500
-#define SD_MOUNT_SLOW_MS      5000
-#define SD_MOUNT_SLOW_AFTER   4
+#define SD_MOUNT_SLOW_MS      3000
+#define SD_MOUNT_SLOW_AFTER   8
 /* 栈要够 FATFS 挂载那一趟用（esp_vfs_fat_sdmmc_mount 内部走 sdmmc_card_init +
- * f_mount，IDF 例程里这类任务一般给 4 KB）。 */
+ * f_mount，IDF 例程里这类任务一般给 4 KB）。探卡的 sdmmc_card_t 是 malloc 的，
+ * 不占这里。 */
 #define SD_MON_TASK_STACK     4096
 #define SD_MON_TASK_PRIO      2
 
 static volatile uint32_t s_sd_gen;          /* 状态代号次（每次变化 +1） */
 static volatile bool     s_sd_mounted;      /* 本服务记录的挂载状态 */
+static volatile int      s_sd_state;        /* sd_state_t：给状态栏图标用 */
 static TaskHandle_t      s_sd_task;
 static SemaphoreHandle_t s_sd_lock;         /* 串行化 mount/unmount */
 
@@ -303,6 +321,22 @@ bool storage_service_sd_is_mounted(void)
     return s_sd_mounted;
 }
 
+sd_state_t storage_service_sd_state(void)
+{
+    return (sd_state_t)s_sd_state;
+}
+
+/* 状态只在**真的变了**时写 + 打一行日志（监控任务每秒都在改它，不能刷屏） */
+static void sd_set_state(sd_state_t st)
+{
+    if ((sd_state_t)s_sd_state == st) {
+        return;
+    }
+    s_sd_state = (int)st;
+    ESP_LOGI(TAG, "SD state -> %s", st == SD_STATE_READY ? "ready"
+                                : st == SD_STATE_ERROR ? "error" : "absent");
+}
+
 /* 挂/卸载的唯一入口：都在锁里做，并且只在状态真的变了时才 +1 代次。
  * 锁在 sd_monitor_start() 里建（那时还是单线程上下文），这里只管拿。 */
 static bool sd_lock_take(void)
@@ -315,6 +349,16 @@ static void sd_lock_give(void)
     if (s_sd_lock) {
         xSemaphoreGive(s_sd_lock);
     }
+}
+
+/**
+ * 没插卡时怎么判"卡在不在"：挂载已经失败了，再跑一次纯协议层探卡
+ * （不挂 FATFS）—— 有应答说明"卡在但读不出来"（ERROR），无应答才是"没插卡"。
+ */
+static sd_state_t sd_classify_absent(void)
+{
+    const bsp_sd_presence_t p = bsp_sdcard_presence_probe();
+    return (p == BSP_SD_PRESENT) ? SD_STATE_ERROR : SD_STATE_ABSENT;
 }
 
 /** 返回 true 表示状态发生了变化（代次已 +1） */
@@ -336,22 +380,40 @@ static bool sd_try_mount(bool quiet)
          * 初始化的几十~一百毫秒）。成功那一次自己打一行 INFO，失败不打。
          *
          * 只压"后台重试"这一条路：设置页点「重新检测」时保留日志，那是用户主动
-         * 要看的。
+         * 要看的。断电重启与探卡也在这个窗口里（它们各自都会打 INFO）。
          */
         const esp_log_level_t saved_level = esp_log_get_default_level();
         if (quiet) {
             esp_log_level_set("*", ESP_LOG_NONE);
         }
-        const esp_err_t ret = bsp_sdcard_mount();
+
+        /*
+         * ★ 先断电重启，再挂：新插入的卡只有这样才能稳定地重新跑一遍上电
+         * 初始化（否则它带着上一次的 OCR/状态，ACMD41 经常直接超时）。
+         * 断电失败（板子没配电源设备）不拦着挂载 —— 退化成老行为。
+         */
+        esp_err_t ret = bsp_sdcard_power_cycle();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "sd power cycle failed: %s (继续直接挂)", esp_err_to_name(ret));
+        }
+        ret = bsp_sdcard_mount();
+
+        /* 挂不上时再探一次卡：把"没插卡"和"卡在但读不出来"分开（状态栏图标要用） */
+        const sd_state_t st = (ret == ESP_OK) ? SD_STATE_READY : sd_classify_absent();
+
         if (quiet) {
             esp_log_level_set("*", saved_level);
         }
+
         if (ret == ESP_OK) {
             s_sd_mounted = true;
             sd_gen_bump();
             changed = true;
+            sd_set_state(SD_STATE_READY);
             ESP_LOGI(TAG, "SD inserted at %s (gen %u)", bsp_sdcard_mount_point(),
                      (unsigned)s_sd_gen);
+        } else {
+            sd_set_state(st);
         }
     }
     sd_lock_give();
@@ -373,6 +435,15 @@ static bool sd_drop_mount(void)
         changed = true;
         ESP_LOGW(TAG, "SD removed (gen %u)", (unsigned)s_sd_gen);
     }
+    /*
+     * 顺序要紧：**先探卡再断电**。探卡要有电（CMD8/ACMD41 是卡自己回的），
+     * 而断电之后探谁都只会得到"无应答"，那就永远分不出"拔了"和"坏了"。
+     * 此刻电源还开着 —— 挂载时的上电在板级电源设备里，卸载只是解除引用，
+     * 引脚仍停在使能电平。
+     */
+    sd_set_state(sd_classify_absent());
+    /* 断电：让下一次插入的卡从冷启动开始（挂载期间断电会被 bsp_sdcard_power 拒绝） */
+    bsp_sdcard_power(false);
     sd_lock_give();
     return changed;
 }
@@ -387,22 +458,44 @@ bool storage_service_sd_rescan(void)
 static void sd_monitor_task(void *arg)
 {
     (void)arg;
-    int fail = 0;
-    int mount_fail = 0;
+    int probe_fail = 0;     /* 已挂载时：连续探卡失败次数，到 SD_PROBE_FAIL_MAX 就卸载 */
+    int mount_fail = 0;     /* 未挂载时：连续挂载失败次数，用来把重试间隔放慢 */
 
     for (;;) {
         if (bsp_sdcard_is_mounted()) {
-            fail = 0;
             mount_fail = 0;
-            if (bsp_sdcard_probe() != ESP_OK) {
-                if (++fail >= SD_PROBE_FAIL_MAX) {
-                    fail = 0;
+            if (bsp_sdcard_probe() == ESP_OK) {
+                /*
+                 * ★★ 连续失败计数**只能在探到卡时清零**（2026-10 修）。
+                 *
+                 * 老代码把 `fail = 0;` 写在每一轮循环的**开头**，而一轮只探一次卡 ——
+                 * 于是 `++fail` 永远只到 1，`SD_PROBE_FAIL_MAX`(2) 这个阈值
+                 * **永远达不到**，`sd_drop_mount()` 一次都不会被调用：
+                 *   s_mounted 一直是 true → 监控任务永远走"已挂载"这一支 →
+                 *   再也不会去试挂新插入的卡。
+                 * 表现就是用户报的"SD 卡拔掉后没有轮询去检测新插入的卡"，
+                 * 以及更早那句"每次热插拔都不能正常响应"（卡拔了界面还显示已挂载、
+                 * 换卡要重启）。**清零点写错位置 = 整个热插拔形同不存在**，
+                 * 动这段逻辑前先确认"计数真的能累加上去"。
+                 */
+                probe_fail = 0;
+                sd_set_state(SD_STATE_READY);
+            } else {
+                probe_fail++;
+                /* 先如实报 ERROR（状态栏亮 sd_card_WARN）；连错 SD_PROBE_FAIL_MAX
+                 * 次才真的卸载 —— 一次 CMD13 超时可能只是时序抖动 */
+                sd_set_state(SD_STATE_ERROR);
+                if (probe_fail >= SD_PROBE_FAIL_MAX) {
+                    probe_fail = 0;
                     sd_drop_mount();
+                } else {
+                    /* 拔卡路径上最多打 1 行（下一次就真的卸载了），不算刷屏 */
+                    ESP_LOGW(TAG, "SD probe failed (%d/%d)", probe_fail, SD_PROBE_FAIL_MAX);
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(SD_PROBE_MS));
         } else {
-            fail = 0;
+            probe_fail = 0;
             /* quiet = true：没插卡时每几秒一次的失败尝试不该刷日志 */
             if (!sd_try_mount(true)) {
                 mount_fail++;
@@ -432,6 +525,7 @@ static void sd_monitor_start(void)
     /* 开机时 main 已经试过一次挂载：把结果记下来，否则第一次轮询会误报"插入" */
     s_sd_mounted = bsp_sdcard_is_mounted();
     s_sd_gen = s_sd_mounted ? 1u : 0u;
+    s_sd_state = s_sd_mounted ? SD_STATE_READY : SD_STATE_ABSENT;
     if (xTaskCreate(sd_monitor_task, "sd_mon", SD_MON_TASK_STACK, NULL,
                     SD_MON_TASK_PRIO, &s_sd_task) != pdPASS) {
         s_sd_task = NULL;

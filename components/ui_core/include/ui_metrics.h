@@ -38,10 +38,18 @@
 #define UI_PX_W(n) ((n) * UI_W / UI_REF_W)   /* 横向按宽度缩放 */
 
 #define UI_STATUSBAR_H    UI_PX_H(32)    /* 状态栏高 */
-#define UI_EDGE_HOTZONE   UI_PX_W(24)    /* 边缘手势热区 */
+#define UI_EDGE_HOTZONE   UI_PX_W(24)    /* 边缘手势热区（只有左边缘，见 ui_gesture.cc） */
 #define UI_MIN_TOUCH      UI_PX_H(44)    /* 最小可点区域 */
-#define UI_DRAWER_W       UI_PX_W(280)   /* 右侧抽屉宽 */
 #define UI_CC_PANEL_H     UI_PX_H(400)   /* 控制中心面板高 */
+/*
+ * 状态栏图标边长。
+ *
+ * ⚠ 这是**唯一一个不随 UI_H 缩放的尺寸**：位图是按这个 px 值烘进固件的
+ *   （assets/icons/icons.txt 里那 11 条），而 LVGL 运行期缩放是每帧都要重算的
+ *   （AGENTS.md 第 7 节）。改这里就必须同步改 icons.txt 并重新生成，
+ *   否则图标会被拉伸 —— 所以刻意不给它套 UI_PX_H()。
+ */
+#define UI_STATUS_ICON    (22)
 #define UI_LIST_ROW_H     UI_PX_H(64)    /* 列表行高 */
 #define UI_LIST_COVER     UI_PX_H(48)    /* 列表封面 */
 #define UI_MINI_PLAYER_H  UI_PX_H(56)    /* 迷你播放条高（首页已按需求移除，保留给后续页面复用） */

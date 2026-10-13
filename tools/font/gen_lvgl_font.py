@@ -54,6 +54,7 @@ FONTS_DIR = ROOT / "assets" / "fonts"
 SUBSET_TTF = FONTS_DIR / "DreamHanSansSC-W17-subset.ttf"
 JP1_TTF = FONTS_DIR / "DreamHanSansSC-W17-jp1.ttf"
 JP2_TTF = FONTS_DIR / "DreamHanSansSC-W17-jp2.ttf"
+DICT_TTF = FONTS_DIR / "DreamHanSansSC-W17-dict.ttf"   # 生僻字 + extra_chars（2bpp）
 LVGL_DIR = ROOT / "managed_components" / "lvgl__lvgl"
 FA_WOFF = LVGL_DIR / "scripts" / "built_in_font" / "FontAwesome5-Solid+Brands+Regular.woff"
 SYMBOL_HDR = LVGL_DIR / "src" / "font" / "lv_symbol_def.h"
@@ -65,6 +66,8 @@ SPECS = [
     (SUBSET_TTF, "ui_font_sc16.c",   "ui_font_sc16",   4, True),
     (JP1_TTF,    "ui_font_jp1_16.c", "ui_font_jp1_16", 4, False),
     (JP2_TTF,    "ui_font_jp2_16.c", "ui_font_jp2_16", 2, False),
+    # ★ 生僻字/补充表：2bpp（同 jp2 的理由——省一半体积；LVGL 未压缩路径支持 2bpp）
+    (DICT_TTF,   "ui_font_dict16.c", "ui_font_dict16", 2, False),
 ]
 
 

@@ -36,6 +36,10 @@ extern "C" {
 
 /* 主字体 + 日文 fallback 链的可写包装。用法与普通 lv_font_t 完全一样。 */
 extern lv_font_t ui_font_text;
+/* 生僻字 + extra_chars.txt（2bpp）。挂在 ui_font_text 的 fallback **链尾**：
+ * 常用字走 sc16（4bpp，质量不变），生僻字自动落到这份 —— 见 ui_font.c 的链条说明。
+ * 单独一份的原因：LVGL 紧凑字形描述符的 bitmap_index 只有 20 位 ⇒ 单份字形数据 ≤1MB ✗。*/
+extern lv_font_t ui_font_dict16;
 
 /* 建好 fallback 链。幂等；必须在创建任何标签之前调用一次。 */
 void ui_font_init(void);

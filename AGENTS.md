@@ -1348,10 +1348,10 @@ cfg.io_cfg.buffer_cfg.buffer_size = 64 * 1024;
 顺带把本地 seek 也纳入落点核对（`s_seek_landing_wait` 不再 `streamed ? 10 : 0`——
 本地 `s_stream_io` 就是文件 IO，同样能按字节反推落点）。
 
-### 12.2.1 SD 卡热插拔（2026-10 加）
+### 12.2.1 SD 卡热插拔（2026-10 加，2026-10 补电源控制与三态）
 
 **板子上没有卡检测脚**（板级 YAML 的 `fs_sdcard` 没有 `cd`），所以"卡在不在"
-只能定期试探。三件事合起来才成立，缺一个就会变成"插拔没反应 / 换卡要重启"：
+只能定期试探。下面几件事合起来才成立，缺一个就会变成"插拔没反应 / 换卡要重启"：
 
 1. **探测**：`bsp_sdcard_probe()` 用 **CMD13(SEND_STATUS)** 问卡还在不在。
    ⚠ 不能用 `stat()`/`opendir()` 代替 —— FATFS 把目录项与 FAT 表缓存在内存里，
@@ -1359,26 +1359,48 @@ cfg.io_cfg.buffer_cfg.buffer_size = 64 * 1024;
 2. **卸载**：探测连续失败 `SD_PROBE_FAIL_MAX`(2) 次才 `bsp_sdcard_unmount()`。
    ⚠ 卸载**必须**走板级 `esp_board_manager_deinit_device_by_name("fs_sdcard")`：
    它的 deinit 会 `esp_vfs_fat_sdcard_unmount()` → 内部 `call_host_deinit()`，
-   把 SDMMC 也一起拆干净（`sdmmc_host_deinit()` 里 `s_ctlr=NULL`）。不拆干净的话，
-   重新挂载会在 `sdmmc_host_init_slot()` 上拿到 "slot already initialized"
-   —— 这就是"换了卡也得重启才认"的根因。`sdmmc_host_init()` 自己是幂等的
-   （已建就返回旧句柄），所以关键在 **slot** 有没有被拆。
+   把 SDMMC 也一起拆干净（S31 上 `SDMMC_HOST_FLAG_DEINIT_ARG` 置位，走的是
+   `sdmmc_host_deinit_slot()`，它内部 `sd_host_del_controller()` 成功后同样把
+   `s_ctlr` 置 NULL）。不拆干净的话，重新挂载会在 `sdmmc_host_init_slot()` 上
+   拿到 "slot already initialized" —— 这就是"换了卡也得重启才认"的根因。
+   `sdmmc_host_init()` 自己是幂等的（已建就返回旧句柄），关键在 **slot** 有没有被拆。
 3. **轮询任务**：`storage_service` 里 `sd_monitor_task`（4 KB 栈、优先级 2）——
    已挂载时每 1 s 探一次，未挂载时每 1.5 s 试着挂一次（连续失败退到 5 s，
    免得没插卡时每 1.5 秒初始化一次卡）。挂/卸都过一把互斥锁，设置页的
    「重新检测」（`storage_service_sd_rescan()`）走同一个入口，两边不会同时
    init/deinit 同一个设备。
+4. **★ 电源控制（2026-10 补，热插拔真正生效的关键）**：`SD_CTRL`=GPIO39 是
+   **低电平使能**的卡供电，板级 `sdcard_power_ctrl` 设备管着它。问题是板级管理器
+   **只在"设备 init 时"自动上电一次**，而它的电源设备**引用计数一旦 ≥1 就再也
+   不会重新 init**、init 失败也不回退 —— 于是连续失败几次之后卡上一直有电，
+   插拔时卡内部的上电初始化序列根本没重跑，SDMMC/FATFS 两边都停在半初始化状态。
+   现在由存储服务自己控制：
+   - `bsp_sdcard_power(bool)`：唯一入口（`esp_board_device_power_ctrl()` 的薄封装）。
+     **已挂载时拒绝断电**（会把文件系统从底下抽走），返回 `ESP_ERR_INVALID_STATE`。
+   - `bsp_sdcard_power_cycle()`：断电 → 等 60 ms → 上电 → 再等 60 ms。
+     **每次挂载尝试前都做一次**（`sd_try_mount()` 里）—— 新插入的卡只有这样才能
+     稳定地重跑 ACMD41；卸载后立刻断电（`sd_drop_mount()` 里），让下一张卡冷启动。
+5. **三态（状态栏 SD 图标的数据源）**：`storage_service_sd_state()`
+   —— `ABSENT`(探卡无应答=没插卡) / `READY`(已挂载) / `ERROR`(卡有应答但挂不上，
+   或已挂载的卡不再应答)。区分"没插卡"和"卡坏了"靠
+   `bsp_sdcard_presence_probe()`：不挂 FATFS，自己按板级配置起一次 SDMMC 主机 →
+   `sdmmc_card_init()`（400 kHz）→ 立刻拆主机；**`ESP_ERR_TIMEOUT`/`NOT_FOUND`
+   才算没插卡**，其它错误是"卡在但读不出来"。
+   ⚠ 只在**未挂载**时调；⚠ 卸载路径里必须**先探卡再断电**（断电后探谁都无应答）。
+   ⚠ `sdmmc_card_t` 一千多字节，探卡那次是 `calloc` 的，别放栈上（监控任务栈 4 KB）。
 
 **UI 怎么跟上**：状态每变一次 `storage_service_sd_generation()` **+1**（多处 UI
 各记自己上次见到的代次，比"事件队列"好，不存在谁消费掉了）。用它的有三处：
 
 | 位置 | 行为 |
 | --- | --- |
-| `ui_status_bar.cc` | 500 ms 轮询代次 → 更新 SD 图标 + Toast（插入还报容量） |
+| `ui_status_bar.cc` | 500 ms 轮询三态 + 代次 → SD 图标（没插卡不画 / OK / WARN）+ Toast（插入还报容量） |
 | `app_music` 本地列表页 | 拔卡 → 列表换"未检测到"，**正在放本地歌就停播**并提示；插卡 → 从挂载点重新列一遍（换卡也能认出来） |
 | `app_settings` 存储页 | 代次变了就 `storage_rebuild()` 重画容量/卡信息 |
 
-Toast 只在**状态栏**那一处弹（插入/拔出各一句），页面不重复弹，否则两句会互相覆盖。
+Toast 只在**状态栏**那一处弹（插入/拔出/插进来读不出来的卡各一句），页面不重复弹，
+否则两句会互相覆盖。"已挂载的卡突然不应答"（READY→ERROR）**故意不弹** ——
+单次 CMD13 超时是会有的抖动，连续两次才真卸载，那种情况只让图标变橙。
 
 **轮询的日志必须自己管住**（2026-10 用户报"每秒一行 `BOARD_DEVICE: Device handle
 fs_sdcard found`"）—— 热插拔是每秒/每几秒一次的常态动作，任何 INFO/ERROR 都会刷屏：
@@ -1476,6 +1498,43 @@ System.Drawing，只做格式转换，不改内容）——
   app 分区很紧，加图标前先看 12.3 的余量。
 - ⚠ `-Werror=comment`：在注释里写通配路径别写成 `assets/icons/` 加 `*.png`，
   那个斜杠加星号会被当成嵌套注释而编译失败（踩过）。
+
+**SVG 源直接进清单（2026-10 加）**：`assets/icons/` 里那批状态栏图标是 SVG，
+不需要 cairosvg / PIL / Inkscape —— 同目录的 `tools/icons/svg_raster.py`
+是个纯标准库的极简光栅化器（解析 `d` → 拍平二/三次贝塞尔 → 扫描线 **nonzero**
+填充；`A/a` 圆弧不支持，要用先转曲线）。gen_icon.py 见到 `.svg` 就按
+`SVG_SUPERSAMPLE`(4) 倍渲染，再 box filter 缩到清单里的尺寸
+（= 每边 4 级灰阶、边沿不掉渣）。
+
+- SVG 一律按**白色**烘（`SVG_FILL`）—— 状态栏那几个是**单色位图**，
+  显示颜色由 `lv_obj_set_style_image_recolor()` + `image_recolor_opa = LV_OPA_COVER`
+  决定（`ui_status_bar.cc` 的 `icon_set()`），所以"同一个图标画成暗色/强调色"
+  不用烘两份。⚠ LVGL 的 ARGB8888 是**直混**（非预乘），gen_icon 输出的就是直混，
+  别自己乘 α。
+- 想肉眼看烘出来什么样：`--preview build/icons_preview` 会把每张位图另存成 PNG
+  （`svg_raster.write_png`），拿图片查看器看一眼再进固件。
+
+**常驻状态栏的图标逻辑全在 `ui_status_bar.cc`（2026-10 重做）**：四个图标
+（Wi-Fi / 蓝牙 / 输出通道 / microSD）由一个 500 ms 的 `lv_timer` 从
+`wifi_service` / `bt_service` / `storage_service` 读状态后画出来，
+**没有任何 `ui_status_set_*` 入口**（老版本那四个 setter 是"永远没人调"的占位，
+所以图标常年一动不动，已删）。
+
+| 图标 | 显示规则 |
+| --- | --- |
+| Wi-Fi | 开关关着 → **不显示**；开着没连上 → `wifi_off`（暗）；已连接 → `wifi_s1..s4` 按 RSSI 分档（`rssi_to_level()`，未知(0) 按满格） |
+| 蓝牙 | 开关关着 → **不显示**；已连接/推流 → `bt_connected`（强调色）；搜索中 → `bt_searching`；其余 → `bt_idle`（暗） |
+| SD | `storage_service_sd_state()`：`ABSENT` → 不显示；`READY` → `sd_ok`；`ERROR` → `sd_warn`（强调色） |
+
+- 图标排在一条 **flex row** 里，隐藏用 `LV_OBJ_FLAG_HIDDEN` —— LVGL 的 flex
+  **跳过隐藏子对象**，所以关掉 Wi-Fi 时右边几个会自动收拢，不会留空洞
+  （`align_to` 链做不到，会留洞）。
+- 行宽 `LV_SIZE_CONTENT`、高取 `UI_STATUSBAR_H`：**交叉轴不能是 CONTENT**
+  （`lv_flex.c` 会把 CONTENT 的交叉轴对齐强制成 START，文字符号就贴上边缘了）。
+- 图标边长固定 `UI_STATUS_ICON`(22)，**不随 UI_H 缩放** —— 位图就是按 22 烘的，
+  改这里必须同步改 `icons.txt` 并重新生成。
+- **右侧左滑功能抽屉已按需求整体移除**（`s_spr_drawer` / 右边缘热区 / `UI_DRAWER_W`
+  全删）：右边缘那条 24px 热区会把页面自己的横滑手势全吃掉，现在直接落给控件。
 
 ---
 

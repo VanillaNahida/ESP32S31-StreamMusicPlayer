@@ -39,18 +39,14 @@ void ui_back_button_update(void);
 /* 首页（ui_home.cc） */
 lv_obj_t *ui_home_create(void);
 
-/* 控制中心 / 抽屉对象（ui_control_center.cc） */
-lv_obj_t *ui_sheet_root(void);           /* 控制中心 + 抽屉的共同父容器 */
+/* 控制中心对象（ui_control_center.cc） */
+lv_obj_t *ui_sheet_root(void);           /* 控制中心面板的父容器（top layer） */
 void ui_cc_apply_open(bool open, bool animate);
-void ui_drawer_apply_open(bool open, bool animate);
 bool ui_cc_state(void);
-bool ui_drawer_state(void);
 
-/* 跟手拖动（手势层调用）：dy 为相对按下点的纵向位移，dx 为横向位移（向左为负） */
+/* 跟手拖动（手势层调用）：dy 为相对按下点的纵向位移 */
 void ui_cc_drag(int dy);
 void ui_cc_drag_end(int dy, int vel);
-void ui_drawer_drag(int dx);
-void ui_drawer_drag_end(int dx, int vel);
 
 #ifdef __cplusplus
 }

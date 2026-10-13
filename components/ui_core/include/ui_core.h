@@ -1,7 +1,7 @@
 /*
  * ui_core.h —— UI 框架层对外接口
  *
- * 全局 UI（状态栏 / 控制中心 / 抽屉 / Toast / 手势）挂在 lv_layer_top()，
+ * 全局 UI（状态栏 / 控制中心 / Toast / 手势）挂在 lv_layer_top()，
  * 跨页面常驻；页面切换走 router 的页面栈，不用 lv_screen_load 裸调。
  */
 #pragma once
@@ -54,7 +54,7 @@ int ui_router_depth(void);
  *     不用再画，标题只需让到 UI_HEADER_TEXT_X 给按钮留位；
  *   - 自带返回钮的页面（设置页 make_page_shell）把 page_desc_t.no_back
  *     置 true 即可。
- * 该键建在 lv_layer_top 上、z 序低于控制中心/抽屉/Toast/遮罩：
+ * 该键建在 lv_layer_top 上、z 序低于控制中心/Toast/遮罩：
  * 模态遮罩打开时它会一并被盖住（点不到，符合预期），关闭后自动恢复。
  */
 
@@ -74,24 +74,21 @@ int ui_router_depth(void);
  */
 lv_obj_t *ui_back_button_create(lv_obj_t *parent, lv_align_t align);
 
-/* ------------------------------------------------------------------ 状态栏 */
-
+/* ------------------------------------------------------------------ 状态栏
+ *
+ * 状态栏右半边那四个图标（Wi-Fi / 蓝牙 / 输出通道 / microSD）**由状态栏自己的
+ * 定时器**从 wifi_service / bt_service / storage_service 读状态后画出来
+ * （见 ui_status_bar.cc 的文件头）。这里只留时钟这一个入口：
+ * 时间来自 SNTP + 首页的 tick，不是任何"服务状态"，没法轮询出来。
+ */
 void ui_status_set_clock(const char *hhmm, const char *date_text);
-void ui_status_set_wifi(int level /*0~4*/, bool connected);
-void ui_status_set_bt(bool connected, const char *device_name);
-void ui_status_set_output(const char *channel_name);
-void ui_status_set_sd(bool mounted);
 
-/* ------------------------------------------------------------------ 控制中心 / 抽屉 */
+/* ------------------------------------------------------------------ 控制中心 */
 
 void ui_cc_open(void);
 void ui_cc_close(void);
 void ui_cc_toggle(void);
 bool ui_cc_is_open(void);
-
-void ui_drawer_open(void);
-void ui_drawer_close(void);
-bool ui_drawer_is_open(void);
 
 /* ------------------------------------------------------------------ 轻提示 */
 

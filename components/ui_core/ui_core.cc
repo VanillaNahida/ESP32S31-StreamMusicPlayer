@@ -2,7 +2,7 @@
  * ui_core.cc —— UI 框架层：top layer、Toast、息屏、初始化
  *
  * 层级（自下而上）：当前页面 screen → 上一层 screen（返回手势视差背景）
- *                   → lv_layer_top()（状态栏 / 控制中心 / 抽屉 / Toast / 手势）
+ *                   → lv_layer_top()（状态栏 / 控制中心 / Toast / 手势）
  */
 #include "ui_core.h"
 #include "ui_metrics.h"
@@ -336,22 +336,18 @@ bool ui_screen_is_off(void)
     return s_screen_off;
 }
 
-/* ------------------------------------------------------------------ 控制中心 / 抽屉 状态转发 */
+/* ------------------------------------------------------------------ 控制中心状态转发 */
 
 bool ui_cc_is_open(void)     { return ui_cc_state(); }
-bool ui_drawer_is_open(void) { return ui_drawer_state(); }
 
 /*
- * 控制中心/抽屉一展开就把音量条收掉：音量条也在 lv_layer_top 上、且位置正好在
- * 屏幕右中，压着控制中心的面板与右侧抽屉。这里属于"焦点被拿走"，立刻缩回，
+ * 控制中心一展开就把音量条收掉：音量条也在 lv_layer_top 上、且位置正好在
+ * 屏幕右中，压着控制中心的面板。这里属于"焦点被拿走"，立刻缩回，
  * 不要等 2.5 秒的自动缩回。
  */
 void ui_cc_open(void)   { ui_volume_hide(); ui_cc_apply_open(true, true); }
 void ui_cc_close(void)  { ui_cc_apply_open(false, true); }
 void ui_cc_toggle(void) { ui_cc_apply_open(!ui_cc_state(), true); }
-
-void ui_drawer_open(void)  { ui_volume_hide(); ui_drawer_apply_open(true, true); }
-void ui_drawer_close(void) { ui_drawer_apply_open(false, true); }
 
 /* ------------------------------------------------------------------ 页面返回键 */
 
@@ -364,9 +360,9 @@ void ui_drawer_close(void) { ui_drawer_apply_open(false, true); }
  * 占位页…）自动就有返回键，页面里不用再画。
  *
  * z 序：本对象在 ui_core_init 里**最先**创建，排在它后面的控制中心 /
- * 状态栏 / 抽屉 / Toast / 手势热区都会盖在它上面 —— 模态遮罩（app 运行时
+ * 状态栏 / Toast / 手势热区都会盖在它上面 —— 模态遮罩（app 运行时
  * 新建在 layer_top 上的）也一样。于是：
- *   - 控制中心 / 抽屉展开、搜索遮罩打开时返回键被盖住、点不到（符合预期）；
+ *   - 控制中心展开、搜索遮罩打开时返回键被盖住、点不到（符合预期）；
  *   - 它们关闭后按钮自动恢复可见，无需额外代码。
  */
 static lv_obj_t *s_back_btn;
@@ -482,17 +478,19 @@ esp_err_t ui_core_init(void)
     ui_metrics_selfcheck();
 
     /* 全局层：返回键最先建（z 序最底，见 ui_back_button_global_create 的说明）：
-     * 控制中心 / 抽屉 / Toast / 模态遮罩展开时都能盖住它 */
+     * 控制中心 / Toast / 模态遮罩展开时都能盖住它 */
     ui_back_button_global_create(top);
     ui_cc_create(top);           /* 控制中心（默认隐藏） */
     lv_obj_t *sb = ui_status_bar_create(top);
     ui_toast_create(top);
 
-    /* 手势：顶部下拉控制中心、左右边缘滑动 */
+    /* 手势：顶部下拉控制中心、左边缘返回（右边缘**故意不留热区**：
+     * 原来那里挂的是功能抽屉，已按需求移除，留着会把页面的横滑手势吃掉） */
     ui_gesture_attach(sb);
 
-    /* 音量悬浮条：放在手势热区**之后**创建，这样它显示时压在右边缘热区之上，
-     * 拖音量不会误触功能抽屉；隐藏时整块在屏幕外，热区照常工作。 */
+    /* 音量悬浮条：屏幕右中，仍然放在手势热区**之后**创建 —— 确保它显示时
+     * 一定压在热区之上（右边缘热区随抽屉一起删了，但"后建的在上面"这条纪律
+     * 别丢，将来往边缘加东西时还靠它）。隐藏时整块在屏幕外，热区照常工作。 */
     ui_volume_panel_create(top);
 
     /*

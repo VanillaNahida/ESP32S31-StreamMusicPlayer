@@ -11,10 +11,16 @@ pip 装东西）。所以这里只用标准库 `zlib` 手解 PNG —— 对"图�
 
 口径
 ----
-* 支持 8 bit、非隔行的 PNG：灰度(0)/真彩(2)/调色板(3)/灰度+α(4)/真彩+α(6)；
-  1/2/4 bit 与 Adam7 隔行会直接报错退出（图标不该是那种）。
+* 源图支持 **PNG** 与 **SVG**：
+  - PNG：8 bit、非隔行，灰度(0)/真彩(2)/调色板(3)/灰度+α(4)/真彩+α(6)；
+    1/2/4 bit 与 Adam7 隔行会直接报错退出（图标不该是那种）。
+  - SVG：交给同目录的 `svg_raster.py`（纯标准库的极简光栅化器）按
+    `SVG_SUPERSAMPLE`(4) 倍渲染，再由下面的 box filter 缩到目标尺寸 ——
+    这样 SVG 也能有干净的抗锯齿，**不需要 cairosvg / PIL / Inkscape**。
 * 输出 **ARGB8888**（LVGL 的字节序是 B,G,R,A）—— 带 alpha，能直接盖在首页那个
   圆角色块上；缩放用面积平均（box filter），缩小时比最近邻干净得多。
+  运行时可以用 `lv_obj_set_style_image_recolor()` 给单色图标上色
+  （状态栏那几个就是这么用的），所以 SVG 一律按白色烘。
 * 目标尺寸默认按 `UI_HOME_ICON`（96 px）给，改 -s 可覆盖。**渲染成显示尺寸**，
   避免 LVGL 运行期缩放（那是每帧都算的）。
 
@@ -23,6 +29,10 @@ pip 装东西）。所以这里只用标准库 `zlib` 手解 PNG —— 对"图�
     tools\\font\\venv\\Scripts\\python.exe tools\\icons\\gen_icon.py
         assets/icons/netease.png --name netease_logo --size 96
         -o components/ui_core/ui_icons.c
+
+    # 一次生成全部（含 .svg，最容易的核对方式：--preview 另存 PNG 看一眼）
+    tools\\font\\venv\\Scripts\\python.exe tools\\icons\\gen_icon.py \\
+        --manifest assets/icons/icons.txt --preview build/icons_preview
 """
 import argparse
 import struct
@@ -30,9 +40,24 @@ import sys
 import zlib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+try:
+    from svg_raster import render_svg, write_png
+except ImportError:      # 只有 .svg 素材才需要它，缺了也不该让 PNG 流程挂掉
+    render_svg = None
+    write_png = None
+
 ROOT = Path(__file__).resolve().parents[2]
 
 CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}   # colortype → 每像素通道数（8 bit）
+
+# .svg 素材的超采样倍数：先按 size*SS 光栅化，再由下面的 resize_rgba() 做
+# box filter 缩到显示尺寸 —— 这样边沿像素有 SS² 级灰阶（4 倍 = 16 级）。
+SVG_SUPERSAMPLE = 4
+
+# .svg 的填充色。**运行时用 image_recolor 上色**（见 ui_status_bar.cc），
+# 所以这里一律烘成白色：万一某处忘了上色，白色也是唯一在深色底上看得见的颜色。
+SVG_FILL = (255, 255, 255)
 
 
 def paeth(a: int, b: int, c: int) -> int:
@@ -226,13 +251,31 @@ FILE_HEADER = """/*
 """
 
 
+def load_source(src: Path, size: int):
+    """读一个源文件 → (w, h, rgba, note)。
+
+    .png 直接解（decode_png）；.svg 先用 svg_raster 按 size*SVG_SUPERSAMPLE 光栅化
+    （抗锯齿靠随后的 box filter 缩小），所以两者在下游是同一种数据。
+    """
+    if src.suffix.lower() == ".svg":
+        if render_svg is None:
+            sys.exit("缺 tools/icons/svg_raster.py，无法处理 .svg 素材")
+        w, h, rgba = render_svg(src, size, SVG_SUPERSAMPLE, SVG_FILL)
+        return w, h, rgba, f"（SVG，{SVG_SUPERSAMPLE}x 超采样后缩到 {size}）"
+    w, h, rgba = decode_png(src)
+    note = "" if w == h else f"（源 {w}x{h} 非正方形，按 {size}x{size} 拉伸）"
+    return w, h, rgba, note
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("png", nargs="?", help="单个 PNG 源（不用 --manifest 时必填）")
+    ap.add_argument("png", nargs="?", help="单个 PNG/SVG 源（不用 --manifest 时必填）")
     ap.add_argument("--manifest", default=None,
                     help="图标清单文件：每行 `路径 符号名 尺寸`，# 开头是注释")
     ap.add_argument("--name", default="netease_logo")
     ap.add_argument("--size", type=int, default=96, help="输出边长（默认 UI_HOME_ICON=96）")
+    ap.add_argument("--preview", default=None,
+                    help="把烘好的位图另存成 PNG 目录（肉眼核对用，不参与构建）")
     ap.add_argument("-o", "--out", default=None)
     a = ap.parse_args()
 
@@ -255,8 +298,17 @@ def main() -> int:
             sys.exit("清单里一个图标都没有")
     else:
         if not a.png:
-            sys.exit("要么给一个 PNG 源，要么用 --manifest")
+            sys.exit("要么给一个 PNG/SVG 源，要么用 --manifest")
         jobs.append((a.png, a.name, a.size))
+
+    preview_dir = None
+    if a.preview:
+        preview_dir = Path(a.preview)
+        if not preview_dir.is_absolute():
+            preview_dir = ROOT / preview_dir
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        if write_png is None:
+            sys.exit("缺 tools/icons/svg_raster.py，无法写 --preview")
 
     blocks = []
     px_bytes = 0
@@ -266,11 +318,12 @@ def main() -> int:
             src = ROOT / src
         if not src.exists():
             sys.exit(f"找不到 {src}")
-        w, h, rgba = decode_png(src)
-        note = "" if w == h else f"（源 {w}x{h} 非正方形，按 {size}x{size} 拉伸）"
+        w, h, rgba, note = load_source(src, size)
         print(f"{src.name:<26} {w}x{h} -> {name:<18} {size}x{size} {note}")
         px = resize_rgba(w, h, rgba, size, size)
         px_bytes += len(px)
+        if preview_dir:
+            write_png(preview_dir / f"{name}.png", size, size, px)
         blocks.append(emit_icon(name, size, size, px, f"assets/icons/{src.name}"
                                 if src.parent.name == "icons" else f"assets/{src.name}"))
 

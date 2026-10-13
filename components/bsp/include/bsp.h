@@ -68,6 +68,51 @@ esp_err_t bsp_sdcard_capacity_kb(uint32_t *total_kb, uint32_t *free_kb);
 esp_err_t bsp_sdcard_probe(void);
 
 /*
+ * SD 卡**供电控制**（SD_CTRL = GPIO39，低电平使能）。
+ *
+ * 为什么需要它（2026-10 真机结论）：板级管理器只在"设备 init 时"自动给卡上电
+ * （`power_ctrl_device` 机制），而且它的电源设备**引用计数一旦 ≥1 就再也不会
+ * 重新 init**，init 失败也不回退 —— 于是连着失败几次之后电源 GPIO 就不再被
+ * 重新配置，卡上一直有电，插拔时卡内部的状态机从来没被复位过；
+ * SDMMC/FATFS 两边都停在半初始化状态，表现就是"插拔没反应、换卡要重启"。
+ *
+ * @param on true = 上电，false = 断电。
+ * @return ESP_OK；ESP_ERR_NOT_FOUND（板子没有 fs_sdcard）；
+ *         **ESP_ERR_INVALID_STATE：想给"已挂载"的卡断电**（会把文件系统从
+ *         底下抽走，一律拒绝）。
+ */
+esp_err_t bsp_sdcard_power(bool on);
+
+/*
+ * 给卡做一次**彻底断电重启**：断电 → 等 60 ms → 上电 → 再等 60 ms。
+ * 新插入的卡只有这样才能稳定地重新走一遍上电初始化序列（ACMD41），
+ * 否则卡还留着上一次的 OCR/状态，握手经常直接超时。
+ *
+ * ⚠ 只能在**未挂载**时调用（已挂载返回 ESP_ERR_INVALID_STATE）。
+ * ⚠ 阻塞约 120 ms，别在 LVGL 任务里调（存储服务的监控任务会调）。
+ */
+esp_err_t bsp_sdcard_power_cycle(void);
+
+/*
+ * 纯协议层探卡：**不挂 FATFS**，也不需要卡已经挂载 —— 用来区分"没插卡"与
+ * "插着卡但读不出来"（板子没有卡检测脚，只有把 SDMMC 起起来发一次初始化
+ * 序列才知道卡到底在不在）。
+ *
+ * 做法：复用板级 fs_sdcard 的引脚/位宽/slot 配置，自己起一次 SDMMC 主机、
+ * 跑一次 sdmmc_card_init()、然后立刻把主机拆掉（不拆会让下一次挂载拿到
+ * "slot already initialized"）。开销 = 一次卡初始化（几十~几百毫秒）。
+ *
+ * ⚠ 只能在**未挂载**时调用（挂载期间 SDMMC 主机归 FATFS 用）。
+ */
+typedef enum {
+    BSP_SD_ABSENT = 0,   /* 卡不应答（超时/无响应）→ 判定"没插卡" */
+    BSP_SD_PRESENT,      /* 卡有应答（哪怕 FATFS 挂不上）→ 判定"卡在" */
+    BSP_SD_UNKNOWN,      /* 探不出来（板子没这个设备 / 起主机失败）→ 别下结论 */
+} bsp_sd_presence_t;
+
+bsp_sd_presence_t bsp_sdcard_presence_probe(void);
+
+/*
  * SD 卡的**物理信息**（"设置 → 存储"详情页用；容量之外的那些）。
  * 取不到的字段保持 0 / 空串，不报错 —— UI 少显示一行即可。
  *

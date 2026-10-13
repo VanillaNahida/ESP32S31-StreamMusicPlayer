@@ -4,16 +4,19 @@
  * 判定优先级（开发指南 5.7）：
  *   1. 顶部状态栏按下         → 控制中心下拉（跟手）
  *   2. 左边缘 24px 内按下     → 返回（跟手 + 底层页面视差）
- *   3. 右边缘 24px 内按下     → 打开右侧功能抽屉
- *   4. 其余                   → 交给控件
+ *   3. 其余                   → 交给控件
  *
- * 动画层（docs/UI-suggest.md）：三种手势全部走 ui_spring 常驻弹簧，**没有**
+ * ⚠ 2026-10 需求：**移除右侧左滑功能抽屉**。原来右边缘那条 24px 热区会把所有
+ *   "从右边缘往左滑"吃掉（列表横滑、卡片滑动手势全收不到），现在整条右边缘没有
+ *   任何热区，触摸直接落给页面控件。
+ *
+ * 动画层（docs/UI-suggest.md）：手势全部走 ui_spring 常驻弹簧，**没有**
  * "停掉动画 A → 新建动画 B"的第二套代码路径。
  *   拖动中 → ui_spring_hold() 冻结物理，ui_spring_set_value() 由手指驱动；
  *   松手后 → ui_spring_release() 只改 target，位置与速度都连续。
  * 因此任一动画跑到一半时再触摸，都会从**当前**位置/速度被手指接管。
  *
- * 实现方式：在 top layer 上放三个边缘热区对象（顶部状态栏本身 + 左右各 24px 的
+ * 实现方式：在 top layer 上放边缘热区对象（顶部状态栏本身 + 左侧 24px 的
  * 透明条），这样不会拦截页面中部控件的正常触摸。
  */
 #include "ui_core.h"
@@ -26,7 +29,7 @@
 
 static const char *TAG = "ui_gesture";
 
-typedef enum { G_IDLE = 0, G_CC, G_BACK, G_DRAWER } gesture_t;
+typedef enum { G_IDLE = 0, G_CC, G_BACK } gesture_t;
 
 /* 返回手势的运动阶段：退栈只在 BACK_SETTLE_COMMIT 到位后发生，
  * 因此在它之前任何时刻都能被新触摸改回 target（= 可打断） */
@@ -79,7 +82,7 @@ static void on_pressed(lv_event_t *e, gesture_t mode)
 
     /* 有面板展开时，边缘热区/状态栏都不能再抢触摸：
      * 点"任意处关闭"要交给遮罩，否则触摸会被热区吃掉，表现为点了没反应。 */
-    if (ui_cc_is_open() || ui_drawer_is_open()) {
+    if (ui_cc_is_open()) {
         s_mode = G_IDLE;
         return;
     }
@@ -278,10 +281,6 @@ static void on_pressing(lv_event_t *e)
     case G_BACK:
         back_drag(dx);
         break;
-    case G_DRAWER:
-        /* 同理：过原点后回拖也应跟手 */
-        ui_drawer_drag((int)dx);
-        break;
     default:
         break;
     }
@@ -316,9 +315,6 @@ static void on_released(lv_event_t *e)
         if (s_back_phase == BACK_DRAG) {
             back_finish(should_commit(dx, 0, UI_W) && ui_router_depth() > 1);
         }
-        break;
-    case G_DRAWER:
-        ui_drawer_drag_end((int)dx, 0);
         break;
     default:
         break;
@@ -381,7 +377,9 @@ void ui_gesture_attach(lv_obj_t *status_bar)
 
     lv_obj_t *top = lv_layer_top();
 
-    /* 2) 左边缘 → 返回（跟手 + 视差） */
+    /* 2) 左边缘 → 返回（跟手 + 视差）。
+     * 右边缘**故意没有热区**：那里原来挂的是功能抽屉，已按需求移除；
+     * 留着热区会把页面自己的横滑手势全吃掉。 */
     lv_obj_t *left = make_edge_strip(top, true);
     lv_obj_add_event_cb(left, [](lv_event_t *e) { on_pressed(e, G_BACK); },
                         LV_EVENT_PRESSED, NULL);
@@ -389,15 +387,6 @@ void ui_gesture_attach(lv_obj_t *status_bar)
     lv_obj_add_event_cb(left, on_released, LV_EVENT_RELEASED, NULL);
     lv_obj_add_event_cb(left, on_press_lost, LV_EVENT_PRESS_LOST, NULL);
     s_hot[s_hot_n++] = left;
-
-    /* 3) 右边缘 → 功能抽屉 */
-    lv_obj_t *right = make_edge_strip(top, false);
-    lv_obj_add_event_cb(right, [](lv_event_t *e) { on_pressed(e, G_DRAWER); },
-                        LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(right, on_pressing, LV_EVENT_PRESSING, NULL);
-    lv_obj_add_event_cb(right, on_released, LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(right, on_press_lost, LV_EVENT_PRESS_LOST, NULL);
-    s_hot[s_hot_n++] = right;
 
     ESP_LOGI(TAG, "gestures attached (edge=%d, hotzones=%d)",
              (int)UI_EDGE_HOTZONE, s_hot_n);

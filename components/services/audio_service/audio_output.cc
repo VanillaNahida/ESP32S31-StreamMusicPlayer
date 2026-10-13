@@ -114,6 +114,15 @@ static size_t            s_in_cap;         /**< ASRC 输入缓冲容量（字节
 static uint8_t          *s_out_buf;
 static uint32_t          s_out_frames_cap;
 static uint32_t          s_asrc_err;       /**< esp_asrc_process 失败次数 */
+
+/* ★ 2026-10 诊断（用户报 96k/24bit FLAC "播放速度过快"）：
+ * 统计 ASRC 的**累计输入/输出帧数**。稳态下 out/in 必须等于 输出率/输入率
+ * （96000→48000 就是 0.500）；若明显偏大（例如 0.875），说明每块喂给输出链的
+ * 样本比应有值多 ⇒ 内容比真实时间跑得快，而"产/墙 100%"的表象并不矛盾
+ * （那只说明 I2S 一直有数据）。*/
+static uint32_t          s_asrc_in_frames;
+static uint32_t          s_asrc_out_frames;
+static uint32_t          s_asrc_calls;
 static uint32_t          s_asrc_sat;       /**< 输出缓冲被写满（样本被截断）的次数 */
 /**
  * ASRC 累计消耗的 **CPU 周期**。
@@ -604,6 +613,19 @@ static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_byt
             }
             memcpy(s_stage + produced, s_out_buf, n);
             produced += n;
+
+        /* 见 s_asrc_in_frames 的说明：每 ~900 次调用（≈5 秒）打一次采样率比 */
+        s_asrc_in_frames += in_frames;
+        s_asrc_out_frames += out_frames;
+        s_asrc_calls++;
+        if ((s_asrc_calls % 900u) == 0u) {
+            const uint32_t permille = (uint32_t)((uint64_t)s_asrc_out_frames * 1000ull /
+                                                (uint64_t)(s_asrc_in_frames ? s_asrc_in_frames : 1u));
+            ESP_LOGI(TAG, "asrc ratio: %u calls, in %u frames -> out %u frames, "
+                     "out/in = %u/1000（96k->48k 应为 500，44.1k->48k 应为 1088）",
+                     (unsigned)s_asrc_calls, (unsigned)s_asrc_in_frames,
+                     (unsigned)s_asrc_out_frames, (unsigned)permille);
+        }
             done     += chunk;
         }
 

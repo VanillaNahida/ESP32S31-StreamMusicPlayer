@@ -9,6 +9,15 @@
 # ⚠ 源图不是标准 PNG 的先跑 tools/icons/prepare_sources.ps1：
 #   assets/default.png 其实是 JPEG、assets/MomoIcon.png 其实是 ICO、
 #   MomoTalk.html 里那个 ✕ 本来是内联 SVG。清单里只写转换后的 assets/icons/*.png。
+#
+# .svg 源**直接写在这里**即可：gen_icon.py 会用同目录的 svg_raster.py（纯标准库
+# 的极简光栅化器）按 4 倍超采样渲染，再 box filter 缩到目标尺寸 —— 不需要
+# cairosvg / PIL / Inkscape。SVG 一律按**白色**烘，运行时用
+# lv_obj_set_style_image_recolor() 上色（状态栏就是这么做明暗与强调色的）。
+#
+# 核对生成结果（把烘好的位图另存成 PNG，拿图片查看器看一眼）：
+#   tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py \
+#       --manifest assets/icons/icons.txt --preview build/icons_preview
 
 # 桌面 APP 图标
 assets/icons/netease.png            netease_logo        96
@@ -18,3 +27,19 @@ assets/MomoTalk.png                 momotalk_logo       96
 assets/icons/momotalk_icon.png      momotalk_icon       32     # 标题栏左侧圆形图标
 assets/icons/momotalk_avatar.png    momotalk_avatar     44     # 对方头像（圆形裁切）
 assets/icons/momotalk_close.png     momotalk_close      40     # 右上角 ✕（原 SVG）
+
+# 常驻状态栏（ui_status_bar.cc）—— 边长与 UI_STATUS_ICON 对齐，别单独改
+# Wi-Fi：已连接按信号强弱用 wifi1..wifi4；开着但没连上 = wifi_off；关掉开关 = 不显示
+assets/icons/wifi1.svg              wifi_s1             22
+assets/icons/wifi2.svg              wifi_s2             22
+assets/icons/wifi3.svg              wifi_s3             22
+assets/icons/wifi4.svg              wifi_s4             22
+assets/icons/wifi_off.svg           wifi_off            22
+# 蓝牙：已连接 = bt_connected；搜索中 = bt_searching；开着但空闲 = bt_idle；关掉 = 不显示
+assets/icons/bluetooth_24dp.svg     bt_idle             22
+assets/icons/bluetooth_searching.svg bt_searching       22
+assets/icons/bluetooth_connected.svg bt_connected       22
+# microSD：没插卡 = 不显示；插着且可用 = sd_ok；插着但读不出来 = sd_warn
+assets/icons/sd_card_OK_24dp.svg    sd_ok               22
+assets/icons/sd_card_WARN_24dp.svg  sd_warn             22
+
