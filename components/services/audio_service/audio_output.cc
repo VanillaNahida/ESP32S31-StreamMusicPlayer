@@ -277,6 +277,12 @@ static void asrc_close(void)
     }
     s_in_cap = 0;
     s_out_frames_cap = 0;
+    /* ★ 换曲/会话结束时清掉 ASRC 统计：它们是**跨会话累计**的，不清零会把上一首
+     * （比如 44.1k->48k，比值 1088）混进这一首，日志里 662→559 那种"漂移"就是这么来的 ✗。
+     * 真实比值要看**增量**（每次 +460800 in / +230400 out = 精确 0.500 ✓）。*/
+    s_asrc_in_frames = 0;
+    s_asrc_out_frames = 0;
+    s_asrc_calls = 0;
 }
 
 static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
@@ -336,7 +342,7 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
      *    把 SW 重采样器害得空转：
      *
      *      W audio_out: asrc out cap 2357 < ideal 2358 (44100 Hz -> 48000 Hz): 用理想值兜底
-     *      I audio_out: asrc ready (sw): 44100 Hz 2ch -> 48000 Hz 2ch, in 2048 frames -> out cap 2422
+     *      I audio_out: asrc ready (hw): 44100 Hz 2ch -> 48000 Hz 2ch, in 2048 frames -> out cap 2422
      *      I audio_out: play stats: PCM 41 KB/s | 产 1143/5115 ms (22.3%) | asrc 5166 ms
      *      E task_wdt: IDLE1 did not reset ... CPU 1: audio_out
      *      --- fa_resample_process  ← 一直卡在重采样里
@@ -372,7 +378,7 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
 
     /* 把"进/出帧数"一起打出来：非整数比时 out/in 应当 ≈ 目标率 ÷ 源率
      * （44.1k→48k ≈ 1.088）。这个比值不对 = 重采样配置错了，声音必然不对。 */
-    ESP_LOGI(TAG, "asrc ready (sw): %u Hz %uch -> %d Hz %dch, in %u frames -> out cap %u frames",
+    ESP_LOGI(TAG, "asrc ready (hw): %u Hz %uch -> %d Hz %dch, in %u frames -> out cap %u frames",
              (unsigned)src_rate, src_ch, AUDIO_OUT_RATE, AUDIO_OUT_CHANNELS,
              (unsigned)ASRC_MAX_FRAMES, (unsigned)s_out_frames_cap);
     return true;

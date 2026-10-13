@@ -8,6 +8,7 @@
  *   - 文件名常见形如 "Artist - Title.ext"，据此推 title/artist
  */
 #include "storage_service.h"
+#include "media_meta.h"    /* media_meta_read_tags()：扫描时优先读内嵌 ID3/Vorbis 标签 */
 
 #include <stdio.h>
 #include <string.h>
@@ -179,6 +180,32 @@ static void add_track(const char *full_path, const char *name, uint32_t size)
     utf8_copy(stem, sizeof(stem), name);
     strip_ext(stem);
     split_title_artist(stem, t->title, sizeof(t->title), t->artist, sizeof(t->artist));
+
+    /*
+     * ★ 2026-10（用户要求）：**优先用内嵌标签**，文件名只作兜底。
+     *
+     *   优先级：ID3v2 / Vorbis 的 title → 文件名推出来的 title
+     *             ID3v2 / Vorbis 的 artist → 文件名推出来的 artist → 空（显示端兜"未知歌手"）
+     *
+     *   为什么在这里做：`split_title_artist()` 只是按 "Artist - Title" 拆**文件名** ✗，
+     *   文件名一旦不规范（"01 track"、"未知艺人 - xxx"、只有歌名没有歌手…），
+     *   列表 / 播放器页 / 信息弹窗显示的就是错的 ✓。
+     *   而 title/artist 只在**扫描时**填这一次 ✓，所以在这里覆盖等于一次修好三处 ✓
+     *   （storage 的 track_t 就是全应用唯一的本地曲目数据源）。
+     *
+     *   `media_meta_read_tags()` 只读文件开头的标签区（MP3 = ID3v2 帧、FLAC = 元数据块链，
+     *   PICTURE 块按长度跳过 ✓），每个文件是"打开 + 少量读"，扫描开销可接受 ✓；
+     *   不支持的容器返回 NOT_SUPPORTED ⇒ 自然保留文件名兜底 ✓。
+     */
+    media_tags_t tags = {};
+    if (media_meta_read_tags(t->path, &tags) == ESP_OK) {
+        if (tags.title[0]) {
+            utf8_copy(t->title, sizeof(t->title), tags.title);
+        }
+        if (tags.artist[0]) {
+            utf8_copy(t->artist, sizeof(t->artist), tags.artist);
+        }
+    }
 
     s_count++;
 }
