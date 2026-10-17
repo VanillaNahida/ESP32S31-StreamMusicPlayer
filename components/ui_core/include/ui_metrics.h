@@ -59,14 +59,60 @@
 #define UI_PAGE_PAD       UI_PX_W(8)     /* 页面安全区（不放可点元素） */
 
 /*
- * 页面标题行的返回键。
+ * 标题栏（导航栏）与页面返回键。
  *
- * 左边缘 UI_EDGE_HOTZONE 是返回手势热区，它挂在 lv_layer_top 上、z 序高于页面，
- * 所以标题行左侧的按钮**不能贴 x=0**：贴边的话左半截被热区吃掉，按了没反应。
- * 按钮放在热区右侧，标题再让开按钮宽 + 间距。
+ * 版面（2026-10 用户第二次调整后的口径）：
+ *
+ *   ┌─ 状态栏（UI_STATUSBAR_H）────────────┐
+ *   │  12:34                         ▮▮▮  │
+ *   ├─ 导航栏（UI_TITLEBAR_H）────────────┤
+ *   │ ╭────╮                              │   ← 按钮**圆心落在导航栏中线**
+ *   │ │ ◀  │   <标题 / 信息…>             │      （= UI_TITLEBAR_MID，与标题、
+ *   └─╰────╯──────────────────────────────┘       页签、右上角按钮同一条线）
+ *        （下半悬出 UI_BACK_BTN_DIP）
+ *
+ * - 用户原话："返回按钮往左上角调整点，且按钮中心位置与其他元素对齐。"
+ *   于是圆心从"栏的下沿"提到"栏的中线"（UI_TITLEBAR_MID）—— 比原来高 24 px，
+ *   中心与标题、页签、右上角动作按钮在一条线上（它们都由 `LEFT_MID` 居中在
+ *   这一条里）。
+ * - 尺寸取 **UI_BACK_BTN_SIZE = 64 = UI_TITLEBAR_H(48) + 上下各一个 UI_PAGE_PAD(8)**：
+ *   圆心的落点一旦定在中线上，按钮就必然上下各悬出 (SIZE - 栏高)/2 —— 取 64 时
+ *   上边正好贴到**状态栏下沿**（再大 1 px 就顶进状态栏：那是后画的半透明暗条，
+ *   会把圆顶切出一道平口），下边正好压在内容区第一行（各页让开 UI_BACK_BTN_DIP）。
+ *   ⚠ 改这个数必须同步改 `assets/icons/icons.txt` 里 `back_arrow` 的边长并重烘
+ *   （位图是按显示尺寸烘的，不是运行期缩放）。
+ * - 这一条**透明**（不画底），各页自己的背景照旧透出来；
+ *   `UI_TITLEBAR_Y/H` 把"返回钮 + 标题"对齐到同一条上：
+ *   标题在栏里垂直居中（`ui_titlebar_text_dy()` 给出偏移，按标题字体的行盒真算）。
+ * - ⚠ **有控件的页面，栏下第一块内容要让开 `UI_BACK_BTN_DIP`**（= 8 px）：
+ *   按钮是挂在 `lv_layer_top()` 上的，z 序永远最高，会盖住下面的行/页签，
+ *   不让开的话既看不见也点不到（各页的做法见 music_view_local / as_page_shell /
+ *   app_online）。
+ * - 页面自己把这一条的高度留出来：`pad_top = UI_TITLEBAR_Y`（= 状态栏高 + 安全区）。
+ * - 左边缘 UI_EDGE_HOTZONE 是返回手势热区，它挂在 lv_layer_top 上、z 序高于页面
+ *   （也高于页面里的按钮），所以返回钮**不能贴 x=0**：贴边的话左半截被热区吃掉、
+ *   按了没反应。按钮放在热区右侧（UI_BACK_BTN_X）—— 那是"按得到的最左一列"，
+ *   已经贴住左上角了，别再往左挪。
  */
+#define UI_TITLEBAR_Y     (UI_STATUSBAR_H + UI_PAGE_PAD)   /* 这一条的顶（= 页面内容顶） */
+#define UI_TITLEBAR_H     UI_PX_H(48)                      /* 导航栏高 */
+#define UI_TITLEBAR_MID   (UI_TITLEBAR_Y + UI_TITLEBAR_H / 2)   /* 标题/按钮中线 */
 #define UI_BACK_BTN_X     UI_EDGE_HOTZONE
-#define UI_BACK_BTN_SIZE  UI_PX_H(36)
+/*
+ * 返回钮边长 = 烘好的 back_arrow 边长（assets/icons/icons.txt）。
+ * ⚠ 尺寸沿革：36（太小）→ 72（用户要求翻倍）→ **64**（圆心提到导航栏中线，
+ *   见上面的说明；72 会顶进状态栏 4 px）。
+ */
+#define UI_BACK_BTN_SIZE  UI_PX_H(64)
+/* ★ 圆心落在导航栏中线上（与标题、页签、右上角按钮同一条线） */
+#define UI_BACK_BTN_Y     (UI_TITLEBAR_MID - UI_BACK_BTN_SIZE / 2)
+/*
+ * 按钮悬到内容区的高度：栏下第一块控件要让开这么多。
+ * 圆心在栏的中线上 ⇒ 下沿比栏的下沿多出 (按钮 - 栏高)/2；
+ * 按钮比栏还矮时是 0（全在栏里）。
+ */
+#define UI_BACK_BTN_DIP   ((UI_BACK_BTN_SIZE) > (UI_TITLEBAR_H) \
+                           ? (((UI_BACK_BTN_SIZE) - (UI_TITLEBAR_H)) / 2) : 0)
 #define UI_HEADER_TEXT_X  (UI_BACK_BTN_X + UI_BACK_BTN_SIZE + UI_PX_W(8))
 
 /* 主题色（深色） */

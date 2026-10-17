@@ -20,13 +20,36 @@
  *    "写硬件的 PCM 恒为 48 kHz/16bit/2ch"（进度条、看门狗、seek 都按 192 B/ms 算）；
  * 3. 输出三路（扬声器/蓝牙/静音）与功放、静音时序是板级需求，库里没有。
  *
- * ── 重采样为什么用 esp_asrc 的**软件**路径 ───────────────────────────────────
- * S31 有硬件 ASRC，但硬件路径要经 GDMA 访问 PSRAM 缓冲，对 cache-line 对齐与
- * 一致性有硬要求；bt_service 已经踩过"先慢放、几秒后全是噪音"的坑并退回软件路径
- * （见 bt_service.cc 里 bt_asrc_open() 的长注释）。这里沿用同样的选择：
- * SW_SPEED + complexity 3，44.1k→48k 立体声每秒不到 200 KB，320 MHz 上余量充足。
- * 想试硬件就把 perf_type 换成 ESP_ASRC_PERF_TYPE_AUTO，并改用
- * esp_asrc_get_buffer_alignment()/esp_asrc_align_alloc() 分配缓冲。
+ * ── 重采样：**硬件** ASRC（2026-10 换，软件路径已被真机证伪）─────────────
+ * S31 自带 ASRC 外设（`SOC_ASRC_SUPPORTED`，2 个 stream、每 stream 1~2 通道），
+ * `espressif/esp_asrc` 的 `ESP_ASRC_PERF_TYPE_AUTO` 会把它挂到 GDMA 上跑。
+ *
+ * 为什么必须换：软件路径（`ESP_ASRC_PERF_TYPE_SW_SPEED`）= esp_audio_effects 的
+ * `esp_ae_rate_cvt`，44.1k→48k 立体声在真机上**吃掉一个整核**，现场日志：
+ *
+ *     audio_out: play stats: 产 2125 ms / 墙 5018 ms (42.3%)
+ *                | asrc 5047 ms (cpu 5047 ms)        ← 100% 的墙钟
+ *     task_wdt: IDLE1 没喂狗，CPU 1: audio_out，MEPC 在 fa_resample_process
+ *
+ * 换成硬件后同一个换算的 CPU 占用≈0（任务阻塞在 DMA 完成事件上）。
+ *
+ * 硬件路径有两条硬约束，下面代码全部照做：
+ *   1. **缓冲必须是内部 RAM（或 cache-line 对齐的 PSRAM）**：`esp_asrc_hw_process()`
+ *      用 GDMA 读写，PSRAM 要先 msync、地址/长度还要按 cache line 对齐。我们把
+ *      in/out 一律放**内部 RAM**并按 `esp_asrc_get_buffer_alignment()` 对齐 ——
+ *      GDMA 完全不碰 PSRAM，也就没有"先慢放、几秒后全是噪音"那类一致性问题
+ *      （bt_service 当年就踩过，见 bts_audio.cc 里 bt_asrc_open() 的长注释）。
+ *   2. **S31 的硬件 ASRC 只认 16-bit / 1~2ch / 6 种标准采样率**
+ *      （`esp_asrc/hw/caps/esp32s31/asrc_caps_check.c`）。ringbuf 本来就是 16-bit
+ *      （espaudiocore `cfg.output_bits=16`），所以这条路成立；22050 Hz 这种不在
+ *      表里的率由 AUTO 自动退回软件（日志写 `asrc ready (sw)`）。
+ *
+ * ⚠ 硬件 ASRC 一共只有 **2 个 stream**，立体声一占就是 2 个 —— 也就是"同时只能有
+ *   一路立体声硬件重采样"。bt_service 那条（48k → A2DP 协商率）刻意继续走软件，
+ *   免得跟这里抢；万一抢了也只是 AUTO 自动退回软件，不会失败。
+ *
+ * 选哪条路是 **menuconfig** 的 `Audio Service → 输出级 ASRC 性能模式`
+ * （AUTO / HW_ONLY / SW_SPEED），默认 AUTO。
  *
  * ── 时间轴 ─────────────────────────────────────────────────────────────────
  * s_played_bytes 统计的是**送去硬件的 48k/16/2 字节数**，所以
@@ -53,12 +76,10 @@
 static const char *TAG = "audio_out";
 
 /*
- * 一次读 ringbuf / 喂 ASRC 的**最大**帧数。
+ * 一次读 ringbuf / 喂 ASRC 的**最大**帧数。两条路径的判据完全不同，别合并成一个数。
  *
- * ★★ 2026-10 修（真机"44.1k 的 FLAC 板载播放异常卡顿"）：这个值直接决定
- *    "硬件会不会断粮"，**不能往大改**。
- *
- * 现场日志（44100 Hz/2ch/16bit FLAC，route 0）：
+ * 【软件路径 ASRC_SW_FRAMES = 512】受"硬件缓冲只有 46.4 − 37.2 ≈ 9.2 ms"约束。
+ * 现场日志（44100 Hz/2ch/16bit FLAC，route 0，当时软件重采样）：
  *     play stats: 产 5015/5015 ms (100.0%) | codec 4019 ms, asrc 962 ms, wait 7 ms,
  *                 calls 108
  * 每行 108 次调用 / 5015 ms → **每次迭代 46.4 ms**：读 8192 B（= 2048 帧 @44.1k
@@ -71,15 +92,64 @@ static const char *TAG = "audio_out";
  * 每 46 ms 断一次粮（≈21 次/秒）就是听感上的"异常卡顿"。
  * （也解释了为什么只有需要重采样的 44.1k/32k/22.05k 卡：48k 直通时 asrc = 0 ms。）
  *
- * 所以判据是 **每次迭代的 ASRC 计算时间 << 9.2 ms 的硬件余量**：
+ * 所以软件路径的判据是 **每次迭代的 ASRC 计算时间 << 9.2 ms 的硬件余量**：
  *     2048 帧 → 8.9 ms   ← 余量 0.3 ms，等于没有（旧值）
  *      512 帧 → 2.2 ms   ← 余量 7.0 ms
  *      256 帧 → 1.1 ms   ← 余量 8.1 ms（迭代次数更多，固定开销开始显出来）
- * 取 512：余量足够，迭代次数（≈86 次/秒）带来的固定开销仍然可忽略。
+ * 软件路径只在"硬件不可用"（22050 Hz、或 hardware stream 被抢）时才走。
  *
+ * 【硬件路径 ASRC_HW_FRAMES = 1024】硬件是**突发**转换：数据由 GDMA 喂进 ASRC
+ * 外设，esp_asrc_hw_process() 等到 RX 收帧中断就返回，**不按实时时钟节流**。
+ * 所以"算得慢"不再是约束；块大一点只是为了摊薄每次调用的固定开销
+ * （GDMA 描述符挂载 + 队列等待）。1024 帧 = 23 ms 音频，一次调用通常几百微秒。
+ * ⚠ 1024 只是**上限**：asrc_open() 还会按 ASRC_DMA_BLOCK_MAX(4080 B) 把实际分片
+ *   压下来（44.1k/2ch 时 → 920 帧 ≈ 21 ms），原因见下面那条长注释。
+ *
+ * ⚠ 别改成 8192 这种巨块：esp_asrc_process() 是在**会话锁内**调的，
+ *   单次持锁时间要压住，否则 LVGL 那边调 audio_service_* 会被一起拖住。
  * ⚠ 想改大之前先看 stats 里的 `asrc` 列：它必须明显小于 (迭代时长 − codec 时长)。
  */
-#define ASRC_MAX_FRAMES   512
+#define ASRC_SW_FRAMES    512
+#define ASRC_HW_FRAMES    1024
+/*
+ * ⚠⚠ 硬件路径的**单次转换块上限 = 4080 字节**（输入、输出都算），这条不是性能，
+ *   是**正确性**：esp_asrc 的 GDMA 描述符按 4080 B 一块切（esp_asrc_adapter.c 里
+ *   ASRC_HW_GDMA_DESC_BUFFER_MAX_SIZE = DMA_DESCRIPTOR_BUFFER_MAX_SIZE_16B_ALIGNED
+ *   = 4080），而它**复用**描述符表时只看"历史最大块数"：
+ *       asrc_hw_gdma_create_link_list(byte_cnt, ...)   // 只有 desc_num > max 才重建
+ *       asrc_hw_gdma_mount_link_list(list, max_desc_num, buf, byte_cnt)
+ *   于是"先来一个大块（max=2）、再来一个小块"时，它仍按 2 块挂载：
+ *   第一块固定写 4080 B、第二块拿 byte_cnt-4080（**无符号下溢成 4 GB**）——
+ *   TX 会越界读、RX 的 EOF 永远等不到（表现：`E ESP_HW_ASRC: HW ASRC process
+ *   timeout` + 丢块卡顿）。
+ * 把**输入和输出都压在 4080 B 以内**，描述符个数就恒为 1、挂载长度恒等于实际
+ * 字节数，块大块小都正确 —— 于是 ringbuf 这次给了多少帧（1024 帧的整片、还是
+ * 解码器刚写的半片）都不再是问题。下面 asrc_open() 里的 clamp 就是算这个。
+ */
+#define ASRC_DMA_BLOCK_MAX  4080
+
+/** 单次 esp_asrc_process() 的等待上限（只对硬件路径有意义）。
+ *  超时 = 这次 DMA 没收到帧；200 ms 远大于真实转换耗时（亚毫秒级），
+ *  又足够短，不会把输出任务卡在那儿一整秒。 */
+#define ASRC_TIMEOUT_MS   200
+
+/*
+ * 走硬件还是软件：由 menuconfig 的
+ *   Audio Service → 输出级 ASRC 性能模式
+ * 决定（默认 AUTO）。三个分支的语义：
+ *   AUTO    —— esp_asrc 自己判：硬件能干的都交给硬件（真换采样率的场合），
+ *              只做声道上混（48k mono→stereo）时落回软件的声道转换（很便宜）；
+ *              **硬件 open 失败会自动退回软件，不会没声**。
+ *   HW_ONLY —— 只走硬件；失败时下面 asrc_open() 也会退回软件（宁可慢，不能变调）。
+ *   SW_SPEED—— 旧行为，只走软件（44.1k→48k 要吃一个整核，仅作对照用）。
+ */
+#if defined(CONFIG_AUDIO_OUT_ASRC_PERF_HW_ONLY)
+#define ASRC_PERF_DEFAULT  ESP_ASRC_PERF_TYPE_HW_ONLY
+#elif defined(CONFIG_AUDIO_OUT_ASRC_PERF_SW_SPEED)
+#define ASRC_PERF_DEFAULT  ESP_ASRC_PERF_TYPE_SW_SPEED
+#else
+#define ASRC_PERF_DEFAULT  ESP_ASRC_PERF_TYPE_AUTO
+#endif
 /** 健康度日志窗口 */
 #define STATS_WINDOW_MS   5000
 /** 输出任务栈（只做 memcpy/重采样/写 codec，不要大） */
@@ -113,6 +183,8 @@ static uint8_t          *s_in_buf;
 static size_t            s_in_cap;         /**< ASRC 输入缓冲容量（字节） */
 static uint8_t          *s_out_buf;
 static uint32_t          s_out_frames_cap;
+static uint32_t          s_chunk_frames;   /**< 一次喂给 ASRC 的输入帧数（软 512 / 硬 ≤1024，再按 4080 B 压） */
+static bool              s_asrc_hw;        /**< 本会话的重采样是否真的在硬件上跑（只影响日志/诊断） */
 static uint32_t          s_asrc_err;       /**< esp_asrc_process 失败次数 */
 
 /* ★ 2026-10 诊断（用户报 96k/24bit FLAC "播放速度过快"）：
@@ -277,12 +349,53 @@ static void asrc_close(void)
     }
     s_in_cap = 0;
     s_out_frames_cap = 0;
+    s_chunk_frames = 0;
+    s_asrc_hw = false;
     /* ★ 换曲/会话结束时清掉 ASRC 统计：它们是**跨会话累计**的，不清零会把上一首
      * （比如 44.1k->48k，比值 1088）混进这一首，日志里 662→559 那种"漂移"就是这么来的 ✗。
      * 真实比值要看**增量**（每次 +460800 in / +230400 out = 精确 0.500 ✓）。*/
     s_asrc_in_frames = 0;
     s_asrc_out_frames = 0;
     s_asrc_calls = 0;
+}
+
+/* S31 硬件 ASRC 支持的采样率（esp_asrc/hw/caps/esp32s31/asrc_caps_check.c 的
+ * IS_VALID_SR，缺一不可）。不在表里的率 AUTO 会自动落回软件，这里只是为了让
+ * 日志能说清"这一首走的是哪条路"。 */
+static bool asrc_hw_rate_ok(uint32_t hz)
+{
+    return hz == 8000 || hz == 16000 || hz == 24000 || hz == 32000 ||
+           hz == 44100 || hz == 48000;
+}
+
+/*
+ * ASRC 的输入/输出缓冲：**内部 RAM + 按 cache line 对齐**。
+ *
+ * 为什么不像别处一样优先用 PSRAM：S31 的硬件 ASRC 是**经 GDMA 读写内存**的
+ * （esp_asrc_hw.c: esp_asrc_hw_gdma_*），PSRAM 缓冲在每次 process 前后都要
+ * esp_cache_msync()，而且地址/长度必须 cache-line 对齐，否则返回
+ * ESP_ASRC_ERR_INVALID_ALIGNMENT。缓冲放内部 RAM 之后：GDMA 不碰 PSRAM、
+ * 两条 msync 都变成空操作（asrc_adapter.c 里 esp_ptr_external_ram() 为假），
+ * 也就没有"先慢放、几秒后全是噪音"那类一致性隐患。
+ * 代价很小：512~1024 帧的 in/out 一共 ~14 KB 内部 RAM。
+ *
+ * 内部 RAM 真不够时才退回 PSRAM —— 此时地址与长度都已按 align 对齐，
+ * 组件的对齐检查仍然能过（是合法配置，只是多两次 cache 操作）。
+ */
+static uint8_t *asrc_buf_alloc(size_t size, size_t align, const char *what)
+{
+    if (align < 4) {
+        align = 4;
+    }
+    uint8_t *p = (uint8_t *)heap_caps_aligned_alloc(
+        align, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (!p) {
+        ESP_LOGW(TAG, "%s: 内部 RAM 分配 %u B 失败，退回 PSRAM（含 cache 同步）",
+                 what, (unsigned)size);
+        p = (uint8_t *)heap_caps_aligned_alloc(
+            align, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+    return p;
 }
 
 static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
@@ -294,7 +407,9 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
     cfg.dest_info.sample_rate    = AUDIO_OUT_RATE;
     cfg.dest_info.channel        = AUDIO_OUT_CHANNELS;
     cfg.dest_info.bits_per_sample = AUDIO_OUT_BITS;
-    cfg.perf_type = ESP_ASRC_PERF_TYPE_SW_SPEED;
+    /* ★ 2026-10：默认硬件（见文件头）。ASRC_PERF_DEFAULT 来自 menuconfig，
+     * 硬件 open 失败时下面会退回 SW_SPEED（宁可慢，不能变调）。 */
+    cfg.perf_type = ASRC_PERF_DEFAULT;
     /*
      * complexity 1~3：3 = 质量最好、最慢；1 = 最快、质量最差。
      *
@@ -309,8 +424,8 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
      * 若日志里 `asrc` 那一列仍然很大，下一步是**换更省的重采样**（自研定点多相 FIR，
      * 或按 esp_asrc.h 的官方对齐 API 走 S31 的硬件 ASRC），不要再往 1 降质量。
      */
-    cfg.complexity = 2;
-    cfg.timeout_ms = 1000;
+    cfg.complexity = 2;                    /* 只在软件路径生效（硬件忽略） */
+    cfg.timeout_ms = ASRC_TIMEOUT_MS;      /* 只在硬件路径生效；0 是非法值 */
     if (src_ch != AUDIO_OUT_CHANNELS) {
         /* 单声道 → 立体声：显式给权重，硬件路径也认这种配置 */
         cfg.weight = s_weight;
@@ -319,10 +434,26 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
         s_weight[1] = 1.0f;
     }
 
-    if (esp_asrc_open(&cfg, &s_asrc) != ESP_ASRC_ERR_OK || !s_asrc) {
+    /*
+     * ★ 打开重采样器（硬件优先）。
+     *
+     * 硬件路径会**占用 S31 的 ASRC stream**（共 2 个，立体声一次吃满 2 个），
+     * 并且只认 16-bit / 1~2ch / 6 种标准率 —— 任何一条不满足，esp_asrc_open() 就
+     * 返回 NOT_SUPPORT / FAIL。这种情况（22050 Hz 的音源、bt_service 已经占着
+     * 硬件、AUTO 判硬件不划算…）必须**退回软件**，否则 prepare_block() 会因为
+     * s_asrc == NULL 而当成"直通"，44.1k 按 48k 时钟播 = 快 8.8% = 明显变调。
+     */
+    esp_asrc_err_t orc = esp_asrc_open(&cfg, &s_asrc);
+    if ((orc != ESP_ASRC_ERR_OK || !s_asrc) && cfg.perf_type != ESP_ASRC_PERF_TYPE_SW_SPEED) {
+        ESP_LOGW(TAG, "asrc: 硬件路径开不起来 (%d, %u Hz %uch)，退回软件重采样",
+                 (int)orc, (unsigned)src_rate, src_ch);
+        cfg.perf_type = ESP_ASRC_PERF_TYPE_SW_SPEED;
+        orc = esp_asrc_open(&cfg, &s_asrc);
+    }
+    if (orc != ESP_ASRC_ERR_OK || !s_asrc) {
         s_asrc = NULL;
-        ESP_LOGE(TAG, "asrc open failed: %u Hz %uch -> %d Hz %dch",
-                 (unsigned)src_rate, src_ch, AUDIO_OUT_RATE, AUDIO_OUT_CHANNELS);
+        ESP_LOGE(TAG, "asrc open failed (%d): %u Hz %uch -> %d Hz %dch",
+                 (int)orc, (unsigned)src_rate, src_ch, AUDIO_OUT_RATE, AUDIO_OUT_CHANNELS);
         return false;
     }
     if (esp_asrc_get_bytes_per_sample(s_asrc, &s_in_smp_bytes, &s_out_smp_bytes) != ESP_ASRC_ERR_OK ||
@@ -331,8 +462,41 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
         return false;
     }
 
+    /*
+     * 走没走硬件：AUTO 只在"真的换了采样率 + 采样率在硬件表里 + 1~2ch + 16bit"
+     * 时才让硬件上（esp_asrc.c 的 asrc_hw_pre_check）；只做声道上混（48k mono→stereo）
+     * 时它落回软件的声道转换 —— 那个只做复制，很便宜，不需要麻烦硬件。
+     * 这里的判断只用于**日志与分片大小**，不参与功能决策。
+     */
+    s_asrc_hw = (cfg.perf_type != ESP_ASRC_PERF_TYPE_SW_SPEED) &&
+                (src_rate != AUDIO_OUT_RATE) && asrc_hw_rate_ok(src_rate) && src_ch <= 2;
+    /*
+     * 分片大小：软件路径固定 512 帧；硬件路径还要再按 ASRC_DMA_BLOCK_MAX 压一层。
+     *
+     * 硬件路径的输入字节数 = 帧数 × 源每帧字节，输出字节数 =（帧数 × 目标率/源率 + 16）
+     * × 目标每帧字节 —— **两者都必须 ≤ 4080**，否则 GDMA 描述符会超过 1 块，
+     * 之后就踩上库的"按历史最大块数挂载"那个陷阱（详见 ASRC_DMA_BLOCK_MAX 的注释）。
+     * 16 是库里 RX DMA 额外挂的补偿帧数（ASRC_NUM_BUF_COMP_SZ，内部常量）。
+     */
+    uint32_t chunk = s_asrc_hw ? ASRC_HW_FRAMES : ASRC_SW_FRAMES;
+    if (s_asrc_hw) {
+        uint32_t lim_in  = ASRC_DMA_BLOCK_MAX / s_in_smp_bytes;
+        uint32_t lim_out = ASRC_DMA_BLOCK_MAX / s_out_smp_bytes;
+        lim_out = (lim_out > 16) ? (lim_out - 16) : 1;
+        const uint32_t by_out = (uint32_t)((uint64_t)lim_out * src_rate / AUDIO_OUT_RATE);
+        const uint32_t lim = (lim_in < by_out) ? lim_in : by_out;
+        if (chunk > lim) {
+            chunk = lim;
+        }
+        chunk &= ~7u;               /* 取 8 帧整数倍，日志好读 */
+        if (chunk < 8) {
+            chunk = 8;              /* 兜底：极端比率下也不能是 0 */
+        }
+    }
+    s_chunk_frames = chunk;
+
     uint32_t out_frames = 0;
-    if (esp_asrc_get_out_sample_num(s_asrc, ASRC_MAX_FRAMES, &out_frames) != ESP_ASRC_ERR_OK ||
+    if (esp_asrc_get_out_sample_num(s_asrc, s_chunk_frames, &out_frames) != ESP_ASRC_ERR_OK ||
         out_frames == 0) {
         asrc_close();
         return false;
@@ -351,36 +515,57 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
      *    于是每块都多跑一大截、100% 占核 → 生产端只剩 22%、蓝牙侧 `7 f/s`。
      *    教训：这个值的语义是"库自己算好的**最大**需要多少"，比它大并不安全。
      *
-     *    所以：**一律用库给的值**。当年怀疑它偏小（怕静默截断）的顾虑，改由下面
+     *    所以：**以库给的值为主，只加固定小余量（+64 帧，就是老代码的取值）**，
+     *    绝不按"理论最大值"去放大。当年怀疑它偏小（怕静默截断）的顾虑，改由下面
      *    `esp_asrc_process()` 之后的**饱和自检**（`out_frames >= cap` 时打日志）来兜 ——
      *    真截断了我们能从日志看见，而不是靠猜着放大缓冲。
      */
-    (void)src_rate;
-    /* 非整数比时输出帧数会浮动，留一点余量 */
-    s_out_frames_cap = out_frames + 64;
-    s_in_cap = (size_t)ASRC_MAX_FRAMES * s_in_smp_bytes;
-    const size_t out_sz = (size_t)s_out_frames_cap * s_out_smp_bytes;
+    /*
+     * 输出容量：库算出来的最大输出帧 + 一点余量，再**按 cache line 向上取整**。
+     *
+     * 取整是为了硬件路径：esp_asrc_hw_process() 会拿 "*out_sample_num × 每帧字节"
+     * 去做 PSRAM 对齐检查（asrc_adapter.c: asrc_hw_check_buffer_alignment），
+     * 长度不是 cache line 整数倍就直接返回 ESP_ASRC_ERR_INVALID_ALIGNMENT。
+     * 我们把缓冲放内部 RAM 时这条检查会被跳过，但取整之后"万一退回 PSRAM"也依然合法。
+     *
+     * 硬件路径还会额外要 ASRC_NUM_BUF_COMP_SZ(16) 帧的补偿空间（RX DMA 的描述符
+     * 按 out_num+16 帧挂），而库对 BYPASS 类型不会把 16 帧算进 get_out_sample_num ——
+     * 所以余量给 64 帧，两种类型都够。
+     */
+    size_t align = 64;
+    esp_asrc_buffer_alignment_t al = {};
+    if (esp_asrc_get_buffer_alignment(&al) == ESP_ASRC_ERR_OK && al.outbuf_addr_align >= 4) {
+        align = al.outbuf_addr_align;
+    }
+    size_t cap_sz = ((size_t)out_frames + 64) * s_out_smp_bytes;
+    cap_sz = (cap_sz + align - 1) & ~(align - 1);
+    /* 取整可能切出半个采样帧（align 不是每帧字节的整数倍时，例如 align=32 而
+     * 每帧 24 字节）。本工程输出恒为 16bit×2ch=4 字节、align 又是 2 的幂，所以
+     * 这里不会进循环；留着是为了不让这类组合把任务卡死。 */
+    for (int guard = 0; guard < 16 && (cap_sz % s_out_smp_bytes) != 0; guard++) {
+        cap_sz += align;
+    }
+    s_out_frames_cap = (uint32_t)(cap_sz / s_out_smp_bytes);
+    s_in_cap = (size_t)s_chunk_frames * s_in_smp_bytes;
 
-    /* 软件路径不要求 cache 对齐；优先放 PSRAM（省内部 RAM），失败退内部 RAM */
-    s_in_buf  = (uint8_t *)heap_caps_aligned_alloc(64, s_in_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_out_buf = (uint8_t *)heap_caps_aligned_alloc(64, out_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_in_buf) {
-        s_in_buf = (uint8_t *)heap_caps_aligned_alloc(64, s_in_cap, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
-    if (!s_out_buf) {
-        s_out_buf = (uint8_t *)heap_caps_aligned_alloc(64, out_sz, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    }
+    s_in_buf  = asrc_buf_alloc(s_in_cap, align, "asrc in");
+    s_out_buf = asrc_buf_alloc(cap_sz, align, "asrc out");
     if (!s_in_buf || !s_out_buf) {
-        ESP_LOGE(TAG, "asrc buffer alloc failed");
+        ESP_LOGE(TAG, "asrc buffer alloc failed (in %u B / out %u B)",
+                 (unsigned)s_in_cap, (unsigned)cap_sz);
         asrc_close();
         return false;
     }
 
     /* 把"进/出帧数"一起打出来：非整数比时 out/in 应当 ≈ 目标率 ÷ 源率
-     * （44.1k→48k ≈ 1.088）。这个比值不对 = 重采样配置错了，声音必然不对。 */
-    ESP_LOGI(TAG, "asrc ready (hw): %u Hz %uch -> %d Hz %dch, in %u frames -> out cap %u frames",
-             (unsigned)src_rate, src_ch, AUDIO_OUT_RATE, AUDIO_OUT_CHANNELS,
-             (unsigned)ASRC_MAX_FRAMES, (unsigned)s_out_frames_cap);
+     * （44.1k→48k ≈ 1.088）。这个比值不对 = 重采样配置错了，声音必然不对。
+     * `asrc ready (hw)` = 真的走 S31 的 ASRC 外设；`(sw)` = 软件路径（会吃 CPU）。 */
+    ESP_LOGI(TAG, "asrc ready (%s): %u Hz %uch -> %d Hz %dch | in %u frames/call, "
+                  "out cap %u frames | buf in %u B, out %u B, align %u, timeout %d ms",
+             s_asrc_hw ? "hw" : "sw", (unsigned)src_rate, src_ch,
+             AUDIO_OUT_RATE, AUDIO_OUT_CHANNELS,
+             (unsigned)s_chunk_frames, (unsigned)s_out_frames_cap,
+             (unsigned)s_in_cap, (unsigned)cap_sz, (unsigned)align, ASRC_TIMEOUT_MS);
     return true;
 }
 
@@ -438,8 +623,14 @@ static void write_out(const uint8_t *pcm, size_t bytes, audio_out_t route, int v
         }
     } else if (route == AUDIO_OUT_BLUETOOTH) {
         if (vol > 0) {
-            if (vol < 100) {
-                /* 蓝牙路的音量只能软件做（ES8389 的寄存器对 A2DP 无效） */
+            /*
+             * 音量有两条路，**只能走一条**（同时走就是平方衰减）：
+             *   - AVRCP 绝对音量可用（bt_service_volume_is_avrcp()）：音量早就以
+             *     SetAbsoluteVolume 发给耳机了，**由对端自己衰减** —— 这里原样送 PCM。
+             *   - 不可用（AVRCP Controller 没连上 / 对端不支持）：退回逐样本软件缩放。
+             * 判据是 bt_service 里上一次 set_absolute 的返回值，见 bts_volume.cc。
+             */
+            if (vol < 100 && !bt_service_volume_is_avrcp()) {
                 uint8_t *dst = bt_stage(bytes);
                 if (dst) {
                     memcpy(dst, pcm, bytes);
@@ -484,8 +675,12 @@ static void write_out(const uint8_t *pcm, size_t bytes, audio_out_t route, int v
  * 关键一列是 `产 N ms / 墙 W ms`（交付的音频时长 ÷ 窗口时长）：
  *   - ≈100%：跟得上；
  *   - <99%：**产能不足**，DMA 会被慢慢抽干 → 一卡一卡。这时看后面三列定位：
- *       `asrc` 大 ⇒ 重采样太贵。★ 再看它括号里的 `cpu`：
- *                  `asrc` ≈ `cpu` ⇒ 重采样本身就这么慢（换更省的实现 / 降 complexity）；
+ *       `asrc` 大 ⇒ 重采样太贵。先看末尾标记是 `(asrc-hw)` 还是 `(asrc-sw)`：
+ *                  `(asrc-hw)`：它应该只有几百微秒/窗口，括号里的 `cpu` 也≈0
+ *                  （任务阻塞在 GDMA 完成事件上，不占核）。若它反而很大，说明
+ *                  卡在 DMA/中断上，去看 `E ESP_HW_ASRC: HW ASRC process timeout`；
+ *                  `(asrc-sw)`：再看括号里的 `cpu` ——
+ *                  `asrc` ≈ `cpu` ⇒ 软件重采样本身就这么慢（正是这次被换掉的东西）；
  *                  `asrc` ≫ `cpu` ⇒ **CPU 被同核的别人抢走了**（去找那个任务/中断）；
  *       `wait` 大 ⇒ 解码端供不上（SD/解码/任务被抢，常见于 Wi-Fi 在 core 0 忙）；
  *       `codec` 接近 100% 而前两项都不大 ⇒ 正常（写硬件本来就是被 DMA 节流的）。
@@ -519,8 +714,22 @@ static void stats_tick(void)
              (unsigned long long)asrc_cpu_ms,
              (unsigned long long)(s_stats_wait_us / 1000),
              (unsigned)s_stats_gap_max_ms, (unsigned)s_stats_calls, (unsigned)ring_free,
-             (int)s_route, (unsigned)s_src_rate, s_src_ch, s_asrc ? " (asrc)" : "",
+             (int)s_route, (unsigned)s_src_rate, s_src_ch,
+             s_asrc ? (s_asrc_hw ? " (asrc-hw)" : " (asrc-sw)") : "",
              s_codec_err ? " [codec write errors!]" : "");
+
+    /*
+     * 硬件路径的承诺是"ASRC 每 5 秒只花几百微秒"。若请求了硬件却仍占掉两成以上
+     * 墙钟，说明 AUTO 在 esp_asrc 内部**已经退回软件**（典型原因：S31 只有 2 个
+     * ASRC stream，两路都被 bt_service 之类占满；或者该采样率后来落到软件模块上）——
+     * 上面那行日志还写着 (asrc-hw)，所以这里必须点名，免得被标记误导。
+     */
+    const uint64_t win_us = (uint64_t)win * 1000ull;
+    if (s_asrc_hw && win_us && (s_stats_asrc_us * 100ull) > (win_us * 20ull)) {
+        ESP_LOGW(TAG, "asrc: 标称硬件但本窗口重采样占 %llu%% 墙钟（应亚毫秒级）——"
+                      "AUTO 很可能在 esp_asrc 内部退回了软件（硬件 stream 被占？）",
+                 (unsigned long long)(s_stats_asrc_us * 100ull / win_us));
+    }
 
     s_stats_ms = now;
     s_stats_bytes = 0;
@@ -559,8 +768,8 @@ static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_byt
         /*
          * ★★ 2026-10 修（真机现象："放久了卡顿 → asrc 100% CPU → task_wdt"）：
          *
-         *   `s_out_frames_cap` 是 asrc_open() 按 **ASRC_MAX_FRAMES(=512) 个输入帧**
-         *   向库要来的容量（日志 `asrc ready ... in 512 frames -> out cap 749 frames`），
+         *   `s_out_frames_cap` 是 asrc_open() 按 **s_chunk_frames 个输入帧**
+         *   向库要来的容量（日志 `asrc ready ... in 1024 frames/call, out cap N frames`），
          *   而 ringbuf 一次交给我们的块可能是 **1024 帧**。直接整块喂进去，库当场拒绝：
          *     E ESP_AE_RATE_CVT: The output resample sample buffer is too small(749).
          *     W audio_out: asrc process failed (1024 in-frames, #1)
@@ -571,7 +780,7 @@ static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_byt
          *   所以：**按库声明的块大小分片喂**（每片输入帧数 = 要容量时用的那个数），
          *   容量就永远够、永远不会踩上面那条错误。
          */
-        const uint32_t chunk_max_bytes = (uint32_t)ASRC_MAX_FRAMES * (uint32_t)frame_bytes;
+        const uint32_t chunk_max_bytes = (uint32_t)s_chunk_frames * (uint32_t)frame_bytes;
         size_t done     = 0;      /* 已处理的输入字节数 */
         size_t produced = 0;      /* 已写进 s_stage 的输出字节数 */
 
@@ -581,9 +790,22 @@ static const uint8_t *prepare_block(uint8_t *data, size_t bytes, size_t *out_byt
             const uint32_t in_frames = (uint32_t)(chunk / frame_bytes);
             uint32_t out_frames = s_out_frames_cap;
 
+            if (in_frames == 0 || !s_in_buf ||
+                (size_t)in_frames * frame_bytes > s_in_cap) {
+                break;
+            }
+            /*
+             * 先整片拷进本任务私有的 s_in_buf（内部 RAM），再喂 ASRC：
+             *   - 硬件路径：GDMA 读的必须是内部 RAM（或按 cache line 对齐的 PSRAM），
+             *     而 PCM ringbuf 在 PSRAM 里、切出来的片也不保证对齐 —— 拷一遍就把
+             *     "地址/长度对齐 + cache 一致性"整类问题挡在门外；
+             *   - 软件路径：只是让每次调用都从对齐地址起步（4 KB ≈ 50 µs，可忽略）。
+             */
+            memcpy(s_in_buf, data + done, (size_t)in_frames * frame_bytes);
+
             const int64_t  t0 = esp_timer_get_time();
             const uint32_t c0 = esp_cpu_get_cycle_count();
-            const esp_asrc_err_t rc = esp_asrc_process(s_asrc, data + done, in_frames,
+            const esp_asrc_err_t rc = esp_asrc_process(s_asrc, s_in_buf, in_frames,
                                                       s_out_buf, &out_frames);
             /* 周期只统计"这颗核真的执行了"的时间（被抢占的时段不计），见 s_stats_asrc_cyc */
             s_stats_asrc_cyc += (uint32_t)(esp_cpu_get_cycle_count() - c0);
@@ -872,6 +1094,13 @@ void audio_output_set_route(audio_out_t out)
         bsp_audio_set_mute(true);
         bsp_audio_pa_enable(false);
         bt_service_media_start();
+        /*
+         * 切到蓝牙就把当前音量下发给对端（AVRCP 绝对音量）。
+         * 不做这一步，用户之前在扬声器下把音量调到 30% 再切蓝牙，耳机仍按它
+         * 自己的音量放 —— 一耳朵就是巨响（这也是"音量为平方"之外最容易被忽略的一处）。
+         * 若此刻 AVRCP 还没连上，bt_service 只缓存不发，流启动时会再补一次。
+         */
+        bt_service_set_volume(s_volume);
         break;
 
     case AUDIO_OUT_NONE:
@@ -901,8 +1130,31 @@ void audio_output_set_volume(int percent)
     s_volume = percent;
     if (s_route == AUDIO_OUT_SPEAKER) {
         bsp_audio_set_volume(percent);   /* 扬声器：ES8389 数字音量寄存器 */
+    } else if (s_route == AUDIO_OUT_BLUETOOTH) {
+        /*
+         * 蓝牙：**AVRCP 绝对音量**（esp_bt_audio_vol.h，见 bt_service/bts_volume.cc）。
+         * 由对端去衰减，我们不碰 PCM；只有它不可用时 write_out() 才退回软件缩放。
+         */
+        bt_service_set_volume(percent);
     }
-    /* 蓝牙：每次写 PCM 时按 s_volume 做软件缩放，这里不用做 */
+}
+
+/*
+ * 对端（耳机按键 / 手机）通过 AVRCP 改了音量：只同步本地状态。
+ *
+ * ⚠ 这里**绝对不能**再调 bt_service_set_volume()：那会把值原样发回对端，
+ *   对端又回一条 VOLUME_CHANGE 通知 —— 音量在两个设备之间来回刷（打乒乓）。
+ *   发起的那个方向（用户在本机改音量）才是唯一的"指令源"。
+ */
+void audio_output_note_peer_volume(int percent)
+{
+    if (percent < 0) {
+        percent = 0;
+    }
+    if (percent > 100) {
+        percent = 100;
+    }
+    s_volume = percent;
 }
 
 int audio_output_volume(void)

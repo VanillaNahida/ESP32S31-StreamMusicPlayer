@@ -43,3 +43,14 @@ assets/icons/bluetooth_connected.svg bt_connected       22
 assets/icons/sd_card_OK_24dp.svg    sd_ok               22
 assets/icons/sd_card_WARN_24dp.svg  sd_warn             22
 
+# 标题栏的返回钮（ui_core.cc 的 ui_back_button_create）—— 边长与 UI_BACK_BTN_SIZE 对齐。
+# 素材本身是"蓝色圆底 + 白色左箭头"的整块图标（106x102 RGBA，四角透明），
+# 所以**整张烘进去**、按烘好的尺寸显示，不要再叠 lv_button 的圆底（会露出两层边）。
+# ⚠ 尺寸沿革：36（太小）→ 72（用户要求翻倍）→ **64**（2026-10 用户要求"往左上角挪、
+#   按钮中心与其他元素对齐"）：圆心要落在导航栏中线上，而栏高 UI_TITLEBAR_H(48) +
+#   上下各一个 UI_PAGE_PAD(8) 正好 = 64 —— 上边贴着状态栏下沿、下边正好压到内容区
+#   第一行，一像素都不越界（72 的话会顶进状态栏 4 px：状态栏是后画的半透明暗条，
+#   会把圆顶切出一道平口）。
+#   必须与 ui_metrics.h 的 UI_BACK_BTN_SIZE 一致，改一处就得改两处。
+assets/icons/back.png               back_arrow          64
+

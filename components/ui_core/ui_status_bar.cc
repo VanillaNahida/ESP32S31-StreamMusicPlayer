@@ -106,7 +106,17 @@ static void icon_set(lv_obj_t *img, const void *src, lv_color_t color)
  * 分档按常见系统状态栏口径（-55 以上满格、每 10 dBm 掉一格）。
  * ⚠ wifi_service_rssi() **未知时返回 0**（不是有效 dBm），不能当成"0 dBm 超强"
  * 也不能当成"没信号"：显示满格 —— 连上了却画一格会让人以为要断线。
+ *
+ * ⚠ 2026-10：服务原来**只在连上那一刻**取一次 RSSI，图标永远不变 —— 现在
+ *   wifi_service 里有个 2 s 的定时器持续刷新（见 wifi_rssi_cb），这里拿到的就是
+ *   当前信号强度了。另外加了一层**迟滞**（见下），否则站在两格交界处会看到
+ *   图标 2↔3 每秒闪一次。
  */
+#define WIFI_RSSI_HYST 3   /* dBm：升/降档都要"多走"这么多，防止边界抖动 */
+
+/* 每档的下限：level >= k 需要 rssi >= WIFI_LEVEL_MIN[k]（1 档没有下限，用 -128 占位） */
+static const int WIFI_LEVEL_MIN[5] = { -128, -128, -75, -65, -55 };
+
 static int rssi_to_level(int rssi)
 {
     if (rssi == 0)      return 4;
@@ -114,6 +124,34 @@ static int rssi_to_level(int rssi)
     if (rssi >= -65)    return 3;
     if (rssi >= -75)    return 2;
     return 1;
+}
+
+/* 当前画到第几格：-1 = 还没画过（断开 / 关开关时复位，重连后按新信号直接落位） */
+static int s_wifi_level = -1;
+
+/*
+ * 带迟滞的取档：从当前格出发，只有"越过边界 + WIFI_RSSI_HYST"才动。
+ *   - 升档：rssi >= 上一档下限 + HYST（-55 边缘要 -52 才显示满格）
+ *   - 降档：rssi <  本档下限 - HYST（满格要掉到 -58 以下才降到 3 格）
+ * 这样同一个读数不会被两个相邻档同时"抢"。
+ */
+static int wifi_level_update(int rssi)
+{
+    if (rssi == 0) {                 /* 未知：满格（和 rssi_to_level 一致） */
+        s_wifi_level = 4;
+        return s_wifi_level;
+    }
+    if (s_wifi_level < 1) {          /* 首次（刚连上）：直接落位，不走迟滞 */
+        s_wifi_level = rssi_to_level(rssi);
+        return s_wifi_level;
+    }
+    while (s_wifi_level < 4 && rssi >= WIFI_LEVEL_MIN[s_wifi_level + 1] + WIFI_RSSI_HYST) {
+        s_wifi_level++;
+    }
+    while (s_wifi_level > 1 && rssi < WIFI_LEVEL_MIN[s_wifi_level] - WIFI_RSSI_HYST) {
+        s_wifi_level--;
+    }
+    return s_wifi_level;
 }
 
 static const void *wifi_icon_src(int level)
@@ -126,11 +164,19 @@ static const void *wifi_icon_src(int level)
     }
 }
 
+/* 上次打日志时的 dBm：只在"换格"或"信号动了 8 dBm 以上"时打一行，
+ * 既不刷屏，又能证明数据真的在变（近距离时 RSSI 常常一直满格，
+ * 光看图标会以为"还是不动"） */
+#define WIFI_RSSI_LOG_STEP 8
+static int s_wifi_rssi_logged;
+
 static void apply_wifi(void)
 {
     /* 开关关着 = 射频根本没起（wifi_service_set_enabled(false) 会 deinit）：
      * 需求是"不显示图标"，而不是画一个 wifi_off —— 那时候没有 Wi-Fi 这件事 */
     if (!wifi_service_is_enabled()) {
+        s_wifi_level = -1;
+        s_wifi_rssi_logged = 0;
         icon_set(s_wifi, NULL, UI_COLOR_FG);
         return;
     }
@@ -138,10 +184,22 @@ static void apply_wifi(void)
     const bool connected = (wifi_service_state() == WIFI_ST_CONNECTED) ||
                            wifi_service_has_ip();
     if (!connected) {
+        s_wifi_level = -1;
+        s_wifi_rssi_logged = 0;
         icon_set(s_wifi, &wifi_off, UI_COLOR_FG_DIM);
         return;
     }
-    icon_set(s_wifi, wifi_icon_src(rssi_to_level(wifi_service_rssi())), UI_COLOR_FG);
+    const int prev = s_wifi_level;
+    const int rssi = wifi_service_rssi();
+    const int level = wifi_level_update(rssi);
+    /* 日志：换格必打；没换格但信号明显动过也打一行（现场判断"UI 没画"还是
+     * "服务没刷新"就看这行 —— 只有这行在刷而图标不动，才是 UI 的问题） */
+    if (level != prev || rssi <= s_wifi_rssi_logged - WIFI_RSSI_LOG_STEP ||
+        rssi >= s_wifi_rssi_logged + WIFI_RSSI_LOG_STEP) {
+        ESP_LOGD(TAG, "wifi rssi %d dBm -> %d/4 格", rssi, level);
+        s_wifi_rssi_logged = rssi;
+    }
+    icon_set(s_wifi, wifi_icon_src(level), UI_COLOR_FG);
 }
 
 /* ---------------------------------------------------------------- 蓝牙 */
@@ -156,8 +214,15 @@ static void apply_bt(void)
     if (st == BT_ST_CONNECTED || st == BT_ST_STREAMING || bt_service_is_connected()) {
         /* 蓝色（不是强调色橙）：橙是"警告"色，留给 sd_warn / 音量条那一类 */
         icon_set(s_bt, &bt_connected, UI_COLOR_STATUS_BT_LINK);
-    } else if (st == BT_ST_DISCOVERING || bt_service_is_discovering()) {
+    } else if (st == BT_ST_DISCOVERING || bt_service_is_discovering() ||
+               st == BT_ST_CONNECTING) {
+        /* 搜索中 / **连接中**（2026-10 新增状态）：都是"正在忙"，用同一个亮色图标 ——
+         * 连接最长会到 15 s ×(1+2 次重试)，状态栏上给个亮的不然像卡住了 */
         icon_set(s_bt, &bt_searching, UI_COLOR_FG);
+    } else if (st == BT_ST_CONNECT_FAILED) {
+        /* 连接失败：暗色即可（橙是警告色，留给 SD 读不出来那一类；失败原因在
+         * 设置页的蓝牙页里写明，状态栏不抢注意力） */
+        icon_set(s_bt, &bt_idle, UI_COLOR_FG_DIM);
     } else {
         /* 开着但空闲（含"还在初始化"）：这是蓝牙"平常"的样子 */
         icon_set(s_bt, &bt_idle, UI_COLOR_FG_DIM);

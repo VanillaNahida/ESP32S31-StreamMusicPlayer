@@ -6,6 +6,7 @@
  */
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "esp_log.h"
 
@@ -23,14 +24,81 @@
 static lv_obj_t *s_bt_status;
 static lv_obj_t *s_bt_list;
 static lv_timer_t *s_bt_timer;
-static int        s_bt_sig = -1;
+static char       s_bt_sig[96];
 static bool       s_bt_dirty;
 
 static void bt_rebuild_list(void);
 
+/* 这台设备是不是"正在连 / 刚连失败"的目标 */
+static bool bt_row_is_target(const uint8_t bda[6])
+{
+    const uint8_t *t = bt_service_connect_target();
+    return t && memcmp(t, bda, 6) == 0;
+}
+
+/*
+ * 行右侧的"转圈 + 连接中…"。
+ *
+ * 为什么必须有：以前点设备只弹一句 2 秒的 Toast，**行上什么都没有** —— 连接失败
+ * （原来失败是完全静默的）之后用户看到的就是"点了没反应"。转圈是 lv_spinner 自带的
+ * 无限循环动画，不用自己起定时器。
+ */
+static void bt_add_busy_badge(lv_obj_t *row)
+{
+    lv_obj_t *box = lv_obj_create(row);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+    lv_obj_align(box, LV_ALIGN_RIGHT_MID, 0, 0);
+    lv_obj_set_flex_flow(box, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(box, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(box, UI_PX_W(6), LV_PART_MAIN);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(box, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *sp = lv_spinner_create(box);
+    lv_obj_set_size(sp, UI_PX_H(18), UI_PX_H(18));
+    lv_obj_set_style_arc_width(sp, UI_PX_H(3), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(sp, UI_PX_H(3), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(sp, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(sp, UI_COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_remove_flag(sp, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *l = lv_label_create(box);
+    lv_obj_set_style_text_font(l, UI_FONT_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, UI_COLOR_ACCENT, LV_PART_MAIN);
+    lv_label_set_text(l, "连接中…");
+}
+
+/*
+ * 目标行右侧的状态文字：
+ *   连接中     → 值 label 清空（右边换成转圈）
+ *   连接失败   → "连接失败 · 点此重试"（整行点击就是重试）
+ */
+static void bt_row_apply_connect_state(lv_obj_t *row, const uint8_t bda[6], lv_obj_t *val)
+{
+    if (!val || !bt_row_is_target(bda)) {
+        return;
+    }
+    const bt_state_t st = bt_service_state();
+    if (st == BT_ST_CONNECT_FAILED) {
+        lv_label_set_text(val, "连接失败 · 点此重试");
+        lv_obj_set_width(val, UI_PCT_X(45));
+        lv_obj_set_style_text_color(val, UI_COLOR_ACCENT, LV_PART_MAIN);
+    } else if (st == BT_ST_CONNECTING || bt_service_is_connecting()) {
+        lv_label_set_text(val, "");
+        bt_add_busy_badge(row);
+    }
+    /* 其它状态（比如关开关后的陈旧目标）什么都不画 */
+}
+
 static void on_bt_scan(lv_event_t *e)
 {
     (void)e;
+    if (bt_service_is_connecting()) {
+        /* 连接中不让扫描：查询会和 page/AVDTP 抢射频，把正在进行的连接搅黄 */
+        ui_toast("正在连接设备，请稍后再试", 1800);
+        return;
+    }
     if (bt_service_start_discovery() != ESP_OK) {
         /* 区分"还没初始化完"和"真的起不来"：开机后蓝牙要 1~3 秒才 READY，
          * 这时候点扫描只是太早，不该吓唬用户说蓝牙坏了 */
@@ -50,6 +118,10 @@ static void on_bt_forget(lv_event_t *e)
     if (!bda) {
         return;
     }
+    if (bt_row_is_target(bda)) {
+        ui_toast("正在处理这台设备，请稍候", 1600);
+        return;
+    }
     char addr[18];
     bt_service_addr_str(bda, addr, sizeof(addr));
     if (bt_service_remove_bond(bda) == ESP_OK) {
@@ -62,17 +134,32 @@ static void on_bt_forget(lv_event_t *e)
     s_bt_dirty = true;
 }
 
-/* 点设备 = 发起 A2DP 源连接；没配对过的会在这一步顺手配对（Just Works） */
+/*
+ * 点设备 = 发起 A2DP 源连接；没配对过的会在这一步顺手配对（Just Works）。
+ *
+ * 连接的过程（停查询 → 必要时先断旧对端 → 超时 → 自动重试 2 次）全在
+ * bt_service 的 bts_conn.cc 里；这里只负责"点了之后马上告诉用户发生了什么"：
+ *   - 正在连这台 → 提示"正在连接，请稍后再试"（用户明确要求）；
+ *   - 正在连另一台 → 改连这台（服务会先取消当前尝试/断开旧对端）；
+ *   - 其余失败   → 提示，并把行上标成"连接失败 · 点此重试"。
+ */
 static void on_bt_dev_click(lv_event_t *e)
 {
     const uint8_t *bda = (const uint8_t *)lv_event_get_user_data(e);
     if (!bda) {
         return;
     }
-    if (bt_service_connect(bda) == ESP_OK) {
-        ui_toast("正在连接（首次会自动配对）…", 2000);
+    if (bt_row_is_target(bda) && bt_service_is_connecting()) {
+        ui_toast("正在连接，请稍后再试", 1600);
+        return;
+    }
+    const esp_err_t ret = bt_service_connect(bda);
+    if (ret == ESP_OK) {
+        ui_toast("正在连接（首次会自动配对）…", 1600);
+    } else if (!bt_service_is_ready() || bt_service_state() == BT_ST_UNINIT) {
+        ui_toast("蓝牙正在初始化，稍等 1~2 秒再试", 1800);
     } else {
-        ui_toast("连接失败", 1600);
+        ui_toast("连接请求没发出去，请重试", 1600);
     }
     s_bt_dirty = true;
 }
@@ -122,8 +209,10 @@ static void bt_rebuild_list(void)
         if (!d) {
             continue;
         }
+        lv_obj_t *val = NULL;
         lv_obj_t *row = as_make_row(s_bt_list, d->is_audio ? LV_SYMBOL_AUDIO : LV_SYMBOL_BLUETOOTH,
-                                    0x4A6FA5, d->name, NULL);
+                                    0x4A6FA5, d->name, &val);
+        bt_row_apply_connect_state(row, d->bda, val);
         /* BDA 也拷一份：设备数组在搜索完成后会重建 */
         void *bda_copy = as_row_user_dup(d->bda, 6);
         lv_obj_add_event_cb(row, on_bt_dev_click, LV_EVENT_CLICKED, bda_copy);
@@ -158,6 +247,7 @@ static void bt_rebuild_list(void)
         char info[56];
         snprintf(info, sizeof(info), "%s · %s", addr, d->bonded ? "已配对" : "未配对");
         lv_label_set_text(val, info);
+        bt_row_apply_connect_state(row, d->bda, val);
         void *bda_copy2 = as_row_user_dup(d->bda, 6);
         lv_obj_add_event_cb(row, on_bt_dev_click, LV_EVENT_CLICKED, bda_copy2);
         lv_obj_add_event_cb(row, as_row_user_free, LV_EVENT_DELETE, bda_copy2);
@@ -171,8 +261,16 @@ static void bt_tick(lv_timer_t *t)
     if (!s_bt_status) {
         return;
     }
-    char buf[128];
-    if (bt_service_is_connected()) {
+
+    char buf[160];
+    const uint8_t *tgt = bt_service_connect_target();
+    if (bt_service_is_connecting()) {
+        /* 连接中（含"等重试"阶段）：把目标名字显示出来，用户才知道在等谁 */
+        snprintf(buf, sizeof(buf), "正在连接 %s…", bt_service_peer_name());
+    } else if (bt_service_state() == BT_ST_CONNECT_FAILED) {
+        snprintf(buf, sizeof(buf), "连接 %s 失败（%s）· 点该设备可重试",
+                 bt_service_peer_name(), bt_service_connect_error());
+    } else if (bt_service_is_connected()) {
         snprintf(buf, sizeof(buf), "%s · %s%s",
                  bt_service_peer_name(), bt_service_state_str(),
                  bt_service_stream_rate() ? "" : "（未推流）");
@@ -184,11 +282,37 @@ static void bt_tick(lv_timer_t *t)
     }
     as_label_set_if_changed(s_bt_status, buf);
 
-    const int sig = (int)bt_service_dev_count() * 64 + (int)bt_service_bonded_count() * 4 +
-                    (int)bt_service_state() * 100000 +
-                    (bt_service_is_discovering() ? 1000000 : 0);
-    if (sig != s_bt_sig || s_bt_dirty) {
-        s_bt_sig   = sig;
+    /*
+     * 需要重建列表的判据：状态 / 设备数 / 配对表代次 / 搜索中 / **连接目标**。
+     * 目标必须算进去 —— 否则"从连 A 改成连 B"时状态一直是 CONNECTING，
+     * 转圈会留在 A 那一行上。
+     */
+    char sig[96];
+    snprintf(sig, sizeof(sig), "%d|%u|%u|%d|%s",
+             (int)bt_service_state(),
+             (unsigned)bt_service_dev_count(),
+             (unsigned)bt_service_bonded_count(),
+             bt_service_is_discovering() ? 1 : 0,
+             tgt ? "target" : "-");
+    if (tgt) {
+        size_t used = strlen(sig);
+        for (int i = 0; i < 6 && used + 3 < sizeof(sig); i++) {
+            used += (size_t)snprintf(sig + used, sizeof(sig) - used, "%02x", tgt[i]);
+        }
+    }
+
+    if (strcmp(sig, s_bt_sig) != 0 || s_bt_dirty) {
+        /*
+         * ⚠ 手指正按着列表时**不要重建**：重建会把行对象删掉再建一份，LVGL 会给
+         *   原对象发 PRESS_LOST —— 这次点击就凭空消失了（"点了没反应"的另一个
+         *   来源，扫描期间尤其容易撞上）。延到松手后的下一个 tick 再建。
+         */
+        lv_indev_t *indev = lv_indev_get_next(NULL);
+        if (indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
+            s_bt_dirty = true;
+            return;
+        }
+        snprintf(s_bt_sig, sizeof(s_bt_sig), "%s", sig);
         s_bt_dirty = false;
         bt_rebuild_list();
     }
@@ -203,7 +327,7 @@ static void bt_on_delete(lv_event_t *e)
     }
     s_bt_status = NULL;
     s_bt_list   = NULL;
-    s_bt_sig    = -1;
+    s_bt_sig[0] = '\0';
 }
 
 lv_obj_t *page_bt(void)

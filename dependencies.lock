@@ -1,6 +1,6 @@
 dependencies:
   espressif/button:
-    component_hash: a1f34e8ed2e61ffef1a230fd9477005c2db335c7e1f6a239f43e5f119dcbe1b0
+    component_hash: 7cb7e2944b5828f409af0c92f7fcc0e2d405de09c3325b7ee4a0eba5fb28dfdc
     dependencies:
     - name: espressif/cmake_utilities
       registry_url: https://components.espressif.com
@@ -12,7 +12,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com
       type: service
-    version: 4.2.1
+    version: 4.2.2
   espressif/cjson:
     component_hash: e788323270d90738662d66fffa910bfe1fba019bba087f01557e70c40485b469
     dependencies:
@@ -138,7 +138,7 @@ dependencies:
       type: service
     version: 0.6.2
   espressif/esp_bt_audio:
-    component_hash: 29e088d780794d4a70b2fc05820c95823d8a4556a6cf2e2dc579054dfa5731b6
+    component_hash: 11495eb60c7878fbfc527f929cd31e6c67ecb599193849f73be9f5f75d596191
     dependencies:
     - name: espressif/esp_audio_codec
       registry_url: https://components.espressif.com
@@ -162,7 +162,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 1.1.0~2
+    version: 1.2.0
   espressif/esp_cam_sensor:
     component_hash: 0dd6634a71cc8756f0e46c961476304a23a82db4f4c4deb8aecfa30161d2185c
     dependencies:
@@ -286,7 +286,7 @@ dependencies:
       type: service
     version: 1.0.1
   espressif/esp_lvgl_adapter:
-    component_hash: 6fc22995c88a717743c094b3294f1ac6d9bca4a6a7fa2e47a712c5f5ab13c3e9
+    component_hash: cdc3dfb8f7a0c4b37493ae57bfb63f94ee6f0f3f19c618758e4e46c78ff3f2ba
     dependencies:
     - name: espressif/button
       registry_url: https://components.espressif.com
@@ -322,7 +322,7 @@ dependencies:
     source:
       registry_url: https://components.espressif.com/
       type: service
-    version: 0.7.2
+    version: 0.7.3
   espressif/esp_mmap_assets:
     component_hash: 42310c362596de2a37248c2937b1754bc29cd0356b9839e2a77cf791e6bcdde1
     dependencies:

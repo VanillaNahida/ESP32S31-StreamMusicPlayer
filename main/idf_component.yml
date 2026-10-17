@@ -41,6 +41,10 @@ dependencies:
   # ESP-GMF 的蓝牙音频模块：经典蓝牙 A2DP/AVRCP + LE Audio。
   # 它自己依赖 esp_audio_codec ~2.6 / gmf_core ~1.1 / gmf_io ~1.1，
   # 与本工程已装的 2.6.2 / 1.1.0 / 1.1.0 完全一致，不会顶版本。
+  # AVRCP 绝对音量（esp_bt_audio_vol.h）用的就是它的 vol_ops：
+  #   本机缓存里是 1.1.0~2（**已经带 esp_bt_audio_vol.h**，API 与 1.2.0 文档一致）。
+  #   ^1.1.0 的语义允许 1.2.0 —— 联网后想显式升级就：
+  #     idf.py add-dependency "espressif/esp_bt_audio^1.2.0" && idf.py update-dependencies
   espressif/esp_bt_audio: "^1.1.0"
 
   # ---- 自研拼音输入法（开发期用 override_path，改代码免重新拉依赖） ----

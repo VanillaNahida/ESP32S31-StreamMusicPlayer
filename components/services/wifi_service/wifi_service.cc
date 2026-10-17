@@ -44,6 +44,17 @@ static const char *TAG = "wifi_svc";
 #define WIFI_RETRY_SLOW_MS    60000
 /* 开机首次连接的延时：等 PHY/扫描就绪，见 wifi_service_init() 里的注释 */
 #define WIFI_FIRST_CONNECT_MS 1500
+/*
+ * 已连接时刷新 RSSI 的周期。
+ *
+ * ⚠ 2026-10 用户报"Wi-Fi 图标不会按信号强度自动更新"：根因就是**只在 GOT_IP
+ * 那一刻取了一次**（on_ip_evt），之后 s_rssi 永远不变 —— 状态栏只能一直显示
+ * "连上瞬间"的那一格。现在由 wifi_rssi_cb 定时重取。
+ * 2 s 是折中：RSSI 本身是"最近一个 beacon"的测量值（beacon 间隔通常 100 ms，
+ * 驱动内部还在平滑），再密也只是重复读同一个缓存字段；而状态栏本来就是 500 ms
+ * 轮询，2 s 已经足够跟手。
+ */
+#define WIFI_RSSI_REFRESH_MS  2000
 
 typedef struct {
     char ssid[WIFI_SSID_MAX];
@@ -71,6 +82,8 @@ static uint8_t              s_cred_idx;     /* 下一次重试要试的已保存
 static volatile int         s_last_reason;  /* 最近一次断开/失败的原因码（UI 显示用） */
 static esp_timer_handle_t   s_retry_timer;
 static volatile bool        s_retry_pending; /* 重试定时器已装载（未触发） */
+static esp_timer_handle_t   s_rssi_timer;    /* 已连接时定时刷新 RSSI（见 wifi_rssi_cb） */
+static int                  s_rssi_fail;     /* 连续读失败次数（只在连着的状态下计数） */
 
 static wifi_ap_t            s_ap[WIFI_AP_MAX];
 static volatile size_t      s_ap_count;
@@ -508,6 +521,70 @@ static void on_wifi_evt(void *arg, esp_event_base_t base, int32_t id, void *data
     }
 }
 
+/* ---------------------------------------------------------------- RSSI */
+
+/*
+ * 读"当前关联"的信号强度（dBm，负值），成功返回 true。
+ *
+ * 为什么要有这个函数：`s_rssi` 要能**持续**反映信号，而不是只在连上那一刻取一次
+ * （见下面 wifi_rssi_cb 的说明）。
+ */
+static bool wifi_read_rssi(int *out)
+{
+    if (!out) {
+        return false;
+    }
+    /* 首选 esp_wifi_sta_get_rssi()：IDF 文档写的就是 "store the rssi info received
+     * from last beacon" —— 正是"实时信号强度"该用的接口。 */
+    int r = 0;
+    if (esp_wifi_sta_get_rssi(&r) == ESP_OK && r < 0 && r > -120) {
+        *out = r;
+        return true;
+    }
+    /*
+     * 兜底：AP 记录里带着同一个 last beacon 的 rssi。
+     * ⚠ wifi_ap_record_t ≈72 B，放**静态区**：这条路径也会在 sys_evt / esp_timer
+     *   任务里跑，别往它们的小栈上加 72 B（on_ip_evt 里原来就是这么处理的）。
+     */
+    static wifi_ap_record_t s_ap_rec;
+    if (esp_wifi_sta_get_ap_info(&s_ap_rec) == ESP_OK &&
+        s_ap_rec.rssi < 0 && s_ap_rec.rssi > -120) {
+        *out = s_ap_rec.rssi;
+        return true;
+    }
+    return false;
+}
+
+/*
+ * 定时把"当前连接"的 RSSI 抄进 s_rssi（状态栏 500 ms 轮询的就是它）。
+ *
+ * ⚠ 2026-10 用户报"状态栏 Wi-Fi 图标不会按信号强度变化"：根因就在这里 ——
+ *   以前只在 IP_EVENT_STA_GOT_IP 那一刻取了一次 RSSI，之后**再没有任何人更新它**，
+ *   于是图标永远停在"连上瞬间"的那一格（走到信号很弱的地方也不动）。
+ *
+ * 读不到（刚连上 / 驱动还在切信道 / 已经掉了）就**保留上一次的值**：
+ * 写 0 等于"未知"，UI 那边会画成满格，看着像突然跳到满格。
+ */
+static void wifi_rssi_cb(void *arg)
+{
+    (void)arg;
+    /* 没连上就别问（deinit 会先把定时器停掉，这里只是再兜一层） */
+    if (!s_ready || s_state != WIFI_ST_CONNECTED) {
+        return;
+    }
+    int rssi = 0;
+    if (wifi_read_rssi(&rssi)) {
+        s_rssi = rssi;
+        s_rssi_fail = 0;
+        return;
+    }
+    /* 连着的状态下连续读不到：打一次警告就够 —— 这条日志能把"取不到数据"和
+     * "UI 没重画"分开（前者看这里，后者看 ui_status 的 `wifi rssi ... -> N/4 格`） */
+    if (++s_rssi_fail == 5) {
+        ESP_LOGW(TAG, "rssi read failed %d times (状态栏信号格不会更新)", s_rssi_fail);
+    }
+}
+
 static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base;
@@ -516,10 +593,12 @@ static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
     const ip_event_got_ip_t *ev = (const ip_event_got_ip_t *)data;
     snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
-    /* 同样别把 wifi_ap_record_t（≈72 B）放 sys_evt 的栈上；回调串行派发，静态安全 */
-    static wifi_ap_record_t s_ap_info;
-    if (esp_wifi_sta_get_ap_info(&s_ap_info) == ESP_OK) {
-        s_rssi = s_ap_info.rssi;
+    /* 先取一次信号强度（之后由 wifi_rssi_cb 每 2 s 刷新）：
+     * 取不到就保持 0（= 未知，UI 画满格），别在这里做分支处理 */
+    int rssi0 = 0;
+    s_rssi_fail = 0;                  /* 新连接：重新数"读不到"的次数 */
+    if (wifi_read_rssi(&rssi0)) {
+        s_rssi = rssi0;
     }
     s_state = WIFI_ST_CONNECTED;
     s_last_reason = 0;                /* 连上了：清掉上次的失败原因 */
@@ -618,6 +697,25 @@ esp_err_t wifi_service_init(void)
     s_ready = true;
     ESP_LOGI(TAG, "wifi ready, %u saved AP", (unsigned)s_store.count);
 
+    /*
+     * RSSI 刷新定时器（2 s）：**必须在 s_ready 之后**再装，回调里会拿它当"现在问
+     * esp_wifi 是否安全"的判据。装在 init 里、deinit 里停，与 s_retry_timer 一样，
+     * 这样"关掉 Wi-Fi 开关"之后不会有个定时器还在戳已经 deinit 的驱动。
+     */
+    if (!s_rssi_timer) {
+        esp_timer_create_args_t rargs = {};
+        rargs.callback = wifi_rssi_cb;
+        rargs.name     = "wifi_rssi";
+        if (esp_timer_create(&rargs, &s_rssi_timer) != ESP_OK) {
+            s_rssi_timer = NULL;
+            ESP_LOGW(TAG, "create rssi timer failed (图标不会跟着信号变)");
+        }
+    }
+    if (s_rssi_timer) {
+        esp_timer_stop(s_rssi_timer);       /* 幂等：重复 init 时别报 INVALID_STATE */
+        esp_timer_start_periodic(s_rssi_timer, (uint64_t)WIFI_RSSI_REFRESH_MS * 1000ULL);
+    }
+
     /* 有存过的网络就自动连最近一次成功的那个（开机自动连接）。
      * 不立刻连：esp_wifi_start() 刚返回时 PHY/扫描还没就绪，实测第一次
      * 连接会直接失败（日志里 "authmode threshold changes from OPEN to WPA2"
@@ -662,6 +760,11 @@ esp_err_t wifi_service_deinit(void)
     }
     if (s_retry_timer) {
         esp_timer_stop(s_retry_timer);
+    }
+    /* RSSI 定时器也停掉：s_ready 上面已经置 false（回调会直接返回），
+     * 但停掉才能保证 esp_wifi_deinit() 之后不会有定时器来戳空驱动 */
+    if (s_rssi_timer) {
+        esp_timer_stop(s_rssi_timer);
     }
     if (s_sntp_started) {
         esp_netif_sntp_deinit();

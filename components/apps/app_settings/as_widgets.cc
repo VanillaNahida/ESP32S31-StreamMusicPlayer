@@ -26,12 +26,6 @@ lv_obj_t *as_make_screen(void)
     return scr;
 }
 
-void as_on_back(lv_event_t *e)
-{
-    (void)e;
-    ui_router_pop();
-}
-
 lv_obj_t *as_make_flat_btn(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *user)
 {
     lv_obj_t *b = lv_button_create(parent);

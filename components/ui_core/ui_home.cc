@@ -50,16 +50,20 @@ static lv_obj_t *placeholder_page(const app_desc_t *app)
 static lv_obj_t *page_music(void)    { return placeholder_page(ui_app_find("music")); }
 static lv_obj_t *page_online(void)   { return placeholder_page(ui_app_find("online")); }
 static lv_obj_t *page_local(void)    { return placeholder_page(ui_app_find("local")); }
+/* 暂时隐藏：日历、蓝牙不在主界面显示
 static lv_obj_t *page_calendar(void) { return placeholder_page(ui_app_find("calendar")); }
 static lv_obj_t *page_bt(void)       { return placeholder_page(ui_app_find("bluetooth")); }
+*/
 static lv_obj_t *page_settings(void) { return placeholder_page(ui_app_find("settings")); }
 
 static const app_desc_t k_apps[] = {
     { "music",     "音乐",     LV_SYMBOL_AUDIO,     0xE8973A, page_music,    NULL, NULL, 10, 0 },
     { "online",    "网易云音乐", LV_SYMBOL_WIFI,      0x3E9E86, page_online,   NULL, NULL, 20, 0 },
-    { "local",     "本地音乐", LV_SYMBOL_DIRECTORY,   0x5B6FB5, page_local,    NULL, NULL, 30, 0 },
+    { "local",     "文件管理", LV_SYMBOL_DIRECTORY,   0x5B6FB5, page_local,    NULL, NULL, 30, 0 },
+    /* 暂时隐藏：日历、蓝牙不在主界面显示
     { "calendar",  "日历",     LV_SYMBOL_LIST,      0xC0584B, page_calendar, NULL, NULL, 40, 0 },
     { "bluetooth", "蓝牙",     LV_SYMBOL_BLUETOOTH, 0x4A6FA5, page_bt,       NULL, NULL, 50, 0 },
+    */
     { "settings",  "设置",     LV_SYMBOL_SETTINGS,  0x6E6E78, page_settings, NULL, NULL, 60, 0 },
 };
 

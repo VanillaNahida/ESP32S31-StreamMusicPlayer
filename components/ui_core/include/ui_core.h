@@ -45,34 +45,75 @@ int ui_router_depth(void);
 /* ------------------------------------------------------------------ 页面返回键 */
 
 /*
- * 全局返回键（推荐用法）：ui_core_init 时在 lv_layer_top 叠一个圆钮，
- * 点击等价于 ui_router_pop()。ui_router_push/pop 之后会自动刷新它的
- * 显示状态：**栈深 > 1 且当前页 desc.no_back == false 时显示**，否则隐藏。
- * 所以：
- *   - 首页（栈深 1）不显示；
- *   - 普通二级页（播放器 / 在线音乐 / 占位页…）自动就有返回键，页面里
- *     不用再画，标题只需让到 UI_HEADER_TEXT_X 给按钮留位；
- *   - 自带返回钮的页面（设置页 make_page_shell）把 page_desc_t.no_back
- *     置 true 即可。
+ * 标题栏（状态栏正下方那一条）—— 版面口径见 ui_metrics.h 的 UI_TITLEBAR_*：
+ *
+ *     [ ◀返回钮 ]    <标题/信息…>
+ *
+ * 返回钮是烘好的位图 back_arrow（assets/icons/back.png：蓝圆底 + 白左箭头），
+ * 交互是**按下缩小、松手还原、还原动画跑完才返回上一级**（见 ui_core.cc）。
+ *
+ * 两种用法，二选一，别同时用（会同屏出现两个返回键）：
+ *
+ * 1) **全局返回键（推荐）**：ui_core_init 时在 lv_layer_top 叠一个，
+ *    ui_router_push/pop 之后自动刷新显示状态：**栈深 > 1 且当前页
+ *    desc.no_back == false 时显示**，否则隐藏。所以：
+ *      - 首页（栈深 1）不显示；
+ *      - 普通二级页（播放器 / 在线音乐 / 本地音乐…）自动就有返回键，页面里
+ *        不用再画；标题按下面的写法摆到同一条中线上即可：
+ *            lv_obj_align(title, LV_ALIGN_TOP_LEFT,
+ *                         UI_HEADER_TEXT_X, ui_titlebar_text_dy());
+ *      - 页面 screen 的 `pad_top` 要是 UI_TITLEBAR_Y（= 状态栏高 + 页面安全区），
+ *        这行才是对的（各二级页本来就是这么设的）。
+ * 2) **自带返回钮的页面**（设置页 make_page_shell）：用 ui_back_button_create()
+ *    建按钮，并把 page_desc_t.no_back 置 true。
+ *
  * 该键建在 lv_layer_top 上、z 序低于控制中心/Toast/遮罩：
  * 模态遮罩打开时它会一并被盖住（点不到，符合预期），关闭后自动恢复。
  */
 
 /*
- * 手动返回键（仅给自带返回钮的页面用，如设置页 make_page_shell）：
- * 点击等价于 ui_router_pop()。
+ * 标题从标题栏顶端往下偏多少才落在**中线上**（按标题字体的行盒真算，
+ * 换字体也不会偏）。配合 UI_HEADER_TEXT_X 用，见上面的用法 1。
  *
- * @param parent 页头元素：标题所在的那个容器，也可以直接是 screen
- * @param align  按钮的对齐方式，与该页标题保持一致
- *               （标题在容器里用 LV_ALIGN_LEFT_MID；标题直接挂 screen 用 LV_ALIGN_TOP_LEFT）
+ * ⚠ 只适用于"标题直接挂在 screen 上、且**页面里没有会滚到这一条的滚动区**"的页面。
+ *   只要页面有滚动内容，就必须按下面这条排：
+ *     父容器 flex 列 → ① 标题栏盒子（固定高 UI_TITLEBAR_H）② 滚动盒子（flex_grow 1）
+ *   —— LVGL 裁剪子对象用的是对象自己的盒子、**不算 padding**，靠 pad_top 错开的话
+ *   滚动内容会把标题盖掉（真机踩过，见 docs/lvgl-pitfalls.md §4）。
+ */
+int ui_titlebar_text_dy(void);
+
+/*
+ * 手动返回键（给"自带返回钮"的页面用，如设置页子页外壳）：
+ *   按下缩小 → 松手还原 → **还原动画结束**才 ui_router_pop()。
+ *
+ * @param parent 父容器。**建议直接传 screen**，然后调
+ *               ui_back_button_place() 统一摆位；父容器是 flex 也没关系
+ *               （建出来的按钮自带 LV_OBJ_FLAG_FLOATING，flex 会跳过它）。
  * @return 按钮对象，不需要时忽略返回值
  *
  * ⚠ 屏幕最左 UI_EDGE_HOTZONE(24 px) 是返回手势热区，它 z 序高于页面，
- *   所以按钮不能贴 x=0（左半截会被热区吃掉、点不动）。helper 已经把按钮放在
- *   UI_BACK_BTN_X 处，调用方只需把标题右移到 UI_HEADER_TEXT_X。
+ *   所以按钮不能贴 x=0（左半截会被热区吃掉、点不动）：位置统一由
+ *   ui_back_button_place() 给（UI_BACK_BTN_X / UI_BACK_BTN_Y）。
  * ⚠ 用自动全局返回键的页面**不要再调这个**，否则会出两个返回键。
  */
-lv_obj_t *ui_back_button_create(lv_obj_t *parent, lv_align_t align);
+lv_obj_t *ui_back_button_create(lv_obj_t *parent);
+
+/*
+ * 把返回键摆到标题栏左侧：**圆心落在导航栏中线**（UI_TITLEBAR_MID，与标题、页签、
+ * 右上角动作按钮同一条线），上下各悬出 UI_BACK_BTN_DIP
+ * （几何见 ui_metrics.h 的 UI_BACK_BTN_*）。
+ *
+ * 为什么要有这个函数：`lv_obj_align` 的偏移是相对**父容器内容区**（扣掉 padding）
+ * 算的，全局键的父容器是 `lv_layer_top()`（无 padding）、页面里的父容器是
+ * `as_make_screen()` 造的 screen（有 padding）—— 各页自己写偏移就会差一个 padding、
+ * 返回钮对不齐。本函数自己把父容器 padding 扣掉，落点全局一致。
+ *
+ * ⚠ 按钮是挂在 `lv_layer_top()` 上的、z 序永远最高，**悬出来的下半截会盖住
+ *   栏下第一块内容**：有控件的页面必须让开 `UI_BACK_BTN_DIP`（做法见
+ *   music_view_local 的列表、as_page_shell 的 body、app_online 的 tabs）。
+ */
+void ui_back_button_place(lv_obj_t *btn);
 
 /* ------------------------------------------------------------------ 状态栏
  *

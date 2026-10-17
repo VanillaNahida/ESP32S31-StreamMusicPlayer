@@ -25,54 +25,67 @@
 lv_obj_t *as_page_shell(lv_obj_t *scr, const char *title,
                         const char *action_text, lv_event_cb_t action_cb)
 {
-    lv_obj_t *body = lv_obj_create(scr);
-    lv_obj_remove_style_all(body);
-    lv_obj_set_size(body, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_pad_top(body, UI_PX_H(44), LV_PART_MAIN);   /* 给标题行让位 */
-    lv_obj_set_style_pad_row(body, UI_PX_H(8), LV_PART_MAIN);
-    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scroll_dir(body, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+    /*
+     * ★ 结构：**标题栏行（固定高）+ body（flex_grow 1，可滚动）** 两个盒子。
+     *
+     * 为什么不能像以前那样"body 铺满整屏 + 靠 pad_top 把内容推到标题下面"
+     * （2026-10 真机照片暴露）：**LVGL 裁剪子对象用的是对象自己的盒子，不算
+     * padding** —— body 往上滚时，行会画进 pad 区，把标题文字盖掉。
+     * 两个盒子一分，body 的盒子物理上就在标题栏下面，滚动永远够不着标题。
+     */
+    lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(scr, 0, LV_PART_MAIN);
 
+    /* 导航栏：高 = UI_TITLEBAR_H，只放标题（返回钮悬在它下沿，见下） */
     lv_obj_t *head = lv_obj_create(scr);
     lv_obj_remove_style_all(head);
-    lv_obj_set_size(head, LV_PCT(100), UI_PX_H(38));
+    lv_obj_set_size(head, LV_PCT(100), UI_TITLEBAR_H);
     lv_obj_set_flex_flow(head, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(head, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(head, UI_PX_W(10), LV_PART_MAIN);
     lv_obj_remove_flag(head, LV_OBJ_FLAG_SCROLLABLE);
-    /*
-     * ★ 让开左边缘手势热区（UI_EDGE_HOTZONE，挂在 lv_layer_top 上、z 序高于页面）：
-     * head 是 flex 行、返回键是第一个子对象，不加这个内边距就会落在屏幕 pad
-     * （UI_PAGE_PAD = 8 px）处 —— 左半截压在热区里，按了没反应。
-     * 宽度仍是 100%，加的是内边距，不会溢出。
-     */
-    lv_obj_set_style_pad_left(head, UI_BACK_BTN_X, LV_PART_MAIN);
-
-    lv_obj_t *b = lv_button_create(head);
-    lv_obj_set_size(b, UI_PX_H(34), UI_PX_H(34));
-    lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(b, UI_COLOR_PILL, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_shadow_width(b, 0, LV_PART_MAIN);
-    lv_obj_t *bl = lv_label_create(b);
-    lv_obj_set_style_text_font(bl, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(bl, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(bl, LV_SYMBOL_LEFT);
-    lv_obj_center(bl);
-    lv_obj_add_event_cb(b, as_on_back, LV_EVENT_CLICKED, NULL);
+    /* 标题让开返回钮（钮宽 + 间距）；钮本身不在这里，由下面的 ui_back_button_place 摆 */
+    lv_obj_set_style_pad_left(head, UI_HEADER_TEXT_X, LV_PART_MAIN);
 
     lv_obj_t *t = lv_label_create(head);
     lv_obj_set_style_text_font(t, UI_FONT_TITLE, LV_PART_MAIN);
     lv_obj_set_style_text_color(t, UI_COLOR_FG, LV_PART_MAIN);
     lv_label_set_text(t, title);
 
+    /* 内容区：导航栏下面，吃掉剩余高度，纵向可滚动。
+     * pad_top 让开悬到内容区的下半截返回钮（UI_BACK_BTN_DIP，见 ui_metrics.h）：
+     * 按钮 z 序在页面内容之上，不让开的话第一行会被它压住、也点不到。 */
+    lv_obj_t *body = lv_obj_create(scr);
+    lv_obj_remove_style_all(body);
+    lv_obj_set_width(body, LV_PCT(100));
+    lv_obj_set_flex_grow(body, 1);
+    lv_obj_set_style_pad_top(body, UI_BACK_BTN_DIP, LV_PART_MAIN);
+    lv_obj_set_style_pad_row(body, UI_PX_H(8), LV_PART_MAIN);
+    lv_obj_set_flex_flow(body, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scroll_dir(body, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(body, LV_SCROLLBAR_MODE_AUTO);
+
     if (action_text && action_cb) {
-        /* 注意：head 是 flex 容器，子对象的位置由 flex 决定，lv_obj_align 会被
-         * 布局覆盖 —— 所以右上角的动作按钮挂到 screen 上绝对定位 */
+        /* 右上角动作按钮：父容器 scr 现在是 flex，位置由 flex 决定，lv_obj_align
+         * 会被布局覆盖 —— 所以给它 FLOATING（LVGL 的 flex **跳过** FLOATING 子对象），
+         * align 才生效。y 偏 (UI_TITLEBAR_H - 按钮高)/2：让它与标题同处栏的中线。 */
         lv_obj_t *a = as_make_flat_btn(scr, action_text, action_cb, NULL);
-        lv_obj_align(a, LV_ALIGN_TOP_RIGHT, 0, 0);
+        lv_obj_add_flag(a, LV_OBJ_FLAG_FLOATING);
+        lv_obj_align(a, LV_ALIGN_TOP_RIGHT, 0,
+                     (UI_TITLEBAR_H - UI_PX_H(34)) / 2);
     }
+
+    /*
+     * ★ 返回键**最后建**，而且**不放进 head**：
+     *  - 不放进 head：head 只有 UI_TITLEBAR_H 高，会把悬出来的下半截裁掉
+     *    （LVGL 默认裁剪子对象）；挂到 scr 上、由 ui_back_button_place() 统一摆到
+     *    "圆心压在导航栏下沿"的位置（它自己扣掉 scr 的 padding，落点与其他页一致）。
+     *    scr 现在是 flex，故 ui_back_button_create 里已带 LV_OBJ_FLAG_FLOATING。
+     *  - 放最后：它悬出来的下半截正好落在 body 的地盘上，而 LVGL 是"后建的画在上面"——
+     *    建在 body 之前的话，body 里往上滚的行会盖住按钮。放最后 = 永远压在页面内容之上
+     *    （与全局返回键挂在 lv_layer_top 上的效果一致）。
+     */
+    ui_back_button_place(ui_back_button_create(scr));
+
     return body;
 }
 

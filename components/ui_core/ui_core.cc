@@ -8,6 +8,8 @@
 #include "ui_metrics.h"
 #include "ui_internal.h"
 #include "ui_home_bg.h"
+#include "ui_icons.h"      /* back_arrow：标题栏返回钮的位图 */
+#include "ui_ba.h"         /* ui_ba_press_feedback：按下反馈（与弹窗按钮同一套） */
 
 #include "esp_log.h"
 #include "esp_lv_adapter.h"
@@ -53,7 +55,7 @@ static bool s_screen_off;
 #define POPUP_OUT_MS    240
 #define POPUP_SLIDE_PX  UI_PX_H(46)   /* 进场起点：卡片在目标位置下方这么远 */
 #define POPUP_OVER_PX   UI_PX_H(6)    /* 70% 处冲过头的距离 */
-#define BA_ANIM_RANGE   1000          /* 动画进度量程（0..1000） */
+#define BA_ANIM_RANGE   1500          /* 动画进度量程（0..1500） */
 
 static inline int32_t clamp_i32(int32_t v, int32_t lo, int32_t hi)
 {
@@ -349,15 +351,116 @@ void ui_cc_open(void)   { ui_volume_hide(); ui_cc_apply_open(true, true); }
 void ui_cc_close(void)  { ui_cc_apply_open(false, true); }
 void ui_cc_toggle(void) { ui_cc_apply_open(!ui_cc_state(), true); }
 
-/* ------------------------------------------------------------------ 页面返回键 */
+/* ------------------------------------------------------------------ 返回键 */
 
 /*
- * 全局返回键：建在 lv_layer_top 上的一个圆钮，由 ui_router 在
- * push / pop / init_home 之后调用 ui_back_button_update() 刷新显示状态。
+ * 返回键（标题栏左侧那一个）：一张烘好的位图 back_arrow
+ * （蓝色圆底 + 白色左箭头，见 assets/icons/back.png，按 UI_BACK_BTN_SIZE = 64 烘）。
+ *
+ * 尺寸与位置口径（2026-10 用户第二次调整）：
+ *   - 用户原话："把返回按钮往左上角调整点，且按钮中心位置与其他元素对齐" ——
+ *     圆心从"导航栏下沿"提到 **UI_TITLEBAR_MID（导航栏中线）**，与标题、页签、
+ *     右上角动作按钮在同一条线上（比原来高 24 px）；
+ *   - 尺寸 72 → **64**：圆心一旦落在中线上，按钮就上下各悬出 (SIZE - 栏高)/2 ——
+ *     栏高 48 + 上下各一个 UI_PAGE_PAD(8) 正好 64：上边贴状态栏下沿、下边正好压在
+ *     内容区第一行。取 72 会顶进状态栏 4 px（那是后画的半透明暗条，会把圆顶切平）；
+ *   - 左边界 UI_BACK_BTN_X = UI_EDGE_HOTZONE —— **按得到的最左一列**
+ *     （左边 24 px 是返回手势热区，挂在 lv_layer_top 上、z 序比按钮高；按钮再往左
+ *     挪就会被它吃掉一部分，按了没反应）。
+ *
+ * 按下反馈（2026-10 用户要求"和弹窗里的按钮一样"）：**与弹窗按钮共用同一份实现** ——
+ * 按住缩到 ≈92%（120 ms）、松手 150 ms 缓出复原，"复原动画跑完"才执行
+ * ui_router_pop()；手指滑走（PRESS_LOST）只复原、不返回。手感常量只有 ui_ba.cc
+ * "按下反馈"一节里那一套，想调就调那里，别在返回钮上另起一套。
+ *
+ * ⚠ 2026-10 修掉的真 bug：原来这里自己写了一套缩放动画，把**按钮**（lv_button）
+ *   当作图片交给 `lv_image_set_scale()` —— 那个 API 只能作用在 lv_image 对象上，
+ *   而本工程 `LV_USE_ASSERT_OBJ=n`，于是它按 `lv_image_t` 的字段去写一块
+ *   `lv_obj_t` 大小的内存（**越界写堆**），偏偏按钮的绘制根本不看那些字段 ——
+ *   结果是"按下去毫无反馈"（外加一颗随时可能踩到的内存炸弹），
+ *   不管把 BACK_PRESS_SCALE / 时长怎么调都不会有反应。
+ *   现在统一走 `transform_scale`（绘制期变换，不参与布局），别再改回图片缩放。
+ *
+ * ⚠ `back_arrow` 素材本身就是整块圆底，**不要再给 lv_button 画圆底/描边**
+ *   （会露出两层边）。按钮只保留透明外壳 + 命中区域。
+ */
+static void back_click_after_restore(lv_event_t *e)
+{
+    (void)e;
+    ui_router_pop();
+}
+
+/*
+ * 建一个返回键。**只建控件、不摆位置**：
+ *   父容器是 flex（设置页的标题行）→ 交给 flex 排；
+ *   否则调用方自己 lv_obj_align（全局键用 UI_HEADER_TEXT 那一套度量）。
+ */
+lv_obj_t *ui_back_button_create(lv_obj_t *parent)
+{
+    if (!parent) {
+        return NULL;
+    }
+    lv_obj_t *btn = lv_button_create(parent);
+    lv_obj_set_size(btn, UI_BACK_BTN_SIZE, UI_BACK_BTN_SIZE);
+    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);   /* 圆底在图里 */
+    lv_obj_set_style_border_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(btn, 0, LV_PART_MAIN);
+    /* 父容器是 flex 时（设置页的 scr），让 flex 跳过它，后面的 align 才生效 */
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_FLOATING);
+
+    lv_obj_t *img = lv_image_create(btn);
+    lv_image_set_src(img, &back_arrow);
+    lv_image_set_antialias(img, true);
+    lv_obj_center(img);
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_CLICKABLE);    /* 点击都算在按钮上 */
+
+    /* 按下反馈 + "复原后才返回上一级"：与弹窗按钮共用同一份实现（见上面的说明） */
+    ui_ba_press_feedback(btn, back_click_after_restore, NULL);
+    return btn;
+}
+
+/*
+ * 把返回键摆到标题栏左侧：**圆心落在导航栏中线**（UI_TITLEBAR_MID，
+ * 与标题、页签、右上角动作按钮同一条线），上下各悬出 UI_BACK_BTN_DIP；
+ * 左边界是"按得到的最左一列" UI_BACK_BTN_X（左边 24 px 被返回手势热区占着）。
+ * 全部度量见 ui_metrics.h 的 UI_BACK_BTN_* / UI_TITLEBAR_*。
+ *
+ * 为什么要在 ui_core 里统一摆、而不是各页自己 lv_obj_align：
+ * `lv_obj_align` 的偏移是相对**父容器的内容区**（扣掉 padding）算的 ——
+ * 全局键的父容器是 lv_layer_top()（无 padding），页面里的父容器是
+ * `as_make_screen()` 造的 screen（pad_all = UI_PAGE_PAD，pad_top =
+ * UI_TITLEBAR_Y）。同样写 (UI_BACK_BTN_X, UI_BACK_BTN_Y)，两边的**绝对**位置
+ * 会差出一个 padding —— 于是"设置页的返回钮"和别的页对不齐。
+ * 这里直接把父容器 padding 扣掉，调用方只管用，落点一定一致。
+ */
+void ui_back_button_place(lv_obj_t *btn)
+{
+    if (!btn) {
+        return;
+    }
+    lv_obj_t *par = lv_obj_get_parent(btn);
+    if (!par) {
+        return;
+    }
+    const int pad_l = (int)lv_obj_get_style_pad_left(par, LV_PART_MAIN);
+    const int pad_t = (int)lv_obj_get_style_pad_top(par, LV_PART_MAIN);
+    lv_obj_align(btn, LV_ALIGN_TOP_LEFT,
+                 UI_BACK_BTN_X - pad_l,
+                 UI_BACK_BTN_Y - pad_t);
+}
+
+/*
+ * 标题栏（状态栏正下方那一条，见 ui_metrics.h 的 UI_TITLEBAR_*）：
+ * 返回键摆在这一条的垂直中线上（UI_BACK_BTN_Y）。
+ *
+ * 返回键建在 lv_layer_top 上、由 ui_router 在 push / pop / init_home 之后调用
+ * ui_back_button_update() 刷新显示状态。
  *
  * 显示条件（ui_router_top_needs_back）：栈深 > 1 且当前页 desc.no_back == false
  * —— 首页与"自带返回钮"的设置页不显示，其余二级页（播放器 / 在线音乐 /
- * 占位页…）自动就有返回键，页面里不用再画。
+ * 本地音乐…）自动就有返回键，页面里不用再画。
  *
  * z 序：本对象在 ui_core_init 里**最先**创建，排在它后面的控制中心 /
  * 状态栏 / Toast / 手势热区都会盖在它上面 —— 模态遮罩（app 运行时
@@ -367,36 +470,13 @@ void ui_cc_toggle(void) { ui_cc_apply_open(!ui_cc_state(), true); }
  */
 static lv_obj_t *s_back_btn;
 
-static void back_button_clicked(lv_event_t *e)
-{
-    (void)e;
-    ui_router_pop();
-}
-
 lv_obj_t *ui_back_button_global_create(lv_obj_t *parent)
 {
     if (!parent) {
         return NULL;
     }
-    lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_size(btn, UI_BACK_BTN_SIZE, UI_BACK_BTN_SIZE);
-    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(btn, UI_COLOR_PILL, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_80, LV_PART_MAIN);
-    lv_obj_add_event_cb(btn, back_button_clicked, LV_EVENT_CLICKED, NULL);
-    /*
-     * 位置：与页面内容区第一行对齐 —— 页面 pad_top 是
-     * UI_STATUSBAR_H + UI_PAGE_PAD，标题行就落在那里；
-     * x 用 UI_BACK_BTN_X 让开左边缘手势热区（同手动返回键）。
-     */
-    lv_obj_align(btn, LV_ALIGN_TOP_LEFT, UI_BACK_BTN_X, UI_STATUSBAR_H + UI_PAGE_PAD);
-
-    lv_obj_t *l = lv_label_create(btn);
-    lv_obj_set_style_text_font(l, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(l, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(l, LV_SYMBOL_LEFT);
-    lv_obj_center(l);
-
+    lv_obj_t *btn = ui_back_button_create(parent);
+    ui_back_button_place(btn);      /* 圆心落在导航栏中线（见函数注释） */
     s_back_btn = btn;
     ui_back_button_update();
     return btn;
@@ -415,26 +495,17 @@ void ui_back_button_update(void)
     }
 }
 
-lv_obj_t *ui_back_button_create(lv_obj_t *parent, lv_align_t align)
+/*
+ * 标题该从这一条的顶往下偏多少，才落在中线上。
+ *
+ * 页面这样用（screen 的 pad_top 就是 UI_TITLEBAR_Y）：
+ *     lv_obj_align(title, LV_ALIGN_TOP_LEFT, UI_HEADER_TEXT_X, ui_titlebar_text_dy());
+ * 按标题字体的**行盒**真算，所以换了标题字体也不会偏。
+ */
+int ui_titlebar_text_dy(void)
 {
-    if (!parent) {
-        return NULL;
-    }
-    lv_obj_t *btn = lv_button_create(parent);
-    lv_obj_set_size(btn, UI_BACK_BTN_SIZE, UI_BACK_BTN_SIZE);
-    lv_obj_set_style_radius(btn, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(btn, UI_COLOR_PILL, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(btn, LV_OPA_80, LV_PART_MAIN);
-    lv_obj_add_event_cb(btn, back_button_clicked, LV_EVENT_CLICKED, NULL);
-    /* UI_BACK_BTN_X 让开了左侧手势热区，贴 x=0 的话左半截点不到（见头文件） */
-    lv_obj_align(btn, align, UI_BACK_BTN_X, 0);
-
-    lv_obj_t *l = lv_label_create(btn);
-    lv_obj_set_style_text_font(l, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(l, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(l, LV_SYMBOL_LEFT);
-    lv_obj_center(l);
-    return btn;
+    const int lh = (int)lv_font_get_line_height(UI_FONT_TITLE);
+    return (UI_TITLEBAR_H - lh) / 2;
 }
 
 /* ------------------------------------------------------------------ 主题 */

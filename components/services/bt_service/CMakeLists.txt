@@ -8,6 +8,8 @@ idf_component_register(
         "bts_feed.cc"
         "bts_events.cc"
         "bts_scan_pair.cc"
+        "bts_conn.cc"
+        "bts_volume.cc"
     INCLUDE_DIRS "include"
     PRIV_INCLUDE_DIRS "include/internal"
     REQUIRES

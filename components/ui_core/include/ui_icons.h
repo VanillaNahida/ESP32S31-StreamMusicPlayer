@@ -75,6 +75,12 @@ LV_IMAGE_DECLARE(bt_connected);
 LV_IMAGE_DECLARE(sd_ok);
 LV_IMAGE_DECLARE(sd_warn);
 
+/* 标题栏的返回钮，**64x64**（来自 assets/icons/back.png —— 蓝色圆底 + 白色左箭头的
+ * 整块图标，四角透明）。边长必须与 ui_metrics.h 的 UI_BACK_BTN_SIZE 一致：
+ * 改尺寸要同步改 assets/icons/icons.txt 里的边长并重烘（见 tools/icons/gen_icon.py），
+ * **不要再叠 lv_button 的圆底背景**，否则会露出两层边（见 ui_core.cc 的说明）。 */
+LV_IMAGE_DECLARE(back_arrow);
+
 #ifdef __cplusplus
 }
 #endif

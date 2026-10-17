@@ -204,6 +204,9 @@ audio_out_t audio_output_route(void);
 /** 主音量 0~100（扬声器走 ES8389 寄存器，蓝牙走软件缩放） */
 void audio_output_set_volume(int percent);
 int  audio_output_volume(void);
+/** 对端（耳机按键/手机）改了 AVRCP 音量：只同步本地状态，**不再回发**（防乒乓）。
+ *  跑在蓝牙栈任务上下文。 */
+void audio_output_note_peer_volume(int percent);
 
 /** 本会话是否**已经真的出声**（有 PCM 写到了硬件） */
 bool audio_output_flowing(void);

@@ -35,6 +35,7 @@ pip 装东西）。所以这里只用标准库 `zlib` 手解 PNG —— 对"图�
         --manifest assets/icons/icons.txt --preview build/icons_preview
 """
 import argparse
+import re
 import struct
 import sys
 import zlib
@@ -267,6 +268,10 @@ def load_source(src: Path, size: int):
     return w, h, rgba, note
 
 
+# C 标识符校验：--name / 清单里的符号名必须能直接当变量名用
+_C_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("png", nargs="?", help="单个 PNG/SVG 源（不用 --manifest 时必填）")
@@ -277,6 +282,8 @@ def main() -> int:
     ap.add_argument("--preview", default=None,
                     help="把烘好的位图另存成 PNG 目录（肉眼核对用，不参与构建）")
     ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("--force", action="store_true",
+                    help="单文件形式也允许覆写默认输出（会丢掉其它所有图标，慎用）")
     a = ap.parse_args()
 
     jobs = []   # (源文件, 符号名, 尺寸)
@@ -299,7 +306,34 @@ def main() -> int:
     else:
         if not a.png:
             sys.exit("要么给一个 PNG/SVG 源，要么用 --manifest")
-        jobs.append((a.png, a.name, a.size))
+        job = (a.png, a.name, a.size)
+        # ★ 单文件形式的两个坑（2026-10 真机踩过，直接编不过）：
+        #   ① --name 是**符号名**（C 标识符），不是文件名 —— 传成 "back.png"
+        #      会生成 `const lv_image_dsc_t back.png`，带点，编译期就炸；
+        #   ② 本仓库的默认输出 components/ui_core/ui_icons.c 是**全项目图标合集**，
+        #      单文件形式会把它**整个覆写**成一个图标（其余全丢）→ 一堆 undefined。
+        #   所以：符号名一律校验；往默认输出里写单个图标必须显式 --force。
+        jobs.append(job)
+
+    for _, name, _ in jobs:
+        if not _C_IDENT.match(name):
+            sys.exit(
+                f"符号名 {name!r} 不是合法的 C 标识符（只能是字母/数字/下划线，且不以数字开头）。\n"
+                f"  --name 是**符号名**，不是文件名 —— 例如 `--name back_arrow`，"
+                f"而不是 `--name back.png`。\n"
+                f"  项目里的图标请改用清单：--manifest assets/icons/icons.txt"
+            )
+
+    if not a.manifest and not a.out and not a.force:
+        sys.exit(
+            "拒绝覆写 components/ui_core/ui_icons.c：\n"
+            "  单文件形式**只会写出你给的那一个图标**，而这个文件是全项目图标合集"
+            "（状态栏 / 返回钮 / 各 app 封面…），覆写后其余图标全部消失、编译报一堆 undefined。\n"
+            "  要重烘**项目图标**：\n"
+            "      tools/font/venv/Scripts/python.exe tools/icons/gen_icon.py "
+            "--manifest assets/icons/icons.txt\n"
+            "  确实只想生成一个图标：加 -o 指定输出文件（别写默认路径），或 --force 强行覆写。"
+        )
 
     preview_dir = None
     if a.preview:

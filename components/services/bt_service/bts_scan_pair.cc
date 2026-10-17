@@ -19,6 +19,7 @@
 #include "esp_bt_audio_media.h"
 #include "esp_gap_bt_api.h"
 
+#include "bts_conn.h"
 #include "bts_name_cache.h"
 #include "bts_state.h"
 
@@ -56,18 +57,14 @@ esp_err_t bt_service_connect(const uint8_t bda[6])
     if (!bt_service_is_ready()) {
         return ESP_ERR_INVALID_STATE;
     }
-    esp_bd_addr_t addr;
-    memcpy(addr, bda, 6);
-    const bt_dev_t *d = bts_dev_find(bda, false);
-    bts_make_peer_name(bda, d ? d->name : NULL);
-    /* A2DP 源连接：没配对过的设备在这一步顺手完成配对（Just Works） */
-    esp_err_t ret = esp_bt_audio_classic_connect(ESP_BT_AUDIO_CLASSIC_ROLE_A2DP_SRC, addr);
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "a2dp connect: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    ESP_LOGI(TAG, "connecting a2dp to %s", bts_peer_name);
-    return ESP_OK;
+    /*
+     * 真正的连接过程（停查询 → 断旧对端 → 延时发起 → 超时 → 重试）全在
+     * bts_conn.cc 的状态机里。这里只保留"入口"这一件事：
+     * 原来那句 `esp_bt_audio_classic_connect()` 是**直接**发的 —— 搜索还在跑的时候
+     * 发出去必然和 inquiry 抢射频（真机报 BTA_AV_FAIL_STREAM），而且没有任何
+     * "连接中/失败"的状态可言，UI 只能干等。
+     */
+    return bts_conn_request(bda);
 }
 
 esp_err_t bt_service_disconnect(const uint8_t bda[6])

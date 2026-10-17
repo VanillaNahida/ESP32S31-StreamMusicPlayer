@@ -1,0 +1,27 @@
+menu "Audio Service"
+
+    choice AUDIO_OUT_ASRC_PERF_MODE
+        prompt "输出级 ASRC 性能模式（44.1k/32k/24k/16k/8k → 48k 重采样）"
+        default AUDIO_OUT_ASRC_PERF_AUTO
+        help
+            audio_output.cc 用 espressif/esp_asrc 把任意源采样率/声道统一到
+            48kHz/16bit/2ch。S31 有硬件 ASRC 外设（SOC_ASRC_SUPPORTED），
+            硬件路径走 GDMA，CPU 占用≈0；软件路径是 esp_audio_effects 的
+            esp_ae_rate_cvt，44.1k→48k 立体声实测吃掉**一整个核**。
+
+        config AUDIO_OUT_ASRC_PERF_AUTO
+            bool "AUTO —— 优先硬件，硬件不可用时自动退回软件（推荐）"
+
+        config AUDIO_OUT_ASRC_PERF_HW_ONLY
+            bool "HW_ONLY —— 只用硬件 ASRC"
+            help
+                硬件 ASRC 只认 16-bit / 1~2ch / 8000|16000|24000|32000|44100|48000。
+                不在表里的采样率（例如 22050 Hz）会让 esp_asrc_open() 直接失败；
+                本工程在这种情况下仍会在运行期退回软件（宁可慢，不能变调），
+                只是会多打一行警告。
+
+        config AUDIO_OUT_ASRC_PERF_SW_SPEED
+            bool "SW_SPEED —— 只用软件 ASRC（旧行为，需要整核 CPU）"
+    endchoice
+
+endmenu

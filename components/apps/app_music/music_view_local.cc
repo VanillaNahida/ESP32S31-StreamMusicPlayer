@@ -372,27 +372,51 @@ lv_obj_t *music_view_local_build(void)
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     /* pad_all 必须在 pad_top 之前（否则标题被状态栏压住） */
     lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);
-    lv_obj_set_style_pad_top(scr, UI_STATUSBAR_H + UI_PAGE_PAD, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(scr, UI_TITLEBAR_Y, LV_PART_MAIN);
+    /*
+     * ★ 纵向 flex：**标题栏行（固定高）+ 列表（吃掉剩余高度）**。
+     *
+     * 为什么必须这样分层（2026-10 真机照片）：以前标题和列表是两个都铺满整屏的
+     * 兄弟对象，靠列表自己的 `pad_top` 把行"错开"到标题下面 —— 但 **LVGL 裁剪
+     * 子对象用的是对象自己的盒子，不算 padding**：列表往上滚时，行会画进那 40 px
+     * 的 pad 区，把标题文字整个盖掉（照片里"文件管理"被压掉一半）。
+     * 拆成两个盒子之后，列表的盒子**物理上**就在标题栏下面，滚动永远够不着标题。
+     * （MomoTalk 页一直是这么排的，这里对齐它。）
+     */
+    lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(scr, 0, LV_PART_MAIN);
 
-    /* 本地音乐页由路由压栈进入：返回键由 ui_core 全局返回键自动叠在顶层，
-     * 这里不再自己画。标题按 UI_HEADER_TEXT_X 起排，给左侧按钮留位。 */
-    lv_obj_t *head = lv_label_create(scr);
+    /* ---- 标题栏行 ---- */
+    lv_obj_t *bar = lv_obj_create(scr);
+    lv_obj_remove_style_all(bar);
+    lv_obj_set_size(bar, LV_PCT(100), UI_TITLEBAR_H);
+    lv_obj_remove_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 文件管理页由路由压栈进入：返回键由 ui_core 全局返回键自动叠在顶层，
+     * 这里不再自己画。标题按 UI_HEADER_TEXT_X 起排、垂直居中在这一条里 ——
+     * 与左侧返回钮同一条中线（见 ui_metrics.h 的 UI_TITLEBAR_*）。 */
+    lv_obj_t *head = lv_label_create(bar);
     lv_obj_set_style_text_font(head, UI_FONT_TITLE, LV_PART_MAIN);
     lv_obj_set_style_text_color(head, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(head, "本地音乐");
-    lv_obj_align(head, LV_ALIGN_TOP_LEFT, UI_HEADER_TEXT_X, 0);
+    lv_label_set_text(head, "文件管理");
+    lv_obj_align(head, LV_ALIGN_LEFT_MID, UI_HEADER_TEXT_X, 0);
 
-    s_list_hint = lv_label_create(scr);
+    s_list_hint = lv_label_create(bar);
     lv_obj_set_style_text_font(s_list_hint, UI_FONT_SMALL, LV_PART_MAIN);
     lv_obj_set_style_text_color(s_list_hint, UI_COLOR_FG_DIM, LV_PART_MAIN);
     lv_obj_set_width(s_list_hint, UI_PCT_X(62));
     lv_label_set_long_mode(s_list_hint, LV_LABEL_LONG_DOT);
     lv_obj_align_to(s_list_hint, head, LV_ALIGN_OUT_RIGHT_MID, UI_PX_W(14), 0);
 
+    /* ---- 列表（标题栏下面，竖向滚动）---- */
     s_list_col = lv_obj_create(scr);
     lv_obj_remove_style_all(s_list_col);
-    lv_obj_set_size(s_list_col, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_pad_top(s_list_col, UI_PX_H(40), LV_PART_MAIN);
+    lv_obj_set_width(s_list_col, LV_PCT(100));
+    lv_obj_set_flex_grow(s_list_col, 1);          /* 高度 = 屏幕剩余；不再是 pad_top 错位 */
+    /* pad_top 让开悬到内容区的下半截返回钮（UI_BACK_BTN_DIP）：按钮在 lv_layer_top 上、
+     * z 序最高，不让开的话第一行的图标会被它压住、也点不到。
+     * 往上滚的行会滑到按钮**下面**（按钮不透明），这正是蔚蓝档案那种效果。 */
+    lv_obj_set_style_pad_top(s_list_col, UI_BACK_BTN_DIP, LV_PART_MAIN);
     lv_obj_set_style_pad_row(s_list_col, UI_PX_H(8), LV_PART_MAIN);
     lv_obj_set_style_pad_right(s_list_col, UI_PX_W(10), LV_PART_MAIN);   /* 给滚动条让位 */
     lv_obj_set_flex_flow(s_list_col, LV_FLEX_FLOW_COLUMN);

@@ -79,6 +79,11 @@ static void bts_auto_connect_cb(void *arg)
     if (!bts_enabled || bts_connected || !bts_has_last) {
         return;
     }
+    /* 用户可能已经在设置页手动点了连接：别插一脚（bt_service_connect 自己会拒，
+     * 但这里提前返回能让日志干净） */
+    if (bt_service_is_connecting()) {
+        return;
+    }
     ESP_LOGI(TAG, "auto connect to saved device");
     bt_service_connect(bts_last_bda);
 }

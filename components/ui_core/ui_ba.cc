@@ -61,10 +61,8 @@ typedef struct {
     bool  closing;
 } ba_ctx_t;
 
-/* 按下反馈 + "复原后才派发"的回调挂载（实现在文件后半的"按下反馈"一节）。
- * ⚠ 前置声明必须放在**卡片创建之前**：卡片右上角的 ✕（ui_ba_open_in 里）就要用。 */
-static void ba_attach_press_feedback(lv_obj_t *obj);
-static void ba_attach_click(lv_obj_t *obj, lv_event_cb_t cb, void *user);
+/* "复原后才派发"的回调挂载（实现在文件后半的"按下反馈"一节）。
+ * 对外的 `ui_ba_press_feedback()` 声明在 ui_ba.h 里（返回钮也用它）。 */
 
 static ba_ctx_t *ba_ctx_of(lv_obj_t *scrim)
 {
@@ -380,8 +378,7 @@ ui_ba_dialog_t ui_ba_open_in(lv_obj_t *parent, const char *title, int width_pct,
     lv_label_set_text(xl, LV_SYMBOL_CLOSE);
     lv_obj_center(xl);
     /* 右上角 ✕ 也走同一套按下反馈（它不走 ui_ba_btn，得自己挂） */
-    ba_attach_click(close, ba_close_clicked, scrim);
-    ba_attach_press_feedback(close);
+    ui_ba_press_feedback(close, ba_close_clicked, scrim);
 
     /* ---------------- 内容区 ---------------- */
     lv_obj_t *body = lv_obj_create(card);
@@ -471,11 +468,20 @@ void ui_ba_on_close(ui_ba_dialog_t *d, void (*cb)(void *user), void *user)
 /* ------------------------------------------------------------------ 按下反馈
  *
  * 需求（2026-10 用户）：BA 按钮**按住时渐进式缩小**，松手后**先复原、再执行事件**。
+ * 2026-10 第二次需求：**标题栏的返回钮也要一模一样的手感** —— 于是这一套提成
+ * 对外入口 `ui_ba_press_feedback()`（声明在 ui_ba.h），弹窗按钮 / 选项行 / ✕ /
+ * 返回钮全走它，常量只有这一份（见 ui_core.cc 的 ui_back_button_create）。
  *
  * 实现要点（三条都别改，改了就变形）：
  *   1. 缩放用 `transform_scale_x/y`（LVGL 的单位是 **1/256**，256 = 原尺寸）。
  *      它是**绘制期变换**、不参与布局 —— 所以按钮缩小不会把旁边的按钮挤动，
  *      也不会触发整卡片重排（用宽高做动画就会）。
+ *      代价：变换期间 LVGL 会把该对象（含子树）先渲染进一层 ARGB8888 图层，
+ *      72 px 的按钮 ≈ 20 KB/帧 —— 只在 120+150 ms 的动画里发生，可以接受。
+ *      ⚠ 别改成 `lv_image_set_scale()`：那个只能作用在 **lv_image 对象**上，
+ *      对 lv_button 调用等于把 `lv_image_t` 的字段写到一块 `lv_obj_t` 大小的
+ *      内存上（本工程 `LV_USE_ASSERT_OBJ=n`，不会被拦下）—— 越界写堆内存，
+ *      而且视觉上什么都不会发生（返回钮"按了没反应"就是这么来的）。
  *   2. **用户回调不再挂 CLICKED**，改挂一个自定义事件码：
  *      真实 CLICKED 在松手**那一瞬间**就来，用它直接执行就等于"先执行、后复原"，
  *      与需求相反。所以：PRESSED → 缩小；RELEASED → 放大，动画**跑完**再派发自定义
@@ -486,9 +492,9 @@ void ui_ba_on_close(ui_ba_dialog_t *d, void (*cb)(void *user), void *user)
  *      而且**从当前实际缩放值**起步（中途打断也不会跳一下）。
  */
 #define BA_SCALE_NORM   256      /* 100% */
-#define BA_SCALE_PRESS  236      /* 按住时 ≈92% */
-#define BA_PRESS_MS     120
-#define BA_RELEASE_MS   150
+#define BA_SCALE_PRESS  150      /* 按住时 ≈92% */
+#define BA_PRESS_MS     400
+#define BA_RELEASE_MS   400
 
 static lv_event_code_t s_ba_click_evt;   /* 懒注册：= "动画跑完的那次点击" */
 static bool            s_ba_click_reg;
@@ -538,21 +544,6 @@ static void ba_btn_released_cb(lv_event_t *e)
                     BA_RELEASE_MS, lv_event_get_code(e) == LV_EVENT_RELEASED);
 }
 
-/* 给任意可点对象挂上"按下缩小 + 复原后派发"（按钮、选项行、✕ 共用一套） */
-static void ba_attach_press_feedback(lv_obj_t *obj)
-{
-    /* 缩放的枢轴放正中：LVGL 默认也是中心，这里写明，免得以后被别处改掉 */
-    lv_obj_set_style_transform_pivot_x(obj, LV_PCT(50), LV_PART_MAIN);
-    lv_obj_set_style_transform_pivot_y(obj, LV_PCT(50), LV_PART_MAIN);
-    /* 起始缩放**显式**写成 100%：别依赖默认值 —— `ba_btn_scale_to()` 会读当前值当动画
-     * 起点，默认值若不是 256，第一次按下的动画就会从错误的比例开始（跳一下）。 */
-    lv_obj_set_style_transform_scale_x(obj, BA_SCALE_NORM, LV_PART_MAIN);
-    lv_obj_set_style_transform_scale_y(obj, BA_SCALE_NORM, LV_PART_MAIN);
-    lv_obj_add_event_cb(obj, ba_btn_pressed_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(obj, ba_btn_released_cb, LV_EVENT_RELEASED, NULL);
-    lv_obj_add_event_cb(obj, ba_btn_released_cb, LV_EVENT_PRESS_LOST, NULL);
-}
-
 /* 登记用户回调：挂到自定义事件码上（见上面第 2 条），动画完成后由我们派发 */
 static void ba_attach_click(lv_obj_t *obj, lv_event_cb_t cb, void *user)
 {
@@ -566,12 +557,31 @@ static void ba_attach_click(lv_obj_t *obj, lv_event_cb_t cb, void *user)
     lv_obj_add_event_cb(obj, cb, s_ba_click_evt, user);
 }
 
-/* ------------------------------------------------------------------ 卡片内控件 */
+/*
+ * ★ 对外入口：给任意可点对象挂上"按下缩小 + 复原后才回调"。
+ *   弹窗按钮 / 选项行 / ✕ / **标题栏返回钮**（ui_core.cc）全走这一份实现 ——
+ *   常量、时长、缓动、事件顺序只有一处，改手感就改这里，各处一定一致。
+ *   on_click 传 NULL 就是"只要按下反馈、不要回调"。
+ */
+void ui_ba_press_feedback(lv_obj_t *obj, lv_event_cb_t on_click, void *user)
+{
+    if (!obj) {
+        return;
+    }
+    /* 缩放的枢轴放正中：LVGL 默认也是中心，这里写明，免得以后被别处改掉 */
+    lv_obj_set_style_transform_pivot_x(obj, LV_PCT(50), LV_PART_MAIN);
+    lv_obj_set_style_transform_pivot_y(obj, LV_PCT(50), LV_PART_MAIN);
+    /* 起始缩放**显式**写成 100%：别依赖默认值 —— `ba_btn_scale_to()` 会读当前值当动画
+     * 起点，默认值若不是 256，第一次按下的动画就会从错误的比例开始（跳一下）。 */
+    lv_obj_set_style_transform_scale_x(obj, BA_SCALE_NORM, LV_PART_MAIN);
+    lv_obj_set_style_transform_scale_y(obj, BA_SCALE_NORM, LV_PART_MAIN);
+    lv_obj_add_event_cb(obj, ba_btn_pressed_cb, LV_EVENT_PRESSED, NULL);
+    lv_obj_add_event_cb(obj, ba_btn_released_cb, LV_EVENT_RELEASED, NULL);
+    lv_obj_add_event_cb(obj, ba_btn_released_cb, LV_EVENT_PRESS_LOST, NULL);
+    ba_attach_click(obj, on_click, user);
+}
 
-/* 按下反馈 + "复原后才派发"的回调挂载（实现见文件后半的"按下反馈"一节；
- * 这里先前置声明：卡片右上角的 ✕ 在本节就要用） */
-static void ba_attach_press_feedback(lv_obj_t *obj);
-static void ba_attach_click(lv_obj_t *obj, lv_event_cb_t cb, void *user);
+/* ------------------------------------------------------------------ 卡片内控件 */
 
 lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style,
                            lv_event_cb_t cb, void *user)
@@ -636,10 +646,8 @@ lv_obj_t *ui_ba_btn_styled(lv_obj_t *row, const char *text, int style,
      * 本机是触摸 + 6 个 ADC 按键，没有键盘，这两个字纯属误导，已去掉。
      */
 
-    if (cb) {
-        ba_attach_click(btn, cb, user);      /* 按下反馈见文件头"按下反馈"一节 */
-    }
-    ba_attach_press_feedback(btn);
+    /* 按下反馈 + "复原后才派发"见文件后半"按下反馈"一节（返回钮共用同一套） */
+    ui_ba_press_feedback(btn, cb, user);
     return btn;
 }
 
@@ -675,10 +683,8 @@ lv_obj_t *ui_ba_opt_row(lv_obj_t *col, const char *text, uint32_t accent,
     lv_label_set_text(l, text ? text : "");
     lv_obj_align(l, LV_ALIGN_LEFT_MID, 0, 0);
 
-    if (cb) {
-        ba_attach_click(r, cb, user);        /* 选项行同样给按下反馈 */
-    }
-    ba_attach_press_feedback(r);
+    /* 选项行同样给按下反馈 */
+    ui_ba_press_feedback(r, cb, user);
     return r;
 }
 

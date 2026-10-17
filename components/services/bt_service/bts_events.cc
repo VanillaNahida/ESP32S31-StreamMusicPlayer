@@ -24,10 +24,12 @@
 #include "freertos/stream_buffer.h"
 
 #include "bts_audio.h"
+#include "bts_conn.h"
 #include "bts_feed.h"
 #include "bts_name_cache.h"
 #include "bts_settings.h"
 #include "bts_state.h"
+#include "bts_volume.h"
 
 static const char *TAG = "bt_svc";   /* 与拆分前一致：日志里仍显示 bt_svc */
 
@@ -55,6 +57,17 @@ void bts_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void *user
     case ESP_BT_AUDIO_EVENT_DEVICE_DISCOVERED: {
         const esp_bt_audio_event_device_discovered_t *d =
             (esp_bt_audio_event_device_discovered_t *)event_data;
+        /*
+         * ⚠ 过滤无效 BDA：真机日志里查询会吐出一条**全 0 地址**
+         *   （`Scanned device: 00:00:00:00:00:00`），原来是直接进列表的 ——
+         *   用户点了它必然连不上，还会占掉一个设备槽（BT_DEV_MAX）。
+         */
+        {
+            static const uint8_t zero[6] = {0};
+            if (memcmp(d->addr, zero, 6) == 0) {
+                break;
+            }
+        }
         bt_dev_t *e = bts_dev_find(d->addr, true);
         if (e) {
             /*
@@ -97,6 +110,14 @@ void bts_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void *user
         if (st->tech != ESP_BT_AUDIO_TECH_CLASSIC) {
             break;
         }
+        /*
+         * 关开关/deinit 期间协议栈还在往外吐剩余事件（bts_state 已经是 UNINIT）：
+         * 这时候再改 bts_connected / bts_state 只会把一个"已经关了"的状态搅乱 ——
+         * 尤其别把 UNINIT 覆盖成 READY（那会让 bt_service_is_ready() 说谎）。
+         */
+        if (bts_state == BT_ST_UNINIT) {
+            break;
+        }
         bts_connected = st->connected;
         if (st->connected) {
             char addr[18];
@@ -106,16 +127,25 @@ void bts_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void *user
             /* 名字可能来自扫描表或 NVS：顺手同步进缓存（是 MAC 兜底时函数内部会跳过） */
             bts_name_save(st->addr, bts_peer_name);
             memcpy(bts_peer_bda, st->addr, 6);
-            bts_state = BT_ST_CONNECTED;
             ESP_LOGI(TAG, "a2dp connected: %s (%s)", bts_peer_name, addr);
             /* 记住这台设备：下次开机自动连它（需求） */
             bts_settings_save_last(st->addr);
             bt_service_refresh_bonded();
+            /* ★ 连接状态机收尾：清目标、停超时/重试定时器、置 BT_ST_CONNECTED */
+            bts_conn_on_connected(st->addr);
         } else {
             bts_streaming = false;
             bts_stream    = NULL;
-            bts_state     = BT_ST_READY;
-            ESP_LOGW(TAG, "a2dp disconnected");
+            /*
+             * ★ 先问连接状态机："这个断开是不是我正在连的那台失败了？"
+             *   - 是：它自己安排重试（保持 BT_ST_CONNECTING）或收尾成
+             *     BT_ST_CONNECT_FAILED；这里**不要**再改 bts_state。
+             *   - 否：普通掉线/主动断开，按原逻辑回 READY。
+             */
+            if (!bts_conn_on_disconnected(st->addr)) {
+                bts_state = BT_ST_READY;
+                ESP_LOGW(TAG, "a2dp disconnected");
+            }
         }
         break;
     }
@@ -141,6 +171,15 @@ void bts_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void *user
                          (unsigned)info.bits, (unsigned)info.frame_size);
             }
             ESP_LOGI(TAG, "streaming, PCM buffer %d bytes", (int)PCM_BUF_BYTES);
+            /*
+             * 把当前音量下发给对端（AVRCP 绝对音量）。
+             * 放在这里而不是"连接成功"那一刻：AVRCP Controller 是在 ACL 建链之后
+             * 才连上的，连接事件那会儿多半还没就绪（set_absolute 会返回
+             * ESP_ERR_INVALID_STATE）；A2DP 流启动时它必然已经在了。
+             * 不这么做的话，用户在扬声器下把音量调到 30% 再切蓝牙，耳机仍按它
+             * 自己的音量放 —— 一耳朵就是巨响。
+             */
+            bts_volume_reapply();
             break;
         }
         case ESP_BT_AUDIO_STREAM_STATE_STOPPED:
@@ -154,6 +193,20 @@ void bts_audio_event_cb(esp_bt_audio_event_t event, void *event_data, void *user
             break;
         default:
             break;
+        }
+        break;
+    }
+    case ESP_BT_AUDIO_EVENT_VOL_ABSOLUTE: {
+        /*
+         * 对端（耳机按键 / 手机）通过 AVRCP 改了绝对音量。
+         * 注意这里是**蓝牙栈任务上下文**：只同步状态，别碰 LVGL、别再回发 AVRCP
+         * （回发会触发对端再发一次通知 = 来回打乒乓）。
+         */
+        const esp_bt_audio_event_vol_absolute_t *v =
+            (esp_bt_audio_event_vol_absolute_t *)event_data;
+        if (v) {
+            /* mute 位也算：对端静音 = 音量 0（组件目前恒填 false，防御性处理） */
+            bts_volume_on_peer(v->mute ? 0 : (int)v->vol);
         }
         break;
     }

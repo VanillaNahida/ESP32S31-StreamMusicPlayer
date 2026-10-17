@@ -13,7 +13,7 @@
           ├─> libs/espaudiocore（解码，PCM 恒 16-bit）─> PCM ringbuf(32KB,PSRAM)
 在线 HTTP ┘                                                   │
                                                               ▼
-                                        audio_output.cc：esp_asrc → 48kHz/16bit/2ch
+                              audio_output.cc：esp_asrc（S31 硬件 ASRC/GDMA）→ 48kHz/16bit/2ch
                                                               │
                               ┌───────────────────────────────┼──────────────────────┐
                               ▼                               ▼                      ▼
@@ -22,7 +22,7 @@
 
 - **解码**：`libs/espaudiocore`（vendored 组件，根 `CMakeLists.txt` 的
   `EXTRA_COMPONENT_DIRS` 注册）。7 种格式：WAV/MP3/AAC/FLAC/Vorbis/Opus/WavPack + M4A。
-- **重采样/声道转换**：`espressif/esp_asrc`（**软件**路径，见 §4）。
+- **重采样/声道转换**：`espressif/esp_asrc`（**S31 硬件 ASRC 外设 + GDMA**，见 §4）。
 - **在线传输**：自研（`audio_http.cc`，esp_http_client + Range + 重连），
   GMF 的 `esp_gmf_io_http` 已随 M2 一起退出构建。
 - 组件列表里**不再有** `esp_audio_simple_player` / `gmf_audio` / `gmf_io` / `gmf_core`
@@ -61,18 +61,67 @@
 由它写 `esp_codec_dev_write()`（TDM 通道归板级管理器所有，我们只是消费者，
 与 GMF 时代一致）。
 
-## 4. 重采样为什么用 esp_asrc 的软件路径
+## 4. 重采样：**硬件 ASRC**（软件路径已被真机证伪，2026-10 换掉）
 
-S31 有硬件 ASRC，但硬件路径要经 GDMA 访问 PSRAM 缓冲，对 cache-line 对齐与一致性
-有硬要求 —— `bt_service.cc` 已经踩过"先慢放、几秒后全是噪音"的坑并退回软件路径。
-本工程沿用同样选择：`ESP_ASRC_PERF_TYPE_SW_SPEED` + complexity 3。
-44.1k→48k 立体声每秒不到 200 KB，320 MHz 上余量充足。
+### 4.1 为什么必须换
 
-> 想试硬件：把 `audio_output.cc::asrc_open()` 里的 `perf_type` 改成
-> `ESP_ASRC_PERF_TYPE_AUTO`，并改用 `esp_asrc_get_buffer_alignment()` +
-> `esp_asrc_align_alloc()` 分配缓冲。注意 **S31 的硬件 ASRC 只支持 16-bit 输入**
-> （`esp_asrc/hw/caps/esp32s31/asrc_caps_check.c`），这也是我们把
-> `cfg.output_bits` 定成 16 的原因之一。
+软件路径（`ESP_ASRC_PERF_TYPE_SW_SPEED`）= esp_audio_effects 的 `esp_ae_rate_cvt`，
+44.1k→48k 立体声在真机上**吃掉一整个核**，而且它跟输出任务同核，于是两边一起饿死：
+
+```
+audio_out: play stats: PCM 78 KB/s | 产 2125 ms / 墙 5018 ms (42.3%) | asrc 5047 ms (cpu 5047 ms)
+task_wdt: Task watchdog got triggered: IDLE1 (CPU 1)
+task_wdt: CPU 1: audio_out
+--- 0x40188598: fa_resample_process at rsp_proc.c.obj:?      ← 就卡在软件重采样里
+```
+
+`asrc 5047 ms / 墙 5010 ms` = 100% 的墙钟都花在重采样上；生产端只剩 42%，
+两个 IDLE 都喂不到狗 → WDT。板载/蓝牙都一样（板载 I2S 是硬件时钟，说明是**产不出**，
+不是送不出）。
+
+### 4.2 换成了什么
+
+`espressif/esp_asrc` 的 **硬件路径**：S31 的 ASRC 外设（`SOC_ASRC_SUPPORTED`，
+2 个 stream）+ 两路 GDMA，数据是内存到内存的**突发**转换，`esp_asrc_hw_process()`
+阻塞在 RX 收帧事件上 —— CPU 占用≈0。
+
+选哪条路由 menuconfig 的 **Audio Service → 输出级 ASRC 性能模式** 决定，默认 `AUTO`：
+
+| 选项 | 行为 |
+| --- | --- |
+| `AUTO`（默认，推荐） | 硬件能干的都交给硬件；只做声道上混（48k mono→stereo）时落回软件的声道转换；硬件 open 失败自动退回软件 |
+| `HW_ONLY` | 只走硬件；本工程仍会在 open 失败时退回软件（宁可慢，不能变调） |
+| `SW_SPEED` | 旧行为，只走软件（对照用，44.1k→48k 吃一个整核） |
+
+### 4.3 三条硬约束（代码里都照做了，别拆）
+
+1. **缓冲必须放内部 RAM**（或按 cache line 对齐的 PSRAM）。硬件路径经 GDMA 读写内存，
+   PSRAM 缓冲在每次 process 前后都要 `esp_cache_msync()`、地址与长度还要 cache-line
+   对齐，否则返回 `ESP_ASRC_ERR_INVALID_ALIGNMENT`。`audio_output.cc::asrc_buf_alloc()`
+   一律 `MALLOC_CAP_INTERNAL|MALLOC_CAP_DMA`，于是两条 msync 都变成空操作，
+   彻底绕开"先慢放、几秒后全是噪音"那类 cache 一致性问题（`bt_service` 当年踩过）。
+2. **喂进去的整片要先 memcpy 到内部 RAM 的 `s_in_buf`**。PCM ringbuf 在 PSRAM 里，
+   切出来的片不保证对齐 —— 拷一遍就把"地址/长度对齐 + 一致性"整类问题挡在门外
+   （4 KB ≈ 50 µs，可忽略）。
+3. **S31 的硬件 ASRC 只认 16-bit / 1~2ch / 8000|16000|24000|32000|44100|48000**
+   （`esp_asrc/hw/caps/esp32s31/asrc_caps_check.c`）。ringbuf 恒为 16-bit
+   （espaudiocore `cfg.output_bits=16`），所以 44.1k/32k/24k/16k/8k 全部走硬件；
+   **22050 Hz 不在表里 → AUTO 自动落回软件**（日志 `asrc ready (sw)`），这是设计内行为。
+
+### 4.4 ⚠ 硬件 ASRC 只有 2 个 stream
+
+立体声一次就吃满 2 个，也就是**同时只能有一路立体声硬件重采样**。
+`bt_service` 那条 48k → A2DP 协商率的重采样**刻意继续走软件**（`bts_audio.cc`），
+避免跟这里抢；真抢了也只是 AUTO 自动退回软件，不会失败、不会没声。
+
+> 历史：`bt_service` 曾因为"缓冲归属/同步没对齐"踩到 "先慢放、几秒后全是噪音" 并退回
+> 软件路径 —— 那次的经验是**别把 PSRAM 缓冲交给 GDMA**，本次正是照这条做的。
+
+**遗留（未做）**：蓝牙路的链路是 `44.1k 源 →(输出级)48k →(bt_service)协商率 44.1k`，
+也就是**同一段音频被重采样两次**。输出级那次现在免费（硬件），`bt_service` 那次仍是
+软件（`bts_audio.cc`，complexity 3）。如果换成蓝牙后**仍然**一卡一卡，下一步就是这里：
+① complexity 3 → 2；或 ② 干脆让输出级按 A2DP 协商率输出（省掉一次无谓的重采样，
+代价是 48k 那条"192 B/ms"的时间轴不变式要跟着改）。
 
 ## 5. 关键语义（与 GMF 时代不同，app 层依赖）
 
@@ -117,7 +166,9 @@ S31 有硬件 ASRC，但硬件路径要经 GDMA 访问 PSRAM 缓冲，对 cache-
 | 日志 | 含义 |
 | --- | --- |
 | `audio_eng: probe: N bps, N ms, N Hz, Nch` | 本地文件起播时的参数探测结果（0 = 探不到） |
-| `audio_out: source format: N Hz Nch` / `asrc ready (sw): ...` | 源格式与重采样器建立（**没有 asrc 那行 = 48k/2ch 直通**） |
+| `audio_out: source format: N Hz Nch` / `asrc ready (hw\|sw): ...` | 源格式与重采样器建立（**没有 asrc 那行 = 48k/2ch 直通**）。`(hw)` = S31 硬件 ASRC 在跑（`asrc` 列应只有几百微秒）；`(sw)` = 硬件用不了（22050 Hz / stream 被占）才退回软件 |
+| `audio_out: asrc: 硬件路径开不起来 (...)，退回软件重采样` | 期望之外的软件回退，看括号里的错误码 |
+| `E ESP_HW_ASRC: HW ASRC process timeout` | 硬件路径一次 DMA 没收到帧（`ASRC_TIMEOUT_MS=200`）；连着出就去查 GDMA/缓冲 |
 | `audio_out: play stats: PCM N KB/s (…) audio N ms, codec N ms, gap max N ms, route N, src N Hz Nch` | 每 5 秒一行：`gap max` 大 = 被饿住；`codec` 大 = 写 codec 慢；`PCM` 应接近 192 KB/s |
 | `audio_http: HTTP 206 from N, remaining N (total N)` | Range 续传/seek 生效 |
 | `audio_http: server ignored Range (200), skipping N bytes locally` | 服务端不支持 Range（慢，但功能对） |
@@ -210,11 +261,12 @@ ringbuf（网络流）源不可 seek，永远走不到这里 —— 以流式为
 
 | # | 操作 | 期望日志 / 现象 |
 | --- | --- | --- |
-| 1 | 插卡 → 本地音乐 → 放一首 **MP3** | `audio_eng: probe: N bps, N ms, N Hz, 2ch`；`audio_out: source format: 44100 Hz 2ch`（或 48000）；**有 `asrc ready (sw)` 说明在重采样** |
+| 1 | 插卡 → 本地音乐 → 放一首 **44.1k MP3** | `audio_eng: probe: N bps, N ms, N Hz, 2ch`；`audio_out: source format: 44100 Hz 2ch`；**`asrc ready (hw): 44100 Hz 2ch -> 48000 Hz 2ch`** —— 这里必须是 `(hw)`，`(sw)` 说明硬件没用上 |
 | 2 | 听 30 秒 | `audio_out: play stats: PCM ~190 KB/s`（48k/16/2 满速就是 192 KB/s；明显低于 150 就要查 `gap max`/`codec` 两列） |
 | 3 | 拖进度条到中段 | `audio_seek: local seek -> NNN ms`，声音从新位置接上（**不再有"定位失败：码率未知"**） |
-| 4 | 放一首 **FLAC 44.1k/24bit** | 应当出声且不变调（变调=重采样没生效）；`play stats` 里 `(asrc)` 标记在 |
-| 5 | 放一首 **单声道 WAV** | 左右都有声（mono→stereo 走的是 esp_asrc 的声道转换） |
+| 4 | 放一首 **FLAC 44.1k/24bit** | 应当出声且不变调（变调=重采样没生效）；`play stats` 末尾是 `(asrc-hw)`，且 `asrc` 列**只有几百微秒**、`产/墙` 应≈100% |
+| 5 | 放一首 **单声道 48k WAV** | 左右都有声（mono→stereo 走 esp_asrc 的声道转换；48k 不变率，AUTO 会落在软件声道转换上，日志是 `(sw)` —— 正常） |
+| 5b | 放一首 **22050 Hz 文件** | 出声且不变调；`asrc ready (sw)` + `asrc: 硬件路径开不起来` 是**设计内**的（22.05k 不在硬件表里） |
 | 6 | 切到**蓝牙**输出 | `audio_out: output route -> 1`；听耳机出声；`play stats` 的 `PCM` 仍接近 192 KB/s |
 | 7 | 在线歌单 → 点一首 | `audio_http: prepare: ...` → `sniffed N bytes -> format 1`（1=MP3）→ `streaming ... (fmt 1, total N)` |
 | 8 | 缓冲期间看播放器页 | 转圈 + `缓冲中 xx KB/s · NN%`（百分比要有；KB/s 是 `audio_http_speed()` 的 Kbps ÷8） |
@@ -238,8 +290,77 @@ ringbuf（网络流）源不可 seek，永远走不到这里 —— 以流式为
    真出现长停顿表现为"提前结束"，由 app 层 `s_eof_retry`（最多 3 次）重刷地址 + 断点续播兜住。
    要根治需要给 ringbuf 源加"生产者还活着"的信号（改库）。
 2. **在线 seek 不支持 FLAC/WAV/M4A**（见 §5）。
-3. **硬件 ASRC 未启用**（见 §4）。
+3. **硬件 ASRC 只覆盖 6 种采样率**（8/16/24/32/44.1/48k）且只有 2 个 stream，
+   22050 Hz 之类的率只能走软件（见 §4.1、§4.4）。
 4. **在线进度百分比**依赖服务端给 `Content-Length`（分块传输时不显示百分比，UI 已兼容）。
 5. `audio_service_position_ms()` 是"送去硬件的字节 ÷192"，比耳朵听到的**超前**
    一个 PCM ringbuf（32 KB ≈ 170 ms）+ codec DMA 的量 —— 目前只用于日志，
    若将来要做"精确进度"需要减掉这段积压。
+
+## 10. 蓝牙音量：AVRCP 绝对音量（2026-10 换掉软件缩放）
+
+### 10.1 为什么换
+
+旧做法是**每一块喂给蓝牙的 PCM 都乘一遍音量系数**（`audio_output.cc` 的
+`pcm16_scale()`）。问题是：
+
+- 音量衰减发生在**我们这边**，耳机自己的音量条/档位**不动**，用户按耳机上的音量键
+  看到的是另一套数值；
+- 每块 PCM 多一次全量 memcpy + 逐样本乘法（48k/2ch 满速 192 KB/s），白烧 CPU；
+- 16-bit 域缩放**天然掉信噪比**：音量 20% 时等于把 16 bit 有效位砍到 13 bit。
+
+A2DP 源的标准做法是 **AVRCP 绝对音量**（手机都是这么干的）：把 0~100 的期望音量用
+`SetAbsoluteVolume` 发给对端，由耳机/音箱**自己**衰减 —— 对端音量条跟着动，我们零成本、
+零音质损失。
+
+### 10.2 怎么接的（全部走 `esp_bt_audio_vol.h`）
+
+```
+audio_service_set_volume(60)                       ← 用户按 VOL± / 拖滑条 / 控制中心
+  → audio_output_set_volume(60)
+     → [route=蓝牙] bt_service_set_volume(60)       bt_service/bts_volume.cc
+        → esp_bt_audio_vol_set_absolute(60)         ← esp_bt_audio 的 vol_ops
+           → BTC 投递 AVRCP SetAbsoluteVolume（非阻塞）
+              → 对端回 SET_ABSOLUTE_VOLUME_RSP + VOLUME_CHANGE
+                 → 组件派发 ESP_BT_AUDIO_EVENT_VOL_ABSOLUTE
+                    → bts_volume_on_peer() → audio_service 同步 s_volume + NVS（**不回发**）
+```
+
+| 点 | 事实 |
+| --- | --- |
+| 角色 | `cfg.classic.roles` 必须带 **`ESP_BT_AUDIO_CLASSIC_ROLE_AVRC_CT`**（A2DP 源 + AVRCP Controller）。不写它，`esp_bt_audio_vol_set_absolute()` 恒返回 `ESP_ERR_INVALID_STATE` 并在组件里刷 `Operation failed: vol_ops.set_absolute is not registered` —— 因为 vol_ops 只在 CT 连上时才注册 |
+| 取值域 | **0~100**（组件内部再转 0~127），不是 0~127；别自己换算 |
+| 何时下发 | ① 用户改音量（`bt_service_set_volume`）② 切到蓝牙输出（`audio_output_set_route`）③ A2DP 流启动（`bts_events.cc` 的 `STREAM_STARTED`，补发缓存的音量） |
+| 为什么要在流启动时补发 | AVRCP Controller 是在 ACL 建链**之后**才连上的，「连接成功」那一刻它多半还没就绪。不补发的话：用户在扬声器下把音量调到 30% 再切蓝牙，耳机会按**它自己的**音量放 = 一耳朵巨响 |
+| 兜底 | AVRCP 不可用（CT 没连上 / 对端不支持）时，`write_out()` 退回 `pcm16_scale()` 软件缩放。判据是 `bt_service_volume_is_avrcp()`（= 上一次 `set_absolute` 的返回值） |
+| ⚠ 绝不能两条同时生效 | 那就是**平方衰减**（滑到 50% 听感像 25%） |
+| ⚠ 防乒乓 | 对端收到 `SetAbsoluteVolume` 会回一条 `VOLUME_CHANGE` 通知；`bts_volume_on_peer()` 只在**值真的变了**时才通知上层，且上层（`audio_output_note_peer_volume`）**绝不回发**，否则两个设备互相刷 |
+
+> 还有一个**限流**：`bts_volume_set()` 里有 60 ms / 5% 的节流（`BTS_VOL_MIN_INTERVAL_MS`）——
+> 音量滑条每来一个 `PRESSING` 就调一次（实测 60~100 Hz），不限流就是每次拖滑条上千条
+> AVRCP 命令 + 组件自己那行 `CT: Set volume to N` 的 ESP_LOGI，115200 的 console 直接被刷爆。
+> 被丢掉的那几次只更新缓存，最新值由下一次调用或 `bts_volume_reapply()` 补发。
+
+### 10.3 判读日志
+
+| 日志 | 含义 |
+| --- | --- |
+| `bt_vol: AVRCP 绝对音量 可用：音量交给对端（vol=60%）` | CT 已连上，`set_absolute` 成功 —— 之后音量由耳机执行 |
+| `bt_vol: AVRCP 绝对音量 不可用：退回软件缩放（vol=60%）` | CT 没连上或对端不支持 → `write_out()` 开始做软件缩放（能听出来，但音质/CPU 都吃亏） |
+| `bt_vol: 下发音量 60% 给对端（AVRCP ok）` | 流启动 / 切路由时的补发 |
+| `bt_vol: 对端 AVRCP 把音量改成 40%` | 耳机/手机自己拧了音量，本地状态与 NVS 已同步 |
+| `E BT_AUD_OPS: Operation failed: vol_ops.set_absolute is not registered` | **AVRCP CT 没开**（roles 少写了 AVRC_CT）或还没连上 |
+
+### 10.4 组件版本
+
+`esp_bt_audio` 用的是本机已有的 **1.1.0~2**（`managed_components/espressif__esp_bt_audio`），
+它**已经带 `esp_bt_audio_vol.h`**，API 与官方 1.2.0 文档一致（`esp_bt_audio_vol_set_absolute(uint32_t vol)`，0~100）。
+工程里写的是 `espressif/esp_bt_audio: "^1.1.0"`（语义上允许 1.2.0）；联网后想显式升到 1.2.0：
+
+```powershell
+idf.py add-dependency "espressif/esp_bt_audio^1.2.0"
+idf.py update-dependencies
+```
+
+> 本机当时没有外网（组件仓库 `components-file.espressif.com` 不可达、代理未运行），
+> 硬改 yml 会让解析失败、整个配置过程报「Cannot establish a connection to the component registry」。

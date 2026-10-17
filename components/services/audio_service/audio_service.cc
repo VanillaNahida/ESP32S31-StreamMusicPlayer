@@ -61,6 +61,36 @@ void audio_service_set_event_cb(audio_event_cb_t cb, void *user)
 }
 
 /* ===========================================================================
+ * 蓝牙 AVRCP 绝对音量：对端改了音量
+ *
+ * 耳机/手机自己把音量拧了，AVRCP 通过 ESP_BT_AUDIO_EVENT_VOL_ABSOLUTE 报上来。
+ * 我们只**同步状态**（内存 + NVS + 输出级缓存），绝不回发 —— 回发会让两个设备
+ * 互相刷音量（见 audio_output_note_peer_volume 的注释）。
+ *
+ * ⚠ 跑在蓝牙栈任务上下文：不碰 LVGL；play_state_volume_set() 自带防抖与锁，
+ *   不会在这里写穿 flash。
+ * =========================================================================*/
+static void on_bt_volume_from_peer(int percent, void *user)
+{
+    (void)user;
+    if (percent < 0) {
+        percent = 0;
+    }
+    if (percent > 100) {
+        percent = 100;
+    }
+    /* 只有当前真的走蓝牙输出时才认这条事件（否则是别的链路的残留） */
+    if (audio_output_route() != AUDIO_OUT_BLUETOOTH) {
+        return;
+    }
+    s_volume = percent;
+    audio_output_note_peer_volume(percent);
+    bsp_audio_set_mute(percent == 0);
+    play_state_volume_set(percent);   /* 唯一的 NVS 落盘点仍在这里 */
+    ESP_LOGI(TAG, "peer set volume -> %d%%", percent);
+}
+
+/* ===========================================================================
  * 初始化
  * =========================================================================*/
 
@@ -97,6 +127,10 @@ esp_err_t audio_service_init(void)
     bsp_audio_set_mute(true);
     bsp_audio_pa_enable(false);
     audio_output_set_volume(s_volume);
+
+    /* 蓝牙 AVRCP 绝对音量：对端改了音量要回到这里（蓝牙可能还没 init，
+     * 这只是把回调记下来，bt_service 初始化时会用）。 */
+    bt_service_set_volume_cb(on_bt_volume_from_peer, NULL);
 
     s_inited = true;
     ESP_LOGI(TAG, "ready: espaudiocore decode -> asrc -> %d Hz/%dch/%dbit, volume %d",

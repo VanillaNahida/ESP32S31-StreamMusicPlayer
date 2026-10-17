@@ -93,7 +93,9 @@ static lv_obj_t *page_online(void)
     lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);
-    lv_obj_set_style_pad_top(scr, UI_STATUSBAR_H + UI_PX_H(6), LV_PART_MAIN);
+    /* pad_top = UI_TITLEBAR_Y：标题行正好落在状态栏下面那条标题栏里，
+     * 与全局返回钮同一条中线（原来是 +UI_PX_H(6)，比标题栏高 2 px，会错开） */
+    lv_obj_set_style_pad_top(scr, UI_TITLEBAR_Y, LV_PART_MAIN);
     lv_obj_set_style_pad_row(scr, UI_PX_H(6), LV_PART_MAIN);
     /* 纵向 flex：标题行 / tab 行 / 三页宿主（宿主 flex_grow 吃掉剩余高度）。
      * 为什么不用"绝对定位 + 给宿主留 pad_top"：那样宿主容器会整屏盖住标题行，
@@ -101,10 +103,11 @@ static lv_obj_t *page_online(void)
     lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
     ao_pages_set_root(scr);
 
-    /* 标题行（返回键由 ui_router/ui_core 统一叠在顶层，不再每页自己画） */
+    /* 标题行（返回键由 ui_router/ui_core 统一叠在顶层，不再每页自己画）。
+     * 高取 UI_TITLEBAR_H：和那条标题栏同高，标题 LEFT_MID 就自动落在中线上 */
     lv_obj_t *head = lv_obj_create(scr);
     lv_obj_remove_style_all(head);
-    lv_obj_set_size(head, LV_PCT(100), UI_PX_H(40));
+    lv_obj_set_size(head, LV_PCT(100), UI_TITLEBAR_H);
     lv_obj_remove_flag(head, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_t *title = lv_label_create(head);
     lv_obj_set_style_text_font(title, UI_FONT_TITLE, LV_PART_MAIN);
@@ -129,6 +132,9 @@ static lv_obj_t *page_online(void)
     lv_obj_t *tabs = lv_obj_create(scr);
     lv_obj_remove_style_all(tabs);
     lv_obj_set_size(tabs, LV_PCT(100), UI_PX_H(42));
+    /* 让开悬到内容区的下半截返回钮（见 ui_metrics.h 的 UI_BACK_BTN_DIP）：
+     * 按钮在 lv_layer_top 上 z 序最高，不让开的话第一个页签会被它压住 */
+    lv_obj_set_style_pad_top(tabs, UI_BACK_BTN_DIP, LV_PART_MAIN);
     lv_obj_set_flex_flow(tabs, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(tabs, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_column(tabs, UI_PX_W(26), LV_PART_MAIN);

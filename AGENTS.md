@@ -26,7 +26,11 @@
 1. 本板 I2S 是 **TDM**，espaudiocore 的 I2S 输出模式（STD API 重配时钟）**不可用** ——
    一律"解码到 ringbuf + 我们自己写 `esp_codec_dev_write()`"。
 2. 写硬件的 PCM **恒为 48kHz/16bit/2ch**（由 `audio_output.cc` 用 esp_asrc 统一），
-   所以时间轴只有一个口径：`ms = 字节数 ÷ 192`。
+   所以时间轴只有一个口径：`ms = 字节数 ÷ 192`。重采样默认走 **S31 硬件 ASRC**
+   （`ESP_ASRC_PERF_TYPE_AUTO`，menuconfig `Audio Service → 输出级 ASRC 性能模式`）；
+   软件路径在真机上会吃掉**一整个核**（真机日志 `asrc 5047 ms / 窗口 5010 ms` + IDLE1 WDT），
+   已被证伪。三条硬约束（缓冲必须内部 RAM、喂进去前 memcpy 到 `s_in_buf`、只有 6 种
+   采样率走硬件）见 [`docs/audio-stack.md`](docs/audio-stack.md) §4。
 3. 会话锁（`audio_core_lock()`）只保护"起播/停止/seek 重开"；**输出任务与事件回调绝不取锁**。
 
 构建入口也变了：本机 `idf.py` 会被 PowerShell 执行策略/沙箱挡住，统一用
@@ -177,6 +181,66 @@ AMOLED、ES8311。
 - 播放器页是**横屏左右分栏**（左封面 / 右歌词与信息）
 - 图标用矢量/位图，**不用 emoji**
 - 800×480 下中文最小 14 px
+- **标题栏（导航栏）口径（2026-10 用户两次调整后的定版）**：状态栏正下面那一条
+  就是导航栏，**返回钮的圆心落在导航栏中线上** —— 与标题、页签、右上角动作按钮
+  同在一条线（用户原话："把返回按钮往左上角调整点，且按钮中心位置与其他元素对齐"）：
+
+  ```
+  ┌─ 状态栏（UI_STATUSBAR_H）────────────┐
+  │  12:34                        ▮▮▮   │
+  ├─ 导航栏（UI_TITLEBAR_H）─────────────┤
+  │ ╭────╮                              │   ← 圆心 = 栏的中线
+  │ │ ◀  │   <标题 / 信息…>             │      （UI_TITLEBAR_MID）
+  └─╰────╯──────────────────────────────┘
+       （下半悬出 UI_BACK_BTN_DIP = 8）
+  ```
+
+  度量全在 `ui_metrics.h` 的 `UI_TITLEBAR_*` / `UI_BACK_BTN_*`。
+  - 返回钮：烘好的位图 `back_arrow`（`assets/icons/back.png`：蓝圆底 + 白左箭头），
+    `UI_BACK_BTN_SIZE` = **64 px** = 栏高 48 + 上下各一个 `UI_PAGE_PAD`(8)。
+    为什么不是 72：圆心一旦在中线上，按钮就上下各悬 (SIZE - 栏高)/2 —— 64 时上边
+    正好贴状态栏下沿、下边正好压到内容区第一行；72 会顶进状态栏 4 px（那是后画的
+    半透明暗条，会把圆顶切出一道平口）。尺寸沿革：36（太小）→ 72（用户要求翻倍）
+    → 64（这次"往上、与其他元素对齐"）。
+    **改这个数必须同步改 `assets/icons/icons.txt` 里 `back_arrow` 的边长并重烘**
+    （位图是按显示尺寸烘的，不是运行期缩放）。
+  - 左边界 `UI_BACK_BTN_X` = `UI_EDGE_HOTZONE`(24) 就是"按得到的最左一列"：
+    左边缘 24 px 是返回手势热区，它挂在 `lv_layer_top()` 上、z 序比按钮高，按钮
+    再往左挪就会被吃掉一部分（按了没反应）。
+  - 摆位**必须用 `ui_back_button_place()`**，不要各页自己 `lv_obj_align`：
+    align 的偏移是相对**父容器内容区**（扣掉 padding）算的，全局键的父容器是无 padding 的
+    `lv_layer_top()`、页面里的父容器是 `as_make_screen()` 造的 screen（有 padding）——
+    各写各的就会差一个 padding、返回钮对不齐。该函数自己扣 padding，落点全局一致。
+  - 标题在栏里垂直居中（`ui_titlebar_text_dy()` 按标题字体行盒真算）——
+    与按钮圆心同一条线。
+  - ⚠ **栏下第一块控件必须让开 `UI_BACK_BTN_DIP`(8 px)**：按钮 z 序在页面内容之上，
+    不让开的话第一行/第一个页签会被它压住（既看不见也点不到）。
+    现有做法：`music_view_local` 的列表 `pad_top`、`as_page_shell` 的 body `pad_top`、
+    `app_online` 的 tabs `pad_top`。**背景类内容（播放器页的封面/壁纸）不用让** ——
+    按钮压在背景上正是蔚蓝档案那个味道。
+  - ⚠⚠ **页面自带的返回钮要在滚动 body 之后创建**（设置页就是这么写的）：LVGL 是
+    "后建的画在上面"，先建按钮的话滚动行会盖住它。全局返回键挂在 `lv_layer_top()` 上，
+    天然最高，没这个问题。
+
+  返回钮的交互：**与弹窗按钮完全同一套**（用户要求"和弹窗里的按钮一样有按下后放大
+  缩小的反馈"）——按住缩到 ≈92%（120 ms）→ 松手 150 ms 缓出复原 → **复原动画跑完**
+  才执行 `ui_router_pop()`；手指滑走（`PRESS_LOST`）只复原、不返回。
+  实现在 `ui_ba.cc` 的 `ui_ba_press_feedback()`，**弹窗按钮 / 选项行 / ✕ / 返回钮
+  共用这一份**（`ui_core.cc` 的 `ui_back_button_create()` 只把回调交给它）；
+  **全局返回键与设置页子页外壳共用同一个 `ui_back_button_create()`**
+  （后者把它排进 flex 标题行里，并把 `no_back` 置位）。
+  ⚠ 缩放是对象级 `transform_scale`（绘制期变换，不参与布局），代价是动画期间
+  每帧一层 ARGB8888（64 px ≈ 16 KB），可以接受。
+  ⚠⚠ **别改回 `lv_image_set_scale()`**：那个 API 只接受 lv_image 对象，拿 lv_button
+  去调等于按 `lv_image_t` 的字段写一块 `lv_obj_t` 大小的内存（本工程
+  `LV_USE_ASSERT_OBJ=n`，不会被拦）—— 越界写堆，而按钮绘制根本不看那些字段，
+  于是"按下去毫无反馈"。2026-10 返回钮就是这样：把 `BACK_PRESS_SCALE` 从 192
+  调到 150、时长调到 300 ms 都没有任何反应，根因就在这里。
+  ⚠ `back_arrow` 素材自带蓝圆底，**别再给按钮画圆底/描边**（会露两层边）。
+  ⚠⚠ **标题栏与滚动区必须是两个盒子、父容器 flex 列排**，不能靠 `pad_top` 错开 ——
+  LVGL 的裁剪用的是对象自己的盒子（不算 padding），滚动内容会盖住标题。
+  真机踩过（文件管理页标题被列表压掉一半），完整现场与铁律见
+  [`docs/lvgl-pitfalls.md`](docs/lvgl-pitfalls.md) §4。
 - ⚠ **LVGL 真机崩溃的坑集中在 [`docs/lvgl-pitfalls.md`](docs/lvgl-pitfalls.md)** ——
   改"全局复用的控件"和"挂 `lv_layer_top()` 的浮层/键盘"之前**必读**。
   最容易踩的一条：`lv_keyboard_set_textarea()` / `lv_pinyin_ime_attach()` 只存指针、
@@ -577,6 +641,12 @@ I media_meta: cover decoded 240x240                          ← 说明 media_me
   （`bt_cfg/last`，在 A2DP 连上时写入，init 后延时 3 秒发起）
 - **SNTP**：WiFi 拿到 IP 后在事件回调里 `esp_netif_sntp_init("ntp.aliyun.com")`，
   顺便 setenv TZ=CST-8 —— 既让首页时钟不再"等待校时"，也让 https 证书校验有正确时间
+- **蓝牙音量 = AVRCP 绝对音量**（2026-10 换掉逐样本软件缩放）：`bt_service_set_volume()`
+  → `esp_bt_audio_vol_set_absolute()`（`esp_bt_audio_vol.h`，取值 **0~100**），由耳机自己衰减。
+  三条铁律：① `cfg.classic.roles` **必须带 `ESP_BT_AUDIO_CLASSIC_ROLE_AVRC_CT`**（否则 vol_ops
+  不注册，恒返回 `ESP_ERR_INVALID_STATE`）；② 软件缩放只能当兜底（`bt_service_volume_is_avrcp()`
+  为假时），两条同时生效 = 平方衰减；③ 对端回上来的 `ESP_BT_AUDIO_EVENT_VOL_ABSOLUTE` **只同步
+  不回发**（否则乒乓刷音量）。详见 [`docs/audio-stack.md`](docs/audio-stack.md) §10。
 
 #### 11.5.1 连不上时别乱猜：先看 reason（2026-10 修）
 
@@ -1038,6 +1108,112 @@ Guru Meditation Error: Core 1 panic'ed (Load access fault)
 **教训（写给自己）**：这类"改了 IO 配置"的改动，**验证顺序必须是**
 ① 拖进度条 → ② 放到底自然结束 → ③ **用一个"进度记忆超过总长"的曲子起播**（本轮就是第③条漏了）。
 第二条在改完之后要重跑一遍。
+
+#### 11.5.15 ✅ 状态栏 Wi-Fi 图标不跟着信号变：**RSSI 只在连上那一刻取过一次**（2026-10 用户报）
+
+**现象**（用户原话："WiFi图标根据RSSI自动切换状态栏图标的有问题，实测发现不会根据信号强度
+自动更新状态栏WiFi图标"）：图标永远停在连上瞬间的那一格，走到信号很弱的地方也不动。
+
+**根因**（`wifi_service.cc`）：`s_rssi` 只有两个写入点，而且都发生在"刚连上"这一刻 ——
+
+| 位置 | 时机 |
+| --- | --- |
+| `on_ip_evt`（GOT_IP） | 连上时取一次 `esp_wifi_sta_get_ap_info()` |
+| `WIFI_EVENT_STA_DISCONNECTED` / deinit | 清 0 |
+
+之后**再没有任何人更新它**。UI 侧（`ui_status_bar.cc` 的 `apply_wifi()`，500 ms 轮询）
+其实一直是对的：`rssi_to_level()` 分档、`icon_set()` 只在 src 变了才重绘 —— 但它轮询到的
+永远是个常量。**所以"图标不变"不是 UI 的锅，是服务没把数据刷新。**
+
+**修法**：
+
+| 位置 | 内容 |
+| --- | --- |
+| `wifi_service.cc` 新增 `wifi_rssi_cb` + `s_rssi_timer` | **每 2 s**（`WIFI_RSSI_REFRESH_MS`）刷新一次：`esp_wifi_sta_get_rssi()`（IDF 文档：*store the rssi info received from last beacon*，就是干这个的），失败退回 `esp_wifi_sta_get_ap_info()`；两者都失败就**保留上一次的值**（写 0 = 未知，UI 会画成满格 = 突然跳满） |
+| 定时器生命周期 | `wifi_service_init()` 里 create + `start_periodic`，`wifi_service_deinit()` 里 `esp_timer_stop`（和 `s_retry_timer` 同一套规矩：**关开关后不能有定时器再戳已 deinit 的驱动**）；`s_ready` 也是回调的第一道闸 |
+| `ui_status_bar.cc` 加迟滞 | `WIFI_RSSI_HYST = 3 dBm`：升档要多 3 dBm、降档要少 3 dBm。否则站在两格交界（-55/-65/-75）会看到图标 2↔3 **每秒闪一次** —— RSSI 天生抖 ±5 dBm |
+| 日志 | 换格时打一行 `wifi rssi -63 dBm -> 3/4 格`（只在变格时打）。现场判断"UI 没画"还是"服务没刷"就看这行 |
+
+⚠ **`esp_wifi_sta_get_rssi()` 的签名在 IDF 6.1 是 `esp_err_t esp_wifi_sta_get_rssi(int *rssi)`**
+（老版本是 `int8_t *`），别写错类型 —— 本机 IDF 头文件：`components/esp_wifi/include/esp_wifi.h:1672`。
+
+⚠ **别改成"UI 自己去调 esp_wifi"**：分层纪律（§6）里 UI 只认 `wifi_service.h`；
+状态栏只做 500 ms 轮询，数据新鲜度归服务管。参数放在 `wifi_service`（`s_rssi` 是
+`volatile int`，单写单读，不需要锁）。
+
+#### 11.5.16 ✅ 蓝牙"点了没反应 / 死活连不上 / 等好久"：**连接是在 inquiry 还在跑时发出去的**（2026-10 用户报）
+
+**现象**（用户原话："优化蓝牙连接逻辑，现在有时候会死活连接不到设备，或者点了连接设备
+要好久才连上"）。真机日志（改造前）：
+
+```
+271038  Starting classic discovery            ← esp_bt_gap_start_discovery(GENERAL_INQUIRY, 10, 0)
+271590  Scanned device: 00:00:00:00:00:00     ← 全 0 假设备也进了列表
+276069  A2DP Src: Connecting to peer ...      ← ★ 查询还剩 ~8 s 就发起连接了
+276467  hcif conn complete: hdl 0x801         ← ACL 连上了
+276803  bta_dm_act no entry for connected service cbs
+276804  BTA_AV_OPEN_EVT::FAILED status: 3     ← ★ 3 = BTA_AV_FAIL_STREAM（AVDTP 流打不开）
+288963  Device discovery stopped              ← 查询这时才结束（10 × 1.28 s ≈ 12.8 s）
+```
+
+**四个根因**：
+
+| # | 根因 | 后果 |
+| --- | --- | --- |
+| 1 | 发起连接前**没停 inquiry**（`bt_service_connect()` 直接转发 `esp_bt_audio_classic_connect()`；`bt_service_stop_discovery()` 从来没有调用者） | inquiry / page / SDP / AVDTP 抢同一个射频 → `BTA_AV_FAIL_STREAM`；查询结束后再点才成功 = "等好久才连上" |
+| 2 | 服务里**没有"连接中"状态、没有超时** | 界面只能弹 2 s 的 Toast 干等；`esp_bt_audio` 的 `CONNECTION_STATE_CHG` **只带一个 `connected` bool**，CONNECTING 压根不上报（`esp_bt_audio_event.h`），所以状态得自己合成 |
+| 3 | 失败**完全静默**（`connected=false` → `bts_state = BT_ST_READY`） | 与"从没连过"一模一样：没有失败痕迹、没有重试入口 |
+| 4 | 重复点击**没有去抖**、已连接时点别的也不先断开 | `esp_a2d_source_connect()` 只检查 Bluedroid 启停、**不拒绝"正在连接"**（`esp_a2dp_api.c:432`）→ 连点几次就是几次 `BTC_AV_SRC_API_CONNECT_EVT`，撞 `BTA_AV_FAIL_RESOURCES` |
+
+次要两条：查询会吐出**全 0 BDA**（`00:00:00:00:00:00`）并进列表；`bt_tick` 每 500 ms 可能
+**整块重建列表**，手指正按着的那行被删掉重建 → LVGL 判 `PRESS_LOST`，这次点击凭空消失。
+
+**修法 ①：服务侧新增连接状态机（`components/services/bt_service/bts_conn.cc`）**
+
+| 阶段 | 做什么 |
+| --- | --- |
+| 受理 | 正在连同一台 → `ESP_ERR_INVALID_STATE`；已连着别的 → 先 `disconnect` 旧对端，等 800 ms；**正在查询 → 先 `discovery_stop()`**，等 400 ms；否则 ~50 ms 后发起 |
+| 发起 | `esp_bt_audio_classic_connect()`；`bts_state = BT_ST_CONNECTING`；`bts_peer_name` 填目标名（UI 显示"正在连接 XXX…"） |
+| 失败/超时 | **总预算 15 s（含重试）**；失败后 1.5 s 重试，最多 2 次（`BT_CONN_RETRY_MAX`）；顺手 `disconnect` 掉残留 ACL —— Bluedroid 自己要 **4 s** 才拆链路（日志 `hci cmd send: disconnect` 比失败晚 4 s），等它就会跟下一次重试撞车 |
+| 收尾 | 连上 → 清目标；彻底失败 → `BT_ST_CONNECT_FAILED` + **保留目标 BDA 与原因**，给 UI 画"连接失败 · 点此重试" |
+
+并发：状态被 LVGL（request）、esp_timer（超时/重试）、BTC（事件）三个上下文碰 ——
+一把互斥锁 + **每次受理 `++s_gen`，定时器回调带代数校验**，过期回调一律丢掉；
+**锁内绝不调用 bluetooth API**（BTC 回调里也要拿锁，锁内进协议栈就是反向死锁）；
+`bts_state` 只在锁外写一次终值。`bts_conn_on_disconnected()` **返回 true 就是"这个事件归
+状态机管"**，`bts_events.cc` 这时不许再改 `bts_state`（否则失败的"重试"入口会被抹掉）。
+
+**修法 ②：UI（`app_settings/as_page_bt.cc`）**
+
+- 目标行右侧 **`lv_spinner` + "连接中…"**（自带无限循环动画，不用自己起 timer）；
+- 再点同一行 → Toast「正在连接，请稍后再试」（用户明确要求）；
+- 点别的行 → 改连新设备（服务里先取消当前尝试 / 断旧对端）；
+- 失败行 → 值 label 变橙「连接失败 · 点此重试」，整行点击即重试；
+- 顶部状态行：`正在连接 XXX…` / `连接 XXX 失败（原因）· 点该设备可重试`；
+- 连接中**禁止搜索**（Toast「正在连接设备，请稍后再试」）—— 别自己把连接搅黄；
+- `bt_tick` 的签名把**连接目标 BDA** 也算进去（否则"从连 A 改成连 B"时状态一直是
+  CONNECTING，转圈会留在 A 那一行）；
+- **手指按着列表时不重建**（`lv_indev_get_state() == PRESSED` → 延到松手后的 tick）。
+
+**状态栏**：`BT_ST_CONNECTING` 用 `bt_searching`（亮色）—— 最长要等 15 s，不点亮像卡住；
+`BT_ST_CONNECT_FAILED` 用 `bt_idle`（暗），橙仍只留给 `sd_warn` 这类警告。
+
+**判读日志**（tag 是 `bt_conn`，另 `bt_svc` 保留原样）：
+
+```
+I bt_conn: request #n accepted (budget 15000 ms)
+I bt_conn: stop discovery before connecting
+I bt_conn: connect MCHOSE V9 PRO (try 1/3, budget 14950 ms)
+W bt_conn: connect failed (连接失败), retry 1/2 in 1500 ms (budget left 13800 ms)
+E bt_conn: connect failed: 连接超时 (gave up after 3 tries)
+I bt_conn: switch: disconnect 50:c0:f0:58:50:61 first
+I bt_conn: already connecting to this device, ignore repeat request
+```
+
+⚠ 纪律：**别再把 `esp_bt_audio_classic_connect()` 直接暴露给 UI/其他组件**，也别在
+`bts_discovering` 为真时发起连接 —— 一律走 `bt_service_connect()`（它负责停查询、
+去抖、超时、重试、失败态）。`bt_service_state_str()` 里 `CONNECTING = "连接中…"`、
+`CONNECT_FAILED = "连接失败"`，新增状态时记得同步状态栏与两个设置页。
 
 ### 11.6 拼音搜索
 

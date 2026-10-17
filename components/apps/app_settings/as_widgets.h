@@ -24,8 +24,6 @@ extern "C" {
  */
 lv_obj_t *as_make_screen(void);
 
-/* 返回键回调：ui_router_pop() */
-void as_on_back(lv_event_t *e);
 
 /* 药丸形小按钮（UI_COLOR_PILL + 小字）；cb 为 NULL 时只造按钮不挂回调 */
 lv_obj_t *as_make_flat_btn(lv_obj_t *parent, const char *text, lv_event_cb_t cb, void *user);

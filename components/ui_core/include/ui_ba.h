@@ -105,6 +105,17 @@ void ui_ba_on_close(ui_ba_dialog_t *d, void (*cb)(void *user), void *user);
 /* ------------------------------------------------------------------ 卡片内控件 */
 
 /*
+ * ★ 按下反馈（弹窗按钮的那套手感）：按住缩到 ≈92%（120 ms）、松手用 150 ms 缓出
+ * 复原，**复原动画跑完**才把 on_click 当成一次点击派发；手指滑出对象
+ * （PRESS_LOST）只复原、不派发。on_click 传 NULL 就是"只要反馈、不要回调"。
+ *
+ * 弹窗里的按钮 / 选项行 / ✕ 都是它挂上去的；**标题栏的返回钮也共用这一份**
+ * （ui_core.cc 的 ui_back_button_create）—— 手感与常量只有一处，别在别处复制一套。
+ * 实现与三条铁律见 ui_ba.cc 的"按下反馈"一节。
+ */
+void ui_ba_press_feedback(lv_obj_t *obj, lv_event_cb_t on_click, void *user);
+
+/*
  * 底部按钮：斜切平行四边形 + 渐变。
  *
  *   primary true = 青蓝渐变（确认），false = 浅灰蓝渐变（取消）

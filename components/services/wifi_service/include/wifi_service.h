@@ -82,7 +82,10 @@ esp_err_t wifi_service_forget(const char *ssid);
 wifi_state_t wifi_service_state(void);
 const char  *wifi_service_conn_ssid(void);   /* 已连接/正在连的 SSID，空串表示无 */
 const char  *wifi_service_ip(void);          /* 已连接时的点分 IP；否则空串 */
-int          wifi_service_rssi(void);        /* 已连接时的信号强度，0 表示未知 */
+/* 已连接时的信号强度（dBm，负值才是有效值；0 表示未知）。
+ * ⚠ 这个值**连上后每 2 s 由服务自己刷新**（wifi_rssi_cb，取 last beacon 的 RSSI），
+ *   所以 UI 只要轮询它就能画出"跟着信号变"的格子；别在 UI 侧再调 esp_wifi。 */
+int          wifi_service_rssi(void);
 
 /*
  * 最近一次连接失败/掉线的原因（中文短句，例如"四次握手超时：密码错"、

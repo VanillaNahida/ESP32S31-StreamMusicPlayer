@@ -44,10 +44,12 @@
 #include "freertos/task.h"
 
 #include "bts_audio.h"
+#include "bts_conn.h"
 #include "bts_events.h"
 #include "bts_feed.h"
 #include "bts_settings.h"
 #include "bts_state.h"
+#include "bts_volume.h"
 
 static const char *TAG = "bt_svc";   /* 与拆分前一致：日志里仍显示 bt_svc */
 
@@ -116,7 +118,18 @@ esp_err_t bt_service_init(void)
     cfg.host_config   = &host_cfg;
     cfg.event_cb      = bts_audio_event_cb;
     cfg.event_user_ctx = NULL;
-    cfg.classic.roles = ESP_BT_AUDIO_CLASSIC_ROLE_A2DP_SRC;   /* A2DP 源（推流给耳机） */
+    /*
+     * A2DP 源（推流给耳机）+ **AVRCP Controller**。
+     *
+     * 为什么要 AVRCP CT：A2DP 源的音量标准做法是**由源发 AVRCP 绝对音量**
+     * （SetAbsoluteVolume）给对端，让耳机/音箱自己衰减。esp_bt_audio 把这条能力
+     * 收在 esp_bt_audio_vol.h 里（esp_bt_audio_vol_set_absolute），而它的 vol_ops
+     * 只在 AVRCP Controller 连上时才注册 —— 不写这个 role，那个函数会一直返回
+     * ESP_ERR_INVALID_STATE（日志 Operation failed: vol_ops.set_absolute is not
+     * registered），音量只能退回软件缩放。
+     */
+    cfg.classic.roles = ESP_BT_AUDIO_CLASSIC_ROLE_A2DP_SRC |
+                        ESP_BT_AUDIO_CLASSIC_ROLE_AVRC_CT;
     /* 发送任务：钉 core 0（core 1 是 LVGL），优先级 5、栈 4 KB */
     cfg.classic.a2dp_src_send_task_core_id    = 0;
     cfg.classic.a2dp_src_send_task_prio       = 5;
@@ -141,6 +154,7 @@ esp_err_t bt_service_init(void)
         return ret;
     }
 
+    bts_volume_reset();     /* 新协议栈：AVRCP 绝对音量还没连上，先按不可用算 */
     bt_service_refresh_bonded();
     bts_state   = BT_ST_READY;
     bts_inited  = true;    /* 只有真正成功才算初始化过，失败允许重试 */
@@ -198,6 +212,9 @@ esp_err_t bt_service_set_enabled(bool on)
 esp_err_t bt_service_deinit(void)
 {
     bts_auto_connect_stop();
+    /* 先把连接状态机停掉：在途的"15 s 超时 / 1.5 s 重试"定时器会在 esp_timer 任务里
+     * 调 esp_bt_audio_*，而下面马上要 deinit 协议栈 —— 不停就是拿定时器戳已释放的栈 */
+    bts_conn_cancel();
     if (!bts_inited && !bts_feed_created()) {
         bts_state = BT_ST_UNINIT;
         return ESP_OK;
@@ -207,6 +224,7 @@ esp_err_t bt_service_deinit(void)
     bts_connected = false;
     bts_stream    = NULL;
     bts_state     = BT_ST_UNINIT;
+    bts_volume_reset();     /* 协议栈要拆了：AVRCP 绝对音量不可用 → 退回软件缩放 */
 
     /*
      * ★ 这两行的顺序不能反：**先删 feed 任务，再关编码器**。

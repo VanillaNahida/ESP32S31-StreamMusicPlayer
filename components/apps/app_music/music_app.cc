@@ -114,7 +114,7 @@ void app_music_register_apps(void)
         music_view_player_build, on_music_enter, on_music_exit, 10, 0
     };
     static const app_desc_t local = {
-        "local", "本地音乐", LV_SYMBOL_SD_CARD, 0x5B6FB5,
+        "local", "文件管理", LV_SYMBOL_DIRECTORY, 0x5B6FB5,
         music_view_local_build, NULL, NULL, 30, 0
     };
 

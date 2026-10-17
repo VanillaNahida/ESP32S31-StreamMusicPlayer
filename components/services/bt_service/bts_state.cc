@@ -90,8 +90,10 @@ const char *bt_service_state_str(void)
     switch (bts_state) {
     case BT_ST_UNINIT:        return "初始化中…";
     case BT_ST_DISCOVERING:   return "搜索中…";
+    case BT_ST_CONNECTING:    return "连接中…";
     case BT_ST_CONNECTED:     return "已连接";
     case BT_ST_STREAMING:     return "正在推流";
+    case BT_ST_CONNECT_FAILED: return "连接失败";
     case BT_ST_FAILED:        return "蓝牙不可用";
     default:                  return "就绪";
     }
