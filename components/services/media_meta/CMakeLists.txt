@@ -12,8 +12,13 @@ idf_component_register(
     INCLUDE_DIRS "include"
     # 封面解码：JPEG 用 esp_new_jpeg，PNG 用官方 libpng 组件（它自带 zlib）。
     # 两条路都在 mm_image.cc 的 mm_image_to_rgb565() 里，按文件魔数分派，输出格式一致。
+    # esp_driver_jpeg = S31 的**硬件** JPEG 解码器（SOC_JPEG_CODEC_SUPPORTED=1）。
+    # 只用在"大图"那条路上（mm_photo_file_rgb565 → hw_jpeg_to_rgb565），
+    # 输出封顶 4 MB；更大的图仍走 esp_new_jpeg 软解（它能解码期缩放）。
+    # 封面/歌词那条老路（mm_image_to_rgb565）**不动**，仍全软解。
     REQUIRES
         esp_new_jpeg
+        esp_driver_jpeg
         libpng
 )
 

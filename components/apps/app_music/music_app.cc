@@ -35,6 +35,7 @@
 #include "music_logic.h"
 #include "music_online.h"
 #include "music_player.h"
+#include "music_player_bg.h"
 #include "music_state.h"
 #include "music_view_local.h"
 #include "music_view_player.h"
@@ -137,6 +138,12 @@ void app_music_register_apps(void)
      * 所以它可以脱离页面一直跑 —— 页面只是"显示"，状态机跑在页面之外。
      */
     music_view_player_ensure_timers();
+
+    /*
+     * 播放器页背景图：开机就在 core 0 后台解（800x480 JPEG 几百毫秒），
+     * 进页面时直接能用；否则第一次进播放页会先看到纯色再"啪"一下变出图。
+     */
+    music_player_bg_start();
 
     music_player_restore_last_session();
 }

@@ -46,6 +46,13 @@ extern "C" {
 LV_IMAGE_DECLARE(netease_logo);
 /* MomoTalk，96x96 ARGB8888（来自 assets/MomoTalk.png，525x525 原图缩放） */
 LV_IMAGE_DECLARE(momotalk_logo);
+/* 图库，96x96 ARGB8888（来自 assets/icons/gallery.png，512x512 原图缩放） */
+LV_IMAGE_DECLARE(gallery_logo);
+
+/* 文件管理列表里「图片文件」那一行的小图标，24x24（来自 assets/icons/gallery.svg）。
+ * 素材是单色 #1f1f1f 的方块+山形，直接放在行内 40x40 的圆角色块上，
+ * 与其它行的 16 px 字形图标视觉同档。 */
+LV_IMAGE_DECLARE(gallery_file);
 
 /* MomoTalk 页面 */
 /* 标题栏左侧圆形小图标，32x32（来自 assets/MomoIcon.png——那个文件其实是 ICO） */

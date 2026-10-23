@@ -33,6 +33,7 @@
 
 #include "internal/mm_container.h"
 #include "internal/mm_cover.h"
+#include "internal/mm_image.h"      /* mm_photo_file_rgb565（图库的大图解码） */
 #include "internal/mm_lrc.h"
 #include "internal/mm_lyrics_file.h"
 
@@ -102,6 +103,13 @@ esp_err_t media_meta_image_mem_rgb565(const uint8_t *data, size_t len, int max_d
                                       uint8_t **pixels, int *out_w, int *out_h)
 {
     return mm_cover_from_mem(data, len, max_dim, pixels, out_w, out_h);
+}
+
+/* 大图（图库）：JPEG 走解码期 scale，别整解再降采样 —— 见 mm_image.cc 的说明 */
+esp_err_t media_meta_photo_file_rgb565(const char *img_path, int max_dim,
+                                       uint8_t **pixels, int *out_w, int *out_h)
+{
+    return mm_photo_file_rgb565(img_path, max_dim, pixels, out_w, out_h);
 }
 
 /* ------------------------------------------------------------------ 音频参数探测 */

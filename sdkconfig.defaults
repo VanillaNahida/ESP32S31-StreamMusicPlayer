@@ -54,8 +54,22 @@ CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=y
 CONFIG_LV_COLOR_DEPTH_16=y
 # 深色主题：LVGL 默认是浅色主题，不打开的话派生控件会是浅底深字
 CONFIG_LV_THEME_DEFAULT_DARK=y
-# 拼音输入法字体要求：必须关闭（打开后 LVGL 按 12 字节遍历 glyph 描述符 → 全部空白）
-CONFIG_LV_FONT_FMT_TXT_LARGE=n
+# ★ 2026-10 改成 y。原来的注释写着"必须关闭（打开后 LVGL 按 12 字节遍历 glyph
+#   描述符 → 全部空白）"，那条理由经核实是错的：lv_font_conv 产出的 .c 用的是
+#   **指定初始化器** + LVGL 自己的 lv_font_fmt_txt_glyph_dsc_t 类型，描述符跨度由
+#   编器按同一个头文件算出来，生成器与读取方**不可能**对不上（只有"预编译的 bin
+#   分片 + 宿主开着 LARGE"这类跨编译单元才会错；本工程走 FONT_SRC_EMBEDDED，
+#   .c 直接编进固件，不涉及）。LVGL 9.5 里开 LARGE 后 adv_w 是 **32 位**（不是
+#   被挤成 8 位），box/ofs 变 16 位 —— 只有好处，没有那条"全部空白"。
+#   真正的理由：lvgl_pinyin_ime 的 tools/gen_font.py 默认按**全字典字符集**生成
+#   （17,266 字），20px/2bpp 的 glyph_bitmap[] 达 1.63 MB、16px 也有 1.06 MB，
+#   都超过紧凑布局里 bitmap_index 的 20 位上限（1 MB）→ 编译期 -Woverflow 报错，
+#   生成文件末尾还会 #error 让你打开本开关。组件文档也写明了这个前提。
+#   代价：glyph 描述符 8 字节 → 16 字节，即 +8 B/字形（拼音两套约 +276 KB，
+#   UI 三套位图字体约 +95 KB，合计约 +370 KB flash；app 分区仍有 40%+ 余量）。
+#   想省这 370 KB 就要回到小字符集：
+#     python tools/gen_charset.py --gb2312-only && python tools/gen_font.py --no-large-bitmap
+CONFIG_LV_FONT_FMT_TXT_LARGE=y
 
 # 屏幕刷新周期：LVGL 默认 33 ms（30 FPS）。跟手动画的观感基本由帧率决定，
 # 15 ms ≈ 66 FPS 是 esp_lvgl_adapter README 与乐鑫 LVGL 性能 FAQ 共同的推荐值。
@@ -240,3 +254,16 @@ CONFIG_ONLINE_NETEASE_CK_FILE="assets/ncm-ck.txt"
 #   lv_pinyin_ime_voice_set_config() 从 NVS / 服务器下发。
 # ---------------------------------------------------------------------------
 CONFIG_LV_PINYIN_IME_VOICE_ENABLE=y
+
+# ---------------------------------------------------------------------------
+# 图库 App（浏览器内图片浏览）所需的三个 LVGL 选项（2026-10）
+# ---------------------------------------------------------------------------
+# GIF：lv_gif 通过内存源播放（lv_gif_set_src 传 lv_image_dsc_t*，不走 LVGL 的
+#   FS 驱动）—— 所以**不需要** CONFIG_LV_USE_FS_*。
+CONFIG_LV_USE_GIF=y
+# 双指捏合：LVGL 的手势识别器（lv_indev_gesture）要 LV_USE_FLOAT，
+#   而它只有单精度浮点：S31 有硬件 FPU（SOC_CPU_HAS_FPU=1），float 是硬件指令，
+#   所以打开它不会把 UI 拖慢。不开这两个就没有 PINCH 事件，双指缩放无从谈起。
+CONFIG_LV_USE_FLOAT=y
+CONFIG_LV_USE_GESTURE_RECOGNITION=y
+

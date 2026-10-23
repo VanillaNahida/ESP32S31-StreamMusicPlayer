@@ -112,10 +112,16 @@ static void ba_para(lv_layer_t *layer, const lv_area_t *a, int32_t sk,
     if (lv_area_get_width(a) < sk * 2 + 4 || lv_area_get_height(a) < 4) {
         return;
     }
-    const lv_point_precise_t pa = { x1 + sk, y1 };   /* 左上 */
-    const lv_point_precise_t pb = { x2,      y1 };   /* 右上 */
-    const lv_point_precise_t pc = { x2 - sk, y2 };   /* 右下 */
-    const lv_point_precise_t pd = { x1,      y2 };   /* 左下 */
+    /*
+     * ⚠ 必须显式转 lv_value_precise_t：本工程开了 CONFIG_LV_USE_FLOAT（图库的
+     *   双指捏合要 LVGL 手势识别器，而它 depends on LV_USE_FLOAT），于是
+     *   lv_value_precise_t 是 float —— 用 int 花括号初始化在 C++ 里是
+     *   -Werror=narrowing，直接编译失败。
+     */
+    const lv_point_precise_t pa = { (lv_value_precise_t)(x1 + sk), (lv_value_precise_t)y1 };
+    const lv_point_precise_t pb = { (lv_value_precise_t)x2,      (lv_value_precise_t)y1 };
+    const lv_point_precise_t pc = { (lv_value_precise_t)(x2 - sk), (lv_value_precise_t)y2 };
+    const lv_point_precise_t pd = { (lv_value_precise_t)x1,      (lv_value_precise_t)y2 };
     ba_tri(layer, pa, pb, pc, LV_GRAD_DIR_VER, top, LV_OPA_COVER, bottom, LV_OPA_COVER, LV_OPA_COVER);
     ba_tri(layer, pa, pc, pd, LV_GRAD_DIR_VER, top, LV_OPA_COVER, bottom, LV_OPA_COVER, LV_OPA_COVER);
 }
@@ -169,14 +175,15 @@ static void ba_deco_corner(lv_layer_t *layer, const lv_area_t *a, uint32_t color
                            lv_opa_t opa, bool br, bool horiz)
 {
     lv_point_precise_t p0, p1, p2;
+    /* 同上：LV_USE_FLOAT 打开后 lv_value_precise_t 是 float，必须显式转 */
     if (!br) {
-        p0 = (lv_point_precise_t){ a->x1, a->y1 };
-        p1 = (lv_point_precise_t){ a->x2, a->y1 };
-        p2 = (lv_point_precise_t){ a->x1, a->y2 };
+        p0 = (lv_point_precise_t){ (lv_value_precise_t)a->x1, (lv_value_precise_t)a->y1 };
+        p1 = (lv_point_precise_t){ (lv_value_precise_t)a->x2, (lv_value_precise_t)a->y1 };
+        p2 = (lv_point_precise_t){ (lv_value_precise_t)a->x1, (lv_value_precise_t)a->y2 };
     } else {
-        p0 = (lv_point_precise_t){ a->x2, a->y2 };
-        p1 = (lv_point_precise_t){ a->x1, a->y2 };
-        p2 = (lv_point_precise_t){ a->x2, a->y1 };
+        p0 = (lv_point_precise_t){ (lv_value_precise_t)a->x2, (lv_value_precise_t)a->y2 };
+        p1 = (lv_point_precise_t){ (lv_value_precise_t)a->x1, (lv_value_precise_t)a->y2 };
+        p2 = (lv_point_precise_t){ (lv_value_precise_t)a->x2, (lv_value_precise_t)a->y1 };
     }
     /* 渐变的两端：贴着角落那侧是 color，斜边那侧透明 */
     if (!br) {

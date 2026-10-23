@@ -115,6 +115,13 @@ lv_obj_t *ui_back_button_create(lv_obj_t *parent);
  */
 void ui_back_button_place(lv_obj_t *btn);
 
+/*
+ * 临时收起/恢复**全局**返回钮（图库全屏看图用；页面自带的返回钮不受影响）。
+ * ⚠ 成对使用：谁 suppress(true) 谁负责在退出时 suppress(false)。
+ * 收起后左边缘的返回手势热区仍然有效。
+ */
+void ui_back_button_suppress(bool suppress);
+
 /* ------------------------------------------------------------------ 状态栏
  *
  * 状态栏右半边那四个图标（Wi-Fi / 蓝牙 / 输出通道 / microSD）**由状态栏自己的
@@ -123,6 +130,12 @@ void ui_back_button_place(lv_obj_t *btn);
  * 时间来自 SNTP + 首页的 tick，不是任何"服务状态"，没法轮询出来。
  */
 void ui_status_set_clock(const char *hhmm, const char *date_text);
+
+/*
+ * 状态栏整条显隐（图库的"单击全屏看图"用它把状态栏收起来）。
+ * ⚠ 谁隐藏谁负责恢复：页面销毁/退出时必须再调一次 true，否则整个系统没状态栏。
+ */
+void ui_status_bar_set_visible(bool visible);
 
 /* ------------------------------------------------------------------ 控制中心 */
 

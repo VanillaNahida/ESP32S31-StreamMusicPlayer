@@ -12,6 +12,14 @@
 #   [2026-10 日文汉字字体] UI 字体从"GB2312 一套"扩成"GB2312 + 日文汉字补充两套"
 #     （见 components/ui_font），app 涨了 ~280 KB；于是把**始终没用过**的
 #     assets(SPIFFS, 128 KB) 整块删掉给 app，两个 app 槽各 +64 KB → 7.5 MB(0x6F0000)。
+#   [2026-10-21 拼音词库换代] ★ lvgl_pinyin_ime 上游更新了词库与字库（引入三个第三方
+#     词库后 charset 从 17,265 字涨到 35,276 字）：
+#       - 系统词库 data/dict/dict_pinyin.dat 从 1.07 MB 涨到 **3.55 MB**，
+#         原来的 1.5 MB dict 分区**装不下**，必须扩到 3.68 MB(0x3AE000)；
+#       - 两套内嵌字体位图 0.97+1.41 MB → 1.19+1.82 MB（app +约 0.65 MB）。
+#     为了让 dict 尽量大、同时不浪费对齐空洞，dict 取 0x3AE000（0x22000+0x3AE000=0x3D0000），
+#     usr 0x60000 接在 0x3D0000 → 0x430000 正好是 64 KB 对齐点，factory 从 0x430000 起，**零空洞**。
+#     代价：app 槽从 14.94 MB 缩到 **11.81 MB(0xBD0000)**，余量约 0.5 MB。
 #   [2026-10 单 app 槽] ★ 砍掉 ota_1，改成**单个 14.94 MB 的 factory 槽**：
 #     本工程一直是 USB 烧录、没用 OTA（A/B 双槽白占 7.5 MB），而 app 余量只剩
 #     1%（~73 KB），WebP 解码等后续功能放不下。
@@ -26,9 +34,10 @@ nvs,        data, nvs,     0x9000,   0x6000,
 otadata,    data, ota,     0xf000,   0x2000,
 phy_init,   data, phy,     0x11000,  0x1000,
 coredump,   data, coredump,0x12000,  0x10000,
-dict,       data, 0x40,    0x22000,  0x180000,
-usr,        data, fat,     0x1A2000, 0x60000,
-# 单 app 槽：0x1000000(16 MB) - 0x210000 = 0xDF0000 = 14.94 MB（末尾不再留空洞）
-# 经典蓝牙（Bluedroid/GAP/AVDTP/A2DP ~5 MB）+ 拼音字体(~2.4 MB) + UI 位图字体(~1.2 MB)
-# 之后 app 约 7.2 MB，这个槽留出 ~7.7 MB 给后续功能（WebP 解码等）。
-factory,    app,  factory, 0x210000, 0xDF0000,
+# dict：系统词库原始 blob（不是 FAT；挂载由 ime_dict_vfs 做），当前占 0x38B4B6。
+dict,       data, 0x40,    0x22000,  0x3AE000,
+usr,        data, fat,     0x3D0000, 0x60000,
+# 单 app 槽：0x1000000(16 MB) - 0x430000 = 0xBD0000 = 11.81 MB
+# 经典蓝牙(~5 MB) + 拼音字体(~3.0 MB) + UI 位图字体(~1.2 MB) 之后 app 约 11.8 MB，
+# 余量只剩 ~0.5 MB —— 再要腾地方只能砍词库（去掉部分第三方词典）或把字体搬到 font 分区。
+factory,    app,  factory, 0x430000, 0xBD0000,

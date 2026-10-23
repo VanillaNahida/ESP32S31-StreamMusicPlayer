@@ -24,6 +24,7 @@
 
 #include "music_cover.h"
 #include "music_info.h"
+#include "music_player_bg.h"
 #include "music_player.h"
 #include "music_state.h"
 #include "music_view_internal.h"
@@ -152,6 +153,12 @@ lv_obj_t *music_view_player_build(void)
      */
     lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);
     lv_obj_set_style_pad_top(scr, UI_STATUSBAR_H + UI_PAGE_PAD, LV_PART_MAIN);
+    /*
+     * 背景图（assets/player_background.jpg）：图是开机后台解好的，这里只是贴一下；
+     * 万一还没解完，解码任务会在解好后自己贴到这个 screen 上（见 music_player_bg.cc）。
+     * 必须在 pad 之后调 —— 它只改 bg_image 样式，不动 pad。
+     */
+    music_player_bg_attach(scr);
 
     lv_obj_t *row = lv_obj_create(scr);
     lv_obj_remove_style_all(row);

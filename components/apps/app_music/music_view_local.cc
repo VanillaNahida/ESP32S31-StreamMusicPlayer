@@ -12,10 +12,12 @@
 
 #include "esp_log.h"
 
+#include "app_gallery.h"    /* 图片文件 -> 图库打开 */
 #include "bsp.h"
 #include "play_state.h"
 #include "storage_service.h"
 #include "ui_core.h"
+#include "ui_icons.h"
 #include "ui_metrics.h"
 
 #include "music_local_source.h"
@@ -34,7 +36,8 @@ static void local_rebuild(void);
 static void on_local_entry(lv_event_t *e);
 
 /* 一行：图标 + 名字（+ 文件大小）。sel 见 LOCAL_SEL_* / 条目下标 */
-static void local_add_row(const char *name, bool is_dir, bool is_audio, uint32_t size, int sel)
+static void local_add_row(const char *name, bool is_dir, bool is_audio, bool is_image,
+                          uint32_t size, int sel)
 {
     if (!s_list_col) {
         return;
@@ -49,8 +52,9 @@ static void local_add_row(const char *name, bool is_dir, bool is_audio, uint32_t
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
 
-    /* 图标底色按类型区分：目录=琥珀，音乐=蓝，其它=灰 */
-    const uint32_t accent = is_dir ? 0xE8973A : (is_audio ? 0x5B6FB5 : 0x4A4A52);
+    /* 图标底色按类型区分：目录=琥珀，音乐=蓝，图片=紫（与图库 App 图标同色），其它=灰 */
+    const uint32_t accent = is_dir ? 0xE8973A
+                            : (is_audio ? 0x5B6FB5 : (is_image ? 0x6C5CE7 : 0x4A4A52));
     /*
      * 三种图标（需求：音乐=音乐图标 / 其它文件=文件图标 / 文件夹=文件夹图标）：
      *   LV_SYMBOL_DIRECTORY = U+F07B、LV_SYMBOL_AUDIO = U+F001、LV_SYMBOL_FILE = U+F158
@@ -67,11 +71,23 @@ static void local_add_row(const char *name, bool is_dir, bool is_audio, uint32_t
     lv_obj_set_style_bg_color(icon, lv_color_hex(accent), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(icon, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_remove_flag(icon, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_t *is = lv_label_create(icon);
-    lv_obj_set_style_text_font(is, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(is, lv_color_hex(0x14141A), LV_PART_MAIN);
-    lv_label_set_text(is, sym);
-    lv_obj_center(is);
+    if (is_image) {
+        /*
+         * 图片文件用**烘好的小图标**（assets/icons/gallery.svg → gallery_file 24x24），
+         * 不再用字形：LVGL 内置 symbol 里没有"图片"这个字形，拿 LV_SYMBOL_FILE 顶
+         * 会让图片和普通文件长得一样，看不出这张能点开看。
+         */
+        lv_obj_t *im = lv_image_create(icon);
+        lv_image_set_src(im, &gallery_file);
+        lv_obj_center(im);
+        lv_obj_remove_flag(im, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+        lv_obj_t *is = lv_label_create(icon);
+        lv_obj_set_style_text_font(is, UI_FONT_TEXT, LV_PART_MAIN);
+        lv_obj_set_style_text_color(is, lv_color_hex(0x14141A), LV_PART_MAIN);
+        lv_label_set_text(is, sym);
+        lv_obj_center(is);
+    }
 
     lv_obj_t *name_l = lv_label_create(row);
     lv_obj_set_style_text_font(name_l, UI_FONT_TEXT, LV_PART_MAIN);
@@ -129,22 +145,23 @@ static void local_render(void)
     }
 
     if (strcmp(local_source_dir(), LOCAL_ROOT) != 0) {
-        local_add_row("..", true, false, 0, LOCAL_SEL_PARENT);   /* 返回上一级（根目录不给） */
+        local_add_row("..", true, false, false, 0, LOCAL_SEL_PARENT);   /* 上一级（根目录不给） */
     }
     for (int i = first; i < last && dv.entries; i++) {
         local_add_row(dv.entries[i].name, dv.entries[i].is_dir,
-                      dv.entries[i].is_audio, dv.entries[i].size, i);
+                      dv.entries[i].is_audio, dv.entries[i].is_image,
+                      dv.entries[i].size, i);
     }
     if (s_page > 0) {
-        local_add_row(LV_SYMBOL_LEFT " 上一页", false, false, 0, LOCAL_SEL_PREV);
+        local_add_row(LV_SYMBOL_LEFT " 上一页", false, false, false, 0, LOCAL_SEL_PREV);
     }
     if (last < entry_n) {
-        local_add_row("下一页 " LV_SYMBOL_NEXT, false, false, 0, LOCAL_SEL_NEXT);
+        local_add_row("下一页 " LV_SYMBOL_NEXT, false, false, false, 0, LOCAL_SEL_NEXT);
     }
     if (entry_n == 0) {
         /* 空目录：根目录直接提示；子目录此时上面已经有 ".." 那一行，
          * 再补一条说明，免得看着像一个坏掉/空的列表 */
-        local_add_row("（这个目录没有文件）", false, false, 0, LOCAL_SEL_NONE);
+        local_add_row("（这个目录没有文件）", false, false, false, 0, LOCAL_SEL_NONE);
     }
 }
 
@@ -201,7 +218,7 @@ static void local_apply_scan(void)
     }
     if (local_source_last_failed()) {
         lv_obj_clean(s_list_col);
-        local_add_row("读取目录失败", false, false, 0, LOCAL_SEL_NONE);
+        local_add_row("读取目录失败", false, false, false, 0, LOCAL_SEL_NONE);
         return;
     }
     local_render();
@@ -271,6 +288,14 @@ static void on_local_entry(lv_event_t *e)
         local_rebuild();
         return;
     }
+    if (en->is_image) {
+        /*
+         * 图片：直接交给图库打开（点哪张就看哪张），左右滑还能接着看同一张卡上的其它图。
+         * 图库页是压栈打开的，返回就回到这个目录，目录与页码都不变。
+         */
+        gallery_open_path(full);
+        return;
+    }
     if (!en->is_audio) {
         ui_toast("不是可播放的音频文件", 1500);
         return;
@@ -329,7 +354,7 @@ static void local_sd_apply_removed(void)
         lv_label_set_text(s_list_hint, "未检测到 SD 卡");
     }
     lv_obj_clean(s_list_col);
-    local_add_row("未检测到 SD 卡，插好后会自动刷新", false, false, 0, LOCAL_SEL_NONE);
+    local_add_row("未检测到 SD 卡，插好后会自动刷新", false, false, false, 0, LOCAL_SEL_NONE);
 }
 
 static void local_sd_apply_inserted(void)
@@ -450,11 +475,11 @@ lv_obj_t *music_view_local_build(void)
 
     if (!storage_service_sd_is_mounted()) {
         lv_label_set_text(s_list_hint, "未检测到 SD 卡");
-        local_add_row("未检测到 SD 卡，仅在线音乐可用", false, false, 0, LOCAL_SEL_NONE);
+        local_add_row("未检测到 SD 卡，仅在线音乐可用", false, false, false, 0, LOCAL_SEL_NONE);
         return scr;
     }
     if (!local_source_reserve(64)) {
-        local_add_row("内存不足，无法列出文件", false, false, 0, LOCAL_SEL_NONE);
+        local_add_row("内存不足，无法列出文件", false, false, false, 0, LOCAL_SEL_NONE);
         return scr;
     }
     s_page = 0;

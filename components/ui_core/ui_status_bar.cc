@@ -48,6 +48,7 @@ static const char *TAG = "ui_status";
 
 #define STATUS_POLL_MS 500     /* 轮询间隔：都只是读几个缓存字段，开销可忽略 */
 
+static lv_obj_t *s_bar;      /* 状态栏根对象（ui_status_bar_set_visible 用） */
 static lv_obj_t *s_clock;
 static lv_obj_t *s_row;        /* 右侧图标行（flex，从右往左：Wi-Fi→蓝牙→输出→SD） */
 static lv_obj_t *s_wifi;
@@ -331,9 +332,27 @@ static void poll_cb(lv_timer_t *t)
     poll_sd();
 }
 
+/*
+ * 状态栏显隐：图库「单击全屏看图」要把状态栏收起来（照片要占满整块屏）。
+ * 只是 HIDDEN —— 定时器照旧跑，回到普通视图时数据立刻是新的，不用重建。
+ * 退出页面时**必须**恢复成 true（调用方负责），否则整个系统就没状态栏了。
+ */
+void ui_status_bar_set_visible(bool visible)
+{
+    if (!s_bar) {
+        return;
+    }
+    if (visible) {
+        lv_obj_remove_flag(s_bar, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 lv_obj_t *ui_status_bar_create(lv_obj_t *parent)
 {
     lv_obj_t *bar = lv_obj_create(parent);
+    s_bar = bar;
     lv_obj_remove_style_all(bar);
     lv_obj_set_size(bar, UI_W, UI_STATUSBAR_H);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 0, 0);

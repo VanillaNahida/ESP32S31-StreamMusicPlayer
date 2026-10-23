@@ -144,7 +144,7 @@ BEFORE_RESET / AFTER_RESET / **MONITOR_BAUD** / NO_STUB，整个 IDF 树里也�
 | **LVGL 桥接用 `esp_lvgl_adapter`，不用 `esp_lvgl_port`** | `esp_board_manager` 官方的 `display_lvgl` 示例即用该组件；它原生支持 RGB 面板的 tear-avoid 与旋转，`esp_lvgl_port` 不具备这些能力 |
 | **`main/idf_component.yml` 不写 `esp_lvgl_port`** | 同上 |
 | **拼音引擎 `libgooglepinyin` 走 `EXTRA_COMPONENT_DIRS`** | 它是 vendored 引擎，组件不递归搜索子目录；已在根 `CMakeLists.txt` 注册 |
-| **`LV_PINYIN_IME_EMBED_DICT=OFF`** | 词库放 `dict` 分区，省 1 MB app 空间 |
+| **`LV_PINYIN_IME_EMBED_DICT=OFF`** | 词库（2026-10-21 起 **3.55 MB**）放 `dict` 分区，不占 app |
 
 ## 5. 板级事实（来自官方 `esp32_s31_korvo_1` 板级 YAML，勿凭猜测写引脚）
 
@@ -241,6 +241,27 @@ AMOLED、ES8311。
   LVGL 的裁剪用的是对象自己的盒子（不算 padding），滚动内容会盖住标题。
   真机踩过（文件管理页标题被列表压掉一半），完整现场与铁律见
   [`docs/lvgl-pitfalls.md`](docs/lvgl-pitfalls.md) §4。
+- **图库 App + 播放器页背景图（2026-10）**：`components/apps/app_gallery/`（扫卡 / 解码线程 /
+  查看器 / 页面）与 `components/apps/app_music/music_player_bg.cc`。三件事必须记住：
+  ① 双指捏合用的是 **LVGL 手势识别器**，要 `CONFIG_LV_USE_GESTURE_RECOGNITION=y` +
+  `CONFIG_LV_USE_FLOAT=y`（后者把 `lv_value_precise_t` 变成 **float** → 用 int 花括号初始化
+  `lv_point_precise_t` 会命中 `-Werror=narrowing`，必须显式转；已修 `ui_ba.cc` 6 处）；
+  ② 大图必须走 `media_meta_photo_file_rgb565()`：JPEG 先试 **S31 硬件解码器**
+  （`esp_driver_jpeg`，输出封顶 5 MB，装不下/不支持才回落 `esp_new_jpeg` 软解），
+  PNG 走**逐行流式**（`png_stream_to_rgb565`，峰值≈输出）。`media_meta_image_file_rgb565()`
+  是「封面」语义、先整解再降采样，大图必 OOM；
+  ⑤ **GIF 宽度上限是 LVGL 的 `MAX_WIDTH`，本工程打了补丁 480 → 2048**
+  （`managed_components/lvgl__lvgl/src/libs/gif/AnimatedGIF.h`）。托管组件更新会**还原**，
+  还原后宽 GIF 又会 "load failed" —— 见 `docs/gallery.md` §5.3；
+  ③ 页面 `LV_EVENT_DELETE` 里**绝不能删子对象**（LVGL 先删子、再给父发 DELETE = use-after-free）。
+  ④ **文件管理页也能进图库**：图片行（`fs_entry_t.is_image`）用 `gallery_file`（
+  `assets/icons/gallery.svg` 烘的 24 px 位图）当图标，点击走 `gallery_open_path()` 压栈定位到那张；
+  ⚠ `storage_service_browse()` **不能加"只留音频"的过滤**，否则图片全看不见。
+  ⑥ **单击切全屏 / 左右箭头翻页**（2026-10 用户要求，滑动与捏合会打架）：全屏会
+  `ui_status_bar_set_visible(false)` + `ui_back_button_suppress(true)` —— 这两个是**全局**
+  组件，**谁藏谁必须还**（页面 DELETE 里无条件恢复）；单击判定要延迟 400 ms（> 双击窗口 350），
+  否则双击放大的第一下会先切全屏。
+  设计、手势表、ⓘ 详情里原始分辨率的来源、踩过的坑见 [`docs/gallery.md`](docs/gallery.md)。
 - ⚠ **LVGL 真机崩溃的坑集中在 [`docs/lvgl-pitfalls.md`](docs/lvgl-pitfalls.md)** ——
   改"全局复用的控件"和"挂 `lv_layer_top()` 的浮层/键盘"之前**必读**。
   最容易踩的一条：`lv_keyboard_set_textarea()` / `lv_pinyin_ime_attach()` 只存指针、
@@ -251,7 +272,23 @@ AMOLED、ES8311。
 - UI 文本：**梦源黑体** `assets/fonts/DreamHanSansSC-W17.ttf`
 - 数字（时钟/日期/进度/百分比）：**文泉驿等宽微米黑**
   `assets/fonts/wqy-microhei-mono-0.2.0-beta.ttc`（TTC 需先取 **face 1**）
-- **`CONFIG_LV_FONT_FMT_TXT_LARGE` 必须保持关闭**（拼音字体按紧凑 8 字节 glyph 描述符生成）
+- **`CONFIG_LV_FONT_FMT_TXT_LARGE` 现在是 `y`（2026-10 从 `n` 翻过来）**。
+  旧规则写的是"必须保持关闭（拼音字体按紧凑 8 字节描述符生成）"，两条理由都不成立：
+  ① `lv_font_conv` 产出的 `.c` 用的是**指定初始化器** + LVGL 自己的
+  `lv_font_fmt_txt_glyph_dsc_t` 类型，描述符跨度由编译器按同一个头文件算，生成器与
+  读取方不可能对不上（"LVGL 按 12 字节遍历 → 全部空白"只会发生在"预编译 bin 分片
+  + 宿主开着 LARGE"这种跨编译单元，本工程走 `FONT_SRC_EMBEDDED`，不涉及）；
+  ② LVGL 9.5 开 LARGE 后 `adv_w` 是 **32 位**（不是被挤成 8 位），只有好处。
+  **真正的原因**：`lvgl_pinyin_ime/tools/gen_font.py` 默认按**全字典字符集**生成
+  （2026-10-21 起是 **35,276 字**，此前 17,265 字；20 px/2 bpp 的 `glyph_bitmap[]` 达
+  **1.82 MB**、16 px 也有 **1.19 MB**），
+  都超过紧凑布局里 `bitmap_index` 的 20 位上限（1 MB）→ `-Werror=overflow` 刷屏
+  + 生成文件末尾 `#error "Too large font ..."`。**只 GB2312 的旧字体（位图 0.7/0.5 MB）
+  才刚好塞得进 1 MB**，所以老规则在旧字符集下"看起来"是对的。
+  代价：glyph 描述符 8 → 16 字节（+8 B/字形；拼音两套 ~+276 KB、UI 三套 ~+95 KB，
+  合计 ~+370 KB flash）。要省回这 370 KB 就得回小字符集：
+  `python tools/gen_charset.py --gb2312-only && python tools/gen_font.py --no-large-bitmap`
+  （此时 20 px 位图 0.71 MB / 16 px 0.46 MB，代价是词库里那 ~9.7k 生僻字显示缺字方框）。
 - **UI 实际用的是编译进去的三套位图字体**（`components/ui_font/`），16 px 梦源黑体，
   按 LVGL 的 `fallback` 链串起来（`ui_font.c` 里的 `ui_font_text`）：
 
@@ -299,24 +336,29 @@ AMOLED、ES8311。
 
 ## 11. 在线音乐 / 无线开关 / 拼音输入法（2026-10 新增）
 
-### 11.1 分区表（app 槽现在是 7.5 MB，见 `partitions.csv`）
+### 11.1 分区表（单 app 槽 11.81 MB，见 `partitions.csv`）
 
 拼音输入法的两套字体是**编进 app** 的（`CONFIG_LV_PINYIN_IME_FONT_SRC_EMBEDDED=y`，
 16 px 0.97 MB + 20 px 1.41 MB），app 从 ~5.3 MB 涨到 ~6.70 MB，原来的 6 MB app 槽
 装不下了。后来又加了 UI 位图字体的日文两份（+286 KB，见第 8 节），
 所以现在的布局是：
 
-| 分区 | 大小 | 说明 |
+| 分区 | 偏移 / 大小 | 说明 |
 | --- | --- | --- |
-| `nvs` / `otadata` / `phy_init` / `coredump` | 24K / 8K / 4K / 64K | coredump 关了就没有崩溃转储，别随便删 |
-| `dict` | 1.5 MB（`0x180000`） | 拼音**系统**词库，必须单独烧（见 11.2） |
-| `usr` | 384 KB | 拼音**用户**词库（FAT，autosave） |
-| `ota_0` / `ota_1` | **7.5 MB（`0x6F0000`）× 2** | `ota_0` 起于 `0x210000`，`ota_1` 起于 `0x900000` |
+| `nvs` / `otadata` / `phy_init` / `coredump` | `0x9000`~`0x22000`，24K+8K+4K+64K | coredump 关了就没有崩溃转储，别随便删 |
+| `dict` | `0x22000` / **3.68 MB（`0x3AE000`）** | 拼音**系统**词库的**原始 blob**（不是 FAT；`esp_partition_mmap` + 自写只读 VFS 暴露成 `/dict/dict_pinyin.dat`），必须单独烧（见 11.2） |
+| `usr` | `0x3D0000` / 384 KB | 拼音**用户**词库（FAT） |
+| `factory` | `0x430000` / **11.81 MB（`0xBD0000`）** | 单 app 槽（无 A/B OTA，历史见 `partitions.csv` 注释） |
+
+⚠ **2026-10-21 词库换代**：上游 `lvgl_pinyin_ime` 引入三个第三方词库后
+`data/dict/dict_pinyin.dat` 从 1.07 MB 涨到 **3.55 MB**、charset 17,265 → **35,276 字**，
+所以 `dict` 扩到 3.68 MB、app 槽从 14.94 MB 缩到 11.81 MB（现 app ≈ 11.22 MB，余量 9%）。
+**换了这个词库就必须重烧分区表 + 重烧 dict**，否则输入法起不来。
 
 - `assets`(SPIFFS, 128 KB) **已在 2026-10 删掉**（整块给了 app 槽）：本工程只有
   `esp_mmap_assets` 这个传递依赖，**没有任何代码引用它**（grep 过）。
-- 末尾还有 **64 KB 未分配**；再要腾地方只剩：这 64 KB、`coredump`(64 KB)、
-  `usr`(384 KB) 三处。
+- 现在**零空洞**（`dict` 尾 = `usr` 头 = `0x3D0000`，`usr` 尾 = app 头 = `0x430000`）。
+  再要腾地方只剩：`coredump`(64 KB)、`usr`(384 KB) 两处，或者砍词库/字体。
 - **改了分区表必须 `idf.py fullclean` 后重编**（AGENTS 老规矩），
   并且要重烧分区表 —— `idf.py flash` 会写它。
   `idf.py flash` 每次都会写 **空的 `otadata`**（`flash_args` 里有
@@ -324,11 +366,15 @@ AMOLED、ES8311。
 
 ### 11.2 `dict` 分区必须单独烧一次（否则输入法起不来）
 
-拼音系统词库（1.07 MB）放在 `dict` 分区，**`idf.py flash` 不会写它**：
+拼音系统词库（2026-10-21 起 **3.55 MB**）放在 `dict` 分区，**`idf.py flash` 不会写它**：
 
 ```powershell
+# ⚠ 必须带 -Project 指向**本工程**：脚本是 Push-Location 到 -Project 再调 parttool，
+#   用它的默认值（examples/k26_k9_demo）会拿**别人的分区表**定位 dict → 写到错误偏移。
 cd D:\Codes\lvgl_pinyin_ime
-powershell -ExecutionPolicy Bypass -File tools\flash_dict.ps1 -Port COM20 -Dict
+powershell -ExecutionPolicy Bypass -File tools\flash_dict.ps1 -Port COM20 -Dict `
+  -Project D:\Codes\ESP32S31-StreamMusicPlayer
+# ⚠ 不要加 -Font：本工程字体是 FONT_SRC_EMBEDDED（编进 app），没有 font 分区。
 ```
 
 没烧过时分区里是历史残留数据（实测读出来是别的分区的旧内容），
@@ -2356,9 +2402,51 @@ discovery_start/stop、connect/disconnect、set_scan_mode）。于是"开机自�
 | 时刻 | 动作 |
 | --- | --- |
 | `app_main` 第一件事（`bsp_init()` 之后） | `boot_splash_decode_start()`：后台任务把 JPEG 软解成 RGB565（≈770 KB PSRAM），**与后面的初始化并行**，钉 core 0（core 1 是 LVGL） |
-| 显示链路 ready 且 `ui_core_init()` 之后（**同一个 LVGL 锁里**） | `boot_splash_show()`：在 `lv_layer_top()` 最上层盖全屏图 + `ui_toast("正在初始化...")` |
+| **`esp_lv_adapter_start()` 之后立刻**（2026-10-21 加） | `boot_splash_early_show()`：建**独立 screen**（不依赖 ui_core）+ 启动图 + 底部状态行。这就是用户看到的第一帧 |
+| 之后每一步慢初始化之前 | `boot_splash_set_status("正在挂载存储卡…")` 之类，把"在干嘛"写在屏幕上 |
+| 显示链路 ready 且 `ui_core_init()` 之后（**同一个 LVGL 锁里**） | `boot_splash_show()`：在 `lv_layer_top()` 最上层盖全屏图 + `ui_toast("正在初始化...")`，顺带收掉早期 screen |
 | `radio_init_task` 结束（WiFi + 蓝牙初始化完） | `boot_splash_init_done()` 只置一个标志 |
 | LVGL 定时器每 100 ms 检查 | `(init_done && 已显示 ≥ 900 ms) \|\| 已显示 ≥ 8000 ms` → 淡出（opa）+ 上滑 28 px，360 ms → 删对象、还回 PSRAM，露出首页 |
+
+### 16.1.1 ⚠ 开机顺序：第一帧要抢在所有慢初始化之前（2026-10-21 用户报"黑屏很久"）
+
+用户原话："启动的时候黑屏很久了才显示第一屏……怀疑是词库部分阻塞了第一屏"。
+**实测不是词库**：`lv_pinyin_ime_create()` 只在用户点进搜索页/MomoTalk 时才调，
+开机路径上只有 `lv_pinyin_ime_set_fonts()`（只存两个指针）。
+
+真正的元凶是 `app_main` 里那串**顺序**初始化：以前屏幕要到
+`ui_core_init()` + `boot_splash_show()` 才第一次出画面，而前面已经串了
+SD 挂载 / 曲库 / 在线目录 / 播放服务 —— 全是阻塞调用。现在改成：
+
+```
+bsp_init → play_state_init → bsp_audio_init → audio_service_init
+        → lvgl_adapter_init → display/touch register → esp_lv_adapter_start
+        → **boot_splash_early_show()   ← 第一帧（启动图 + 状态行）**
+        → bsp_sdcard_mount / storage_service_init / online_service_init
+        → app 注册 → ui_core_init → boot_splash_show（换到 layer_top 浮层）
+        → bsp_button_init → radio_init_task（WiFi/蓝牙）
+```
+
+为什么 `bsp_audio_init` / `audio_service_init` 仍留在显示之前：它们**吃内部 RAM 最多**
+（ASRC 缓冲必须内部 RAM，见 §0），先做能保证内存最宽松；而且它们不碰 SD，
+耗时是百毫秒级。真要再往前抢，就得把它们也挪到画面之后，**必须同时验证**
+`audio_service_init` 在 LVGL 之后仍能拿到内部 RAM（拿不到就整机没声音）。
+
+**每一步都有耗时基线**：`app_main` 里 `boot_mark("…")` 会打
+`I app_main: boot +  123 ms  bsp_init` 这样的行。排查"开机慢"先看这串数字，
+别再靠猜。正常参考：`bsp_init` < 400 ms、`first frame` < 1500 ms 是可接受的。
+
+⚠⚠ **早期屏上放文字，必须先 `ui_font_init()`**：`ui_font_text` 是 `ui_font.c:30` 里
+**运行期才填**的可写副本（原字体在 `.rodata`，`fallback` 链要拷到可写内存才串得起来）。
+在 `ui_font_init()` 之前它是**全零的 `lv_font_t`** → 渲染到文字时 `get_glyph_dsc == NULL`
+→ 跳到地址 0：`Core 1 panic'ed (Instruction access fault)`、`MEPC 0x00000000`、
+`MCAUSE 0x1`、`MTVAL 0x0`，栈里只有 `lv_font_get_glyph_dsc`。
+（2026-10-21 真机就这么崩过一次。）现在 `boot_splash_early_show()` **第一句**就调
+`ui_font_init()`（幂等），所以别在它之前建任何带文字的控件。
+
+早期那个 screen 是 `lv_obj_create(NULL)` 建的真 screen，不是 `lv_layer_top()` 浮层 ——
+因为 `ui_core_init()` 之前全局层上还没有 Toast/状态栏，而 screen 是自洽的，
+`ui_core_init()` 切首页时它自然下台，`boot_splash_show()` 里再删掉。
 
 几个**别改回去**的点：
 

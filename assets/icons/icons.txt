@@ -22,6 +22,9 @@
 # 桌面 APP 图标
 assets/icons/netease.png            netease_logo        96
 assets/MomoTalk.png                 momotalk_logo       96
+assets/icons/gallery.png            gallery_logo        96     # 图库 App 桌面图标
+# 文件管理里「图片文件」那一行的小图标（24 px，与 16 px 字形图标视觉同档）
+assets/icons/gallery.svg            gallery_file        24
 
 # MomoTalk 页面
 assets/icons/momotalk_icon.png      momotalk_icon       32     # 标题栏左侧圆形图标

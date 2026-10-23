@@ -469,6 +469,7 @@ void ui_back_button_place(lv_obj_t *btn)
  *   - 它们关闭后按钮自动恢复可见，无需额外代码。
  */
 static lv_obj_t *s_back_btn;
+static bool      s_back_btn_suppressed;   /* 全屏看图时临时收起返回钮 */
 
 lv_obj_t *ui_back_button_global_create(lv_obj_t *parent)
 {
@@ -482,12 +483,23 @@ lv_obj_t *ui_back_button_global_create(lv_obj_t *parent)
     return btn;
 }
 
+/*
+ * 临时收起全局返回钮（图库全屏看图）。只是置一个抑制位再刷新一次可见性 ——
+ * 页面切换时 ui_back_button_update() 会重算，所以**必须在退出页面时**恢复成 false。
+ * 收起后左边缘的返回手势热区仍然有效，不会把用户困住。
+ */
+void ui_back_button_suppress(bool suppress)
+{
+    s_back_btn_suppressed = suppress;
+    ui_back_button_update();
+}
+
 void ui_back_button_update(void)
 {
     if (!s_back_btn) {
         return;
     }
-    const bool need = ui_router_top_needs_back();
+    const bool need = ui_router_top_needs_back() && !s_back_btn_suppressed;
     if (need) {
         lv_obj_remove_flag(s_back_btn, LV_OBJ_FLAG_HIDDEN);
     } else {

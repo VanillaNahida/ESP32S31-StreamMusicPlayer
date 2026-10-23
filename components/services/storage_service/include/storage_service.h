@@ -101,6 +101,10 @@ void           storage_service_clear(void);
 /* 按扩展名判断是否为本项目支持的音频 */
 bool storage_service_is_audio(const char *name);
 
+/* 按扩展名判断是否为图库能打开的图片（jpg/jpeg/png/gif）——
+ * 文件管理页据此把图片行画成图库图标，点击时交给 app_gallery 打开。 */
+bool storage_service_is_image(const char *name);
+
 /* ------------------------------------------------------------------ 目录浏览
  *
  * 本地音乐页是"SD 卡文件浏览器"：只列**当前这一层**，不递归。
@@ -122,6 +126,7 @@ typedef struct {
     char     name[STORAGE_NAME_MAX];
     bool     is_dir;
     bool     is_audio;
+    bool     is_image;     /* 图库能打开（jpg/jpeg/png/gif） */
     uint32_t size;
 } fs_entry_t;
 

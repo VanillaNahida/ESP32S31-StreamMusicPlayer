@@ -25,6 +25,14 @@ extern "C" {
 esp_err_t mm_image_to_rgb565(const uint8_t *data, size_t len, int max_dim,
                              uint8_t **out_pixels, int *out_w, int *out_h);
 
+/*
+ * **大图**版本（图库 App 用）：JPEG 走 esp_new_jpeg 解码期 scale，峰值内存≈输出。
+ * 与上面那条路的区别见 mm_image.cc 的说明（手机照片整解会 OOM）。
+ * 输出同样是 jpeg_calloc_align 分配，用 mm_cover_free() 释放。
+ */
+esp_err_t mm_photo_file_rgb565(const char *path, int max_dim,
+                               uint8_t **out_pixels, int *out_w, int *out_h);
+
 #ifdef __cplusplus
 }
 #endif

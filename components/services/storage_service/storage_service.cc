@@ -139,6 +139,34 @@ bool storage_service_is_audio(const char *name)
     return false;
 }
 
+/* 图库能打开的图片扩展名（与 app_gallery 的 gallery_kind_of() 保持同一套） */
+static const char *const k_img_ext[] = { "jpg", "jpeg", "png", "gif" };
+
+bool storage_service_is_image(const char *name)
+{
+    if (!name) {
+        return false;
+    }
+    size_t n = strlen(name);
+    for (size_t i = 0; i < sizeof(k_img_ext) / sizeof(k_img_ext[0]); i++) {
+        size_t e = strlen(k_img_ext[i]);
+        if (n > e) {
+            const char *p = name + (n - e);
+            bool eq = true;
+            for (size_t k = 0; k < e; k++) {
+                if (tolower((unsigned char)p[k]) != k_img_ext[i][k]) {
+                    eq = false;
+                    break;
+                }
+            }
+            if (eq) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /* 去掉扩展名 */
 static void strip_ext(char *s)
 {
@@ -665,6 +693,7 @@ int storage_service_browse(const char *dir, fs_entry_t *out, int max)
         utf8_copy(e->name, sizeof(e->name), ent->d_name);
         e->is_dir   = S_ISDIR(st.st_mode);
         e->is_audio = !e->is_dir && storage_service_is_audio(e->name);
+        e->is_image = !e->is_dir && !e->is_audio && storage_service_is_image(e->name);
         e->size     = e->is_dir ? 0 : (uint32_t)st.st_size;
         n++;
     }

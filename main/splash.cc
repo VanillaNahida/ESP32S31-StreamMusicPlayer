@@ -31,7 +31,9 @@
  */
 #include "splash.h"
 
+#include <stdio.h>
 #include <stdlib.h>
+#include "esp_lv_adapter.h"   /* esp_lv_adapter_lock：状态行可能在 app_main 里更新 */
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -41,6 +43,7 @@
 
 #include "lvgl.h"
 #include "ui_core.h"
+#include "ui_font.h"         /* ui_font_init：早期屏的文字必须等它跑过 */
 #include "ui_metrics.h"
 #include "media_meta.h"
 
@@ -61,6 +64,10 @@ extern "C" const uint8_t _binary_boot_splash_jpg_end[];
 #define SPLASH_POLL_MS    100     /* 轮询"图解码好了吗 / 初始化完了吗" */
 #define SPLASH_TOAST_MS   6000    /* Toast 时长；真正收掉是在过渡开始时（ui_toast_hide） */
 #define SPLASH_DECODE_STACK (8 * 1024)  /* 与 app_music 的封面解码任务同量级 */
+
+static lv_obj_t       *s_early_scr;   /* 早期启动屏（独立 screen，不依赖 ui_core） */
+static lv_obj_t       *s_early_label; /* 早期屏底部那行状态文字 */
+static char            s_status[64] = "正在初始化…";   /* 没设过时用这句 */
 
 static uint8_t        *s_px;          /* 解码后的 RGB565 像素（PSRAM，media_meta_cover_free 释放） */
 static int             s_px_w;
@@ -121,16 +128,26 @@ void boot_splash_decode_start(void)
 
 /* ---------------------------------------------------------------- 显示（LVGL 任务） */
 
+/* 当前该贴图的容器：ui_core 起来前是早期 screen，之后是 layer_top 上的浮层 */
+static lv_obj_t *splash_host(void)
+{
+    return s_scr ? s_scr : s_early_scr;
+}
+
 /* 解码好了就把图贴上去（建 lv_image + 描述符）。只在 LVGL 任务里调用。 */
 static void splash_attach(void)
 {
-    if (s_img || !s_px || !s_scr) {
+    lv_obj_t *host = splash_host();
+    if (s_img || !s_px || !host) {
         return;
     }
-    s_dsc = (lv_image_dsc_t *)calloc(1, sizeof(lv_image_dsc_t));
+    /* 描述符只建一次：早期屏 → 浮层的二次 attach 会复用它（否则漏一个） */
     if (!s_dsc) {
-        ESP_LOGW(TAG, "splash dsc alloc failed");
-        return;
+        s_dsc = (lv_image_dsc_t *)calloc(1, sizeof(lv_image_dsc_t));
+        if (!s_dsc) {
+            ESP_LOGW(TAG, "splash dsc alloc failed");
+            return;
+        }
     }
     s_dsc->header.magic  = LV_IMAGE_HEADER_MAGIC;
     s_dsc->header.cf     = LV_COLOR_FORMAT_RGB565;
@@ -140,9 +157,13 @@ static void splash_attach(void)
     s_dsc->data_size     = (uint32_t)s_px_w * 2u * (uint32_t)s_px_h;
     s_dsc->data          = s_px;
 
-    s_img = lv_image_create(s_scr);
+    s_img = lv_image_create(host);
     lv_image_set_src(s_img, s_dsc);
     lv_obj_center(s_img);
+    /* 启动图是整屏 800x480，会把先建的"状态行"盖住 —— 图一贴上来就把它提回最前 */
+    if (s_early_label) {
+        lv_obj_move_foreground(s_early_label);
+    }
 }
 
 static void splash_timer_stop(void)
@@ -203,14 +224,15 @@ static void splash_out_done_cb(lv_anim_t *a)
 static void splash_tick(lv_timer_t *t)
 {
     (void)t;
-    if (!s_scr) {
+    if (!s_scr && !s_early_scr) {
         splash_timer_stop();
         return;
     }
     if (!s_img && s_decoded) {
         splash_attach();
     }
-    if (s_fading) {
+    /* 淡出只对"ui_core 已就绪"的浮层做；早期屏由 boot_splash_show() 换掉 */
+    if (!s_scr || s_fading) {
         return;
     }
     const uint32_t el = lv_tick_elaps(s_shown_tick);
@@ -238,6 +260,92 @@ static void splash_tick(lv_timer_t *t)
     lv_anim_start(&a);
 }
 
+void boot_splash_early_show(void)
+{
+    if (s_early_scr || s_scr) {
+        return;
+    }
+    /*
+     * ⚠⚠ 必须先 ui_font_init()：状态行用的是 UI_FONT_TEXT，而 ui_font_text 是
+     *   ui_font.c:30 那个**运行期才填的可写副本**（原字体在 .rodata，fallback 链要拷
+     *   到可写内存才能串起来）。初始化之前它是**全零的 lv_font_t** → 渲染到文字时
+     *   get_glyph_dsc == NULL → 跳到地址 0：
+     *     Guru Meditation: Core 1 panic'ed (Instruction access fault)
+     *     MEPC 0x00000000 / MCAUSE 0x1 / MTVAL 0x0，栈里只有 lv_font_get_glyph_dsc
+     *   这个坑 ui_font.h 顶部写着"必须先 ui_font_init() 再创建任何标签"。
+     *   函数幂等（只是结构体拷贝 + 串 fallback），ui_core_init() 里再调一次是空操作。
+     */
+    ui_font_init();
+    /*
+     * 独立 screen（lv_obj_create(NULL)）而不是 lv_layer_top() 的浮层：
+     * ui_core_init() 还没跑，全局层上的东西会跟着首页一起被建/被删，
+     * 而 screen 是自洽的 —— 之后 ui_core_init() 切到首页，这一屏就自然下台。
+     */
+    s_early_scr = lv_obj_create(NULL);
+    lv_obj_remove_style_all(s_early_scr);
+    lv_obj_set_style_bg_color(s_early_scr, UI_COLOR_BG, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_early_scr, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_remove_flag(s_early_scr, LV_OBJ_FLAG_SCROLLABLE);
+
+    /*
+     * 底部状态行：这是"开机到底在干嘛"的唯一反馈。以前这 2~5 秒是一整块黑屏，
+     * 用户只能猜是不是死机了。
+     */
+    s_early_label = lv_label_create(s_early_scr);
+    lv_obj_set_style_text_font(s_early_label, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_early_label, UI_COLOR_FG, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(s_early_label, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(s_early_label, LV_OPA_80, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(s_early_label, UI_PX_W(14), LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(s_early_label, UI_PX_H(5), LV_PART_MAIN);
+    lv_obj_set_style_radius(s_early_label, UI_PX_H(10), LV_PART_MAIN);
+    lv_label_set_text(s_early_label, s_status);
+    lv_obj_align(s_early_label, LV_ALIGN_BOTTOM_MID, 0, -UI_PX_H(26));
+
+    lv_screen_load(s_early_scr);
+
+    s_shown_tick = lv_tick_get();
+    s_fading     = false;
+    splash_attach();          /* 图已就绪就直接贴，否则交给轮询 */
+    splash_timer_stop();
+    s_tick = lv_timer_create(splash_tick, SPLASH_POLL_MS, NULL);
+    ESP_LOGI(TAG, "early boot screen up (decode done=%d)", (int)s_decoded);
+}
+
+void boot_splash_set_status(const char *text)
+{
+    if (!text || !text[0]) {
+        return;
+    }
+    snprintf(s_status, sizeof(s_status), "%s", text);
+    if (!s_early_label) {
+        return;          /* 早期屏还没建/已收掉：记下文字就够了 */
+    }
+    /* 拿不到锁也不等（这一步不能拖慢启动），下次更新会补上 */
+    if (esp_lv_adapter_lock(200) != ESP_OK) {
+        return;
+    }
+    if (s_early_label) {
+        lv_label_set_text(s_early_label, s_status);
+    }
+    esp_lv_adapter_unlock();
+    ESP_LOGI(TAG, "boot status: %s", s_status);
+}
+
+/* 收掉早期屏（图上移交给 layer_top 的浮层之前必须先清 s_img，否则悬垂） */
+static void splash_early_release(void)
+{
+    if (!s_early_scr) {
+        return;
+    }
+    s_img = NULL;              /* 图对象挂在早期屏上，跟着一起删 */
+    if (s_early_label) {
+        s_early_label = NULL;
+    }
+    lv_obj_delete(s_early_scr);
+    s_early_scr = NULL;
+}
+
 void boot_splash_show(void)
 {
     if (s_scr) {
@@ -257,6 +365,7 @@ void boot_splash_show(void)
     s_shown_tick = lv_tick_get();
     s_fading     = false;
 
+    splash_early_release();   /* 先收早期屏（它上面的图对象一起删），再由下面重新贴 */
     splash_attach();          /* 解码已就绪就直接贴（否则由 splash_tick 补） */
     splash_timer_stop();
     s_tick = lv_timer_create(splash_tick, SPLASH_POLL_MS, NULL);

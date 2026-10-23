@@ -117,6 +117,23 @@ esp_err_t media_meta_image_mem_rgb565(const uint8_t *data, size_t len, int max_d
                                       uint8_t **pixels, int *out_w, int *out_h);
 
 /*
+ * **大图**文件 → RGB565（图库 App 用，2026-10 加）。
+ *
+ * 与 media_meta_image_file_rgb565() 的区别只有一点，但对手机照片是决定性的：
+ *   后者先把整张图**按原始尺寸**解进临时缓冲再降采样（4000x3000 要 24 MB RGB565，
+ *   直接 OOM）；本函数对 JPEG 用 esp_new_jpeg 的**解码期 scale**（按 1/2^n 直接
+ *   解到目标尺寸），峰值内存≈输出本身（800 长边时约 1.5 MB）。
+ *
+ * 文件上限 12 MB；输出同样是 jpeg_calloc_align 分配，用 media_meta_cover_free() 释放。
+ * 失败码：ESP_ERR_NOT_FOUND 打不开 / ESP_ERR_INVALID_SIZE 超过 12 MB /
+ *        ESP_ERR_NO_MEM / ESP_FAIL 解码失败。
+ *
+ * ⚠ 同步阻塞（读整份文件 + 解码），只在工作线程里调。
+ */
+esp_err_t media_meta_photo_file_rgb565(const char *img_path, int max_dim,
+                                       uint8_t **pixels, int *out_w, int *out_h);
+
+/*
  * 容器头部长度（音频数据起始偏移，字节）。
  *   MP3：ID3v2 标签总长度（10 + synchsafe size），无标签为 0
  *   其它：0

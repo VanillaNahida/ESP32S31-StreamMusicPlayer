@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -23,6 +24,7 @@
 #include "voice_service.h"     /* 语音输入宿主：WebSocket + 麦克风 + 自动暂停播放 */
 #include "audio_service.h"
 #include "storage_service.h"   /* 本地曲库 + SD 热插拔监控任务的启动点 */
+#include "app_gallery.h"
 #include "app_music.h"
 #include "app_settings.h"
 #include "app_online.h"
@@ -54,6 +56,22 @@ extern "C" void cxx_heap_anchor(void);
 __attribute__((used)) static void (*const s_cxx_heap_anchor)(void) = &cxx_heap_anchor;
 
 static const char *TAG = "app_main";
+
+/*
+ * 启动耗时基线：每一步都打一行 "boot +N ms  xxx"。
+ * 排查"开机黑屏很久"这类问题只能靠这个 —— 没有数字就只能靠猜（踩过）。
+ * app_main 第一句就置 t0，之后每一大步都 mark 一次。
+ */
+static int64_t s_boot_t0;
+
+static void boot_mark(const char *what)
+{
+    if (s_boot_t0 <= 0) {
+        s_boot_t0 = esp_timer_get_time();
+    }
+    ESP_LOGI(TAG, "boot +%5lld ms  %s",
+             (long long)((esp_timer_get_time() - s_boot_t0) / 1000), what);
+}
 
 /* ------------------------------------------------------------------ */
 /* LVGL 适配器（官方 esp_lvgl_adapter）                                 */
@@ -198,8 +216,11 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "=== ESP32-S31 stream music player boot ===");
 
+    boot_mark("app_main");
+
     ESP_ERROR_CHECK(bsp_init());
     log_heap("after bsp_init");      /* 基线：后面每一步吃多少内部 RAM 都有参照 */
+    boot_mark("bsp_init");
 
     /*
      * 开机启动图：**先把解码任务发出去**（assets/init.jpg，800x480 JPEG 软解成
@@ -207,7 +228,6 @@ extern "C" void app_main(void)
      * 已经就绪，于是"屏幕一亮就是这张图"（见 splash.cc）。
      */
     boot_splash_decode_start();
-    log_heap("splash decode kicked");
 
     /*
      * 播放状态记忆（音量 / 曲目 / 进度，存 NVS）：必须在 audio_service_init()
@@ -218,31 +238,26 @@ extern "C" void app_main(void)
     if (play_state_init() != ESP_OK) {
         ESP_LOGW(TAG, "play_state_init failed (音量/进度不做记忆)");
     }
-
-    /* 板级外设（惰性初始化各自设备，未插卡/无触摸都不致命） */
-    bsp_audio_init();
-    bsp_sdcard_mount();
-    bsp_led_set(0, 0, 12);
+    boot_mark("play_state_init");
 
     /*
-     * 本地曲库服务：这里必须显式初始化一次 —— SD 热插拔监控任务就是在
-     * storage_service_init() 里起来的（板子没有卡检测脚，全靠它轮询）。
-     * 只在别的入口惰性初始化的话，用户不开本地音乐页就永远没有热插拔：
-     * 插拔卡没有 Toast、状态栏图标不动、换了卡也得重启。
+     * 板载 codec / 播放服务：**留在显示之前**是有意的 ——
+     *  ① 这两步吃内部 RAM 最多（ASRC 缓冲、解码器），先做能保证内存最宽松；
+     *  ② 它们不碰 SD，耗时是百毫秒级，不是"黑屏几秒"的元凶。
+     * 真正慢的 SD 挂载 / 曲库 / 在线目录已经挪到第一帧之后（见下面）。
      */
-    if (storage_service_init() != ESP_OK) {
-        ESP_LOGW(TAG, "storage_service_init failed (本地曲库不可用)");
-    }
-
-    /* 在线音乐：建 /sdcard/online 目录树 + 读回保存的歌单 ID（不需要网络） */
-    online_service_init();
-
-    /* 播放服务（ESP-GMF / esp_audio_simple_player） */
+    bsp_audio_init();
+    bsp_led_set(0, 0, 12);
     if (audio_service_init() != ESP_OK) {
         ESP_LOGW(TAG, "audio_service_init failed (无声音，但 UI 继续可用)");
     }
+    boot_mark("audio ready");
 
-    /* LVGL 适配器先起来，再注册显示与触摸 */
+    /*
+     * ================= 显示链路（决定"第一帧"什么时候出来）=================
+     * 从这里到 boot_splash_early_show() 之间**只放必须的**：
+     * 面板/LVGL 起来之后立刻铺第一帧，剩下的初始化都在画面后面做。
+     */
     ESP_ERROR_CHECK(lvgl_adapter_init());
 
     lv_display_t *disp = NULL;
@@ -252,12 +267,57 @@ extern "C" void app_main(void)
     bsp_touch_register_lvgl(disp, &indev);
 
     ESP_ERROR_CHECK(esp_lv_adapter_start());
+    boot_mark("lvgl up");
+
+    /*
+     * ★ 第一帧：启动图 + 底部状态行。ui_core 还没建，所以用独立的 screen
+     *   （见 splash.cc 的 boot_splash_early_show）。以前这一帧要等
+     *   SD 挂载 + 曲库 + 在线目录 + ui_core_init 全跑完才出 —— 也就是用户说的
+     *   "开机黑屏很久"。
+     */
+    if (esp_lv_adapter_lock(-1) == ESP_OK) {
+        /*
+         * ⚠ 早期屏那行状态文字用的是 UI_FONT_TEXT，而 ui_font_text 是**运行期才填**的
+         *   可写副本 —— 在 ui_font_init() 之前它是全零的 lv_font_t，渲染到文字就跳到
+         *   地址 0（Instruction access fault / MCAUSE=1 / MTVAL=0，栈里只有
+         *   lv_font_get_glyph_dsc）。所以 boot_splash_early_show() **自己**先调
+         *   ui_font_init()（幂等），别再在它之前建带文字的控件。
+         */
+        boot_splash_early_show();
+        esp_lv_adapter_unlock();
+    }
+    boot_mark("first frame");
+
+    /* ================= 以下是"画面之后"的慢初始化 ================= */
+
+    boot_splash_set_status("正在挂载存储卡…");
+    bsp_sdcard_mount();
+    boot_mark("sdcard mounted");
+
+    /*
+     * 本地曲库服务：这里必须显式初始化一次 —— SD 热插拔监控任务就是在
+     * storage_service_init() 里起来的（板子没有卡检测脚，全靠它轮询）。
+     * 只在别的入口惰性初始化的话，用户不开本地音乐页就永远没有热插拔：
+     * 插拔卡没有 Toast、状态栏图标不动、换了卡也得重启。
+     */
+    boot_splash_set_status("正在建立本地曲库…");
+    if (storage_service_init() != ESP_OK) {
+        ESP_LOGW(TAG, "storage_service_init failed (本地曲库不可用)");
+    }
+
+    /* 在线音乐：建 /sdcard/online 目录树 + 读回保存的歌单 ID（不需要网络） */
+    boot_splash_set_status("正在准备在线音乐…");
+    online_service_init();
+    boot_mark("storage + online ready");
+
+    boot_splash_set_status("正在加载界面…");
 
     /* 先注册真实 APP（覆盖 ui_home 的同 id 占位页），再起 UI */
     app_music_register_apps();
     app_settings_register_apps();
     app_online_register_apps();
     app_momotalk_register_apps();
+    app_gallery_register();          /* 图库（SD 卡图片浏览） */
 
     /*
      * UI 框架：状态栏 / 控制中心 / 手势 / 首页（全部在 LVGL 任务上下文建）。
@@ -288,9 +348,10 @@ extern "C" void app_main(void)
          * 所以放在 ui_core_init 之后、启动图之前最稳妥。
          */
         lv_pinyin_ime_set_fonts(UI_FONT_TEXT, UI_FONT_TEXT);
-        boot_splash_show();
+        boot_splash_show();          /* 浮层接替早期屏，首页已在它下面建好 */
         esp_lv_adapter_unlock();
     }
+    boot_mark("ui + home ready");
 
     /* 硬件按键：必须在 ui_core_init() 之后，音量条的 LVGL 定时器才已经建好 */
     if (bsp_button_init(on_board_key, NULL) != ESP_OK) {
@@ -298,6 +359,7 @@ extern "C" void app_main(void)
     }
     /* UI + 启动图 + 两张 800x480 图（PSRAM）之后的内部 RAM 余额 —— 射频启动就靠它 */
     log_heap("after ui+splash");
+    boot_mark("ui+splash");
 
     /*
      * Wi-Fi / 蓝牙：初始化要几百毫秒（蓝牙更久），放后台任务里做。

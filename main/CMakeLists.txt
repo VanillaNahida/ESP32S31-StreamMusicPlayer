@@ -16,6 +16,7 @@ idf_component_register(
         app_settings
         app_online
         app_momotalk
+        app_gallery
         wifi_service
         bt_service
         online_service

@@ -1,0 +1,59 @@
+D:\Espressif\EIM\tools\python\v6.1\venv\Lib\site-packages\requests\__init__.py:92: RequestsDependencyWarning: Unable to find acceptable character detection dependency (chardet or charset_normalizer).
+  warnings.warn(
+Your environment is not configured to handle Unicode characters.
+
+Recommended fix (persistent):
+ - Enable "Beta: Use Unicode UTF-8 for worldwide language support" in Windows language/region settings.
+
+If you still see issues or this warning persists, you can also try one of these workarounds:
+ - Run "chcp 65001" in the current console before running idf.py.
+ - Set PYTHONUTF8=1 before running idf.py (or set it globally).
+
+Note: "chcp 65001" must be run in each new console session unless your console/profile is configured to apply it automatically.
+INFO: Loaded component extension from "managed_components\espressif__esp_board_manager"
+[Board Manager] Running global callback for tasks: all
+[Board Manager] board_manager.defaults has higher priority than the project sdkconfig.defaults.
+[Board Manager] If a configuration does not take effect, inspect: components/gen_bmgr_codes/board_manager.defaults
+[Board Manager] Checking sdkconfig consistency before action execution...
+   sdkconfig board-manager symbols are consistent with current board generation
+[1/10] Performing build step for 'bootloader'
+[1/1] C:\WINDOWS\system32\cmd.exe /C "cd /D D:\Codes\ESP32S31-StreamMusicPlayer\build\bootloader && D:\Espressif\EIM\tools\python\v6.1\venv\Scripts\python.exe D:/Espressif/EIM/v6.1/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 bootloader 0x2000 D:/Codes/ESP32S31-StreamMusicPlayer/build/bootloader/bootloader.bin"
+
+Bootloader binary size 0x5a80 bytes. 0x580 bytes (6%) free.
+
+
+[2/10] No install step for 'bootloader'
+[3/10] Completed 'bootloader'
+[4/10] Building CXX object esp-idf/main/CMakeFiles/__idf_main.dir/splash.cc.obj
+[5/10] Building CXX object esp-idf/main/CMakeFiles/__idf_main.dir/main.cc.obj
+[6/10] Linking C static library esp-idf\main\libmain.a
+[7/10] Generating esp-idf/esp_system/ld/sections.ld
+Skipping linker script generation, section names unchanged
+
+[8/10] Linking CXX executable esp32s31_stream_music_player.elf
+[9/10] Generating binary image from built executable
+esptool v5.4.0
+
+Creating ESP32-S31 image...
+
+Merged 3 ELF sections.
+
+Successfully created ESP32-S31 image.
+
+Generated D:/Codes/ESP32S31-StreamMusicPlayer/build/esp32s31_stream_music_player.bin
+[10/10] C:\WINDOWS\system32\cmd.exe /C "cd /D D:\Codes\ESP32S31-StreamMusicPlayer\build && D:\Espressif\EIM\tools\python\v6.1\venv\Scripts\python.exe D:/Espressif/EIM/v6.1/esp-idf/components/partition_table/check_sizes.py --offset 0x8000 partition --type app D:/Codes/ESP32S31-StreamMusicPlayer/build/partition_table/partition-table.bin D:/Codes/ESP32S31-StreamMusicPlayer/build/esp32s31_stream_music_player.bin"
+esp32s31_stream_music_player.bin binary size 0xab5900 bytes. Smallest app partition is 0xbd0000 bytes. 0x11a700 bytes (9%) free.
+
+Executing action: all (aliases: build)
+Running ninja in directory D:\Codes\ESP32S31-StreamMusicPlayer\build
+Executing "ninja all"...
+
+
+Project build complete. To flash, run:
+ idf.py flash
+or
+ idf.py -p PORT flash
+or
+ python -m esptool --chip esp32s31 -b 921600 --before default-reset --after hard-reset --no-stub write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m 0x2000 build\bootloader\bootloader.bin 0x8000 build\partition_table\partition-table.bin 0xf000 build\ota_data_initial.bin 0x430000 build\esp32s31_stream_music_player.bin
+or from the "D:\Codes\ESP32S31-StreamMusicPlayer\build" directory
+ python -m esptool --chip esp32s31 -b 921600 --before default-reset --after hard-reset --no-stub write-flash "@flash_args"
