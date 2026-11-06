@@ -471,6 +471,22 @@ void ui_back_button_place(lv_obj_t *btn)
 static lv_obj_t *s_back_btn;
 static bool      s_back_btn_suppressed;   /* 全屏看图时临时收起返回钮 */
 
+void ui_screen_apply_default_bg(lv_obj_t *scr)
+{
+    if (!scr) {
+        return;
+    }
+    lv_obj_remove_style_all(scr);
+    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
+    /*
+     * ⚠ 这一行是关键：remove_style_all() 之后 bg_opa 是 0（透明），只设 bg_color
+     *   等于什么都没画 —— screen 区域保留 framebuffer 里的上一屏内容。单帧
+     *   framebuffer（num_fbs=1）时尤其明显：从播放器进设置，设置页会"显示"
+     *   播放器那张背景图（真机复现过）。
+     */
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, LV_PART_MAIN);
+}
+
 lv_obj_t *ui_back_button_global_create(lv_obj_t *parent)
 {
     if (!parent) {

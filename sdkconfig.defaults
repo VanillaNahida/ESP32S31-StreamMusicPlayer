@@ -267,3 +267,29 @@ CONFIG_LV_USE_GIF=y
 CONFIG_LV_USE_FLOAT=y
 CONFIG_LV_USE_GESTURE_RECOGNITION=y
 
+
+# ---------------------------------------------------------------------------
+# USB Host（UAC 声卡输出，见 docs/uac-audio.md）
+#
+# ⚠ 默认 256 字节**装不下这个声卡的配置描述符**（1 个 AudioControl + 4 个
+#   AudioStreaming alt（16/24bit × 2）+ 1 个 HID 接口），枚举阶段直接失败：
+#     E ENUM: Configuration descriptor larger than control transfer max length
+#     E ENUM: CHECK_SHORT_CONFIG_DESC FAILED
+#   → 设备永远"插着但认不到"（USB 主机栈自己都到不了类驱动那层）。
+#   代价只有一个 1 KB 的内部 RAM 缓冲。
+# ---------------------------------------------------------------------------
+CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+
+# ---------------------------------------------------------------------------
+# TLS 接收缓冲 16 KB → 8 KB（2026-10-21）
+#
+# 内部 RAM 现在同时供着：LVGL、PCM ringbuf、**UAC 环形缓冲 19.2 KB**、
+# **ASRC 池 14 KB**、USB 三任务栈。MBEDTLS_INTERNAL_MEM_ALLOC=y 意味着 mbedTLS
+# 的 TLS 缓冲**只能从内部 RAM 拿**，16 KB 的 in-buffer 一旦拿不到就：
+#     E esp-aes: Failed to allocate memory
+#     E esp-tls-mbedtls: write error :-0x0084
+#     W online: GET failed (ESP_ERR_HTTP_WRITE_DATA)
+# 8 KB 仍大于绝大多数服务器的 TLS 记录（常见 ≤4 KB），风险很低、直接省 8 KB。
+# 不要降到 4 KB 以下：个别服务器会发 8/16 KB 记录，mbedTLS 会报 buffer_too_small。
+# ---------------------------------------------------------------------------
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192

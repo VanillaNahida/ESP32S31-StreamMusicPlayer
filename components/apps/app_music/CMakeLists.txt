@@ -25,6 +25,7 @@ idf_component_register(
         media_meta
         play_state
         bt_service
+        usb_audio_service  # 输出设备弹窗里"USB 声卡"那一行只在插着时出现
         online_service
         app_settings
         app_gallery        # 文件管理里点图片 -> gallery_open_path()（压栈打开图库）

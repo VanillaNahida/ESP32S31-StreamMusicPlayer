@@ -1,7 +1,7 @@
 # audio_service —— 播放服务
 #
 # 解码用 libs/espaudiocore（**不是** ESP-GMF / esp_audio_simple_player）：
-#   解码 → PCM ringbuf → esp_asrc 重采样到 48k/16/2 → 扬声器 / 蓝牙 / 静音
+#   解码 → PCM ringbuf → esp_asrc 重采样到 48k/16/2 → 扬声器 / 蓝牙 / USB 声卡 / 静音
 #
 # 五个实现文件按职责拆分（对外契约只有 include/audio_service.h）：
 #   audio_service.cc  门面（对外 API、会话锁、事件上报）
@@ -24,6 +24,8 @@ idf_component_register(
         media_meta
         bt_service
         play_state
+        # USB 声卡（UAC 1.0）输出：插拔检测 + 推流，拔出时切回板载也在这里
+        usb_audio_service
         # 解码库（根 CMakeLists 里以 EXTRA_COMPONENT_DIRS 注册 libs/espaudiocore）
         espaudiocore
         # 重采样：espaudiocore 不做采样率/声道转换，由输出级补上

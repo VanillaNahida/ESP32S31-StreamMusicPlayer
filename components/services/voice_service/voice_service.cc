@@ -40,11 +40,13 @@
 #include "voice_service.h"
 
 #include <string.h>
+#include <math.h>               /* powf()：软件增益兜底 */
 
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "nvs.h"                /* 麦克风增益存 NVS（voice_cfg/gain_x10） */
 
 #include "esp_crt_bundle.h"     /* wss 的根证书包（不设就会报 No server verification option set）*/
 #include "esp_board_manager.h"
@@ -92,6 +94,31 @@ static int16_t s_mic_raw[VOICE_FRAME_FRAMES * VOICE_DECIM * VOICE_BUS_CHANNELS];
 
 static esp_codec_dev_handle_t      s_mic;
 static bool                        s_mic_open;
+
+/*
+ * ---------------- 麦克风增益（2026-11：用户报"要很大声才识别"） ----------------
+ *
+ * ES8389 的 ADC 侧有一个**模拟 PGA**，档位 0 / 3.5 / 6.5 / 9.5 / 12.5 … 36.5 dB
+ * （`es8389_reg.h` 的 `es8389_mic_gain_t`）。而驱动在 `es8389_open()` 里把它写成
+ *     write_reg(0x72/0x73, (InputSel << 4) + 0)      ← 低 4 bit = 增益 = 0 dB
+ * 于是默认电平极低：真机实测峰值只有 -50…-29 dBFS，正常说话应是 -20…-6 dBFS。
+ * 电平太低时讯飞服务端的 VAD 直接当静音 —— 这就是"识别为空 / 漏字 / 要大喊"。
+ *
+ * 修法：开麦之后用 `esp_codec_dev_set_in_gain()` 抬 PGA（模拟域，不会像软件乘
+ * 数字那样把量化噪声一起放大）。可调，存 NVS，设置页的"麦克风测试"里有 ± 按钮。
+ */
+static const float k_mic_gain_steps[] = {0.0f, 6.5f, 12.5f, 18.5f, 24.5f, 30.5f, 36.5f};
+#define MIC_GAIN_STEP_COUNT  (sizeof(k_mic_gain_steps) / sizeof(k_mic_gain_steps[0]))
+/* 默认 +30.5 dB：实测峰值 -50…-29 dBFS 抬到 -20…+1 dBFS，正好落进识别区间，
+ * 还留 6 dB 余量给"离得远 / 说话轻"的情况（再高就只剩底噪了）。*/
+#define MIC_GAIN_DEFAULT_DB  30.5f
+#define MIC_GAIN_NVS_NS      "voice_cfg"
+#define MIC_GAIN_NVS_KEY     "gain_x10"    /* NVS 没有 float，存 ×10 的整数 */
+
+static float                       s_gain_db = MIC_GAIN_DEFAULT_DB;
+static bool                        s_hw_gain_ok = true;  /* 硬件 PGA 写成功过 */
+static float                       s_sw_mul = 1.0f;      /* 软件增益倍数（仅兜底用） */
+
 static esp_websocket_client_handle_t s_ws;
 static SemaphoreHandle_t           s_ws_connected;
 static lv_pinyin_ime_voice_t      *s_voice;      /* 当前键盘上挂着的会话 */
@@ -105,6 +132,79 @@ static bool s_resume_needed;
 static char s_json[VOICE_WS_BUF];
 
 /* ------------------------------------------------------------------ 麦克风 */
+
+/* 把任意 dB 吸附到最近的硬件档位 —— UI 显示值与驱动实际取到的值必须一致，
+ * 否则会出现"我调到 31 dB 了怎么没反应"（驱动是按档位向下取的）。 */
+static float mic_gain_nearest(float db)
+{
+    int best = 0;
+    float best_d = db - k_mic_gain_steps[0];
+    if (best_d < 0) {
+        best_d = -best_d;
+    }
+    for (int i = 1; i < (int)MIC_GAIN_STEP_COUNT; i++) {
+        float d = db - k_mic_gain_steps[i];
+        if (d < 0) {
+            d = -d;
+        }
+        if (d < best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return k_mic_gain_steps[best];
+}
+
+static void mic_gain_load(void)
+{
+    nvs_handle_t h;
+    int32_t x10 = 0;
+    if (nvs_open(MIC_GAIN_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_i32(h, MIC_GAIN_NVS_KEY, &x10) == ESP_OK && x10 >= 0 && x10 <= 365) {
+            s_gain_db = (float)x10 / 10.0f;
+        }
+        nvs_close(h);
+    }
+    s_gain_db = mic_gain_nearest(s_gain_db);   /* 存的可能是中间值（旧版本），吸附到档位 */
+    ESP_LOGI(TAG, "麦克风增益 %.1f dB（可调范围 0~36.5，设置 → 麦克风测试里调）", s_gain_db);
+}
+
+static void mic_gain_save(float db)
+{
+    nvs_handle_t h;
+    if (nvs_open(MIC_GAIN_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "麦克风增益存 NVS 失败（下次开机回到旧值）");
+        return;
+    }
+    const int32_t x10 = (int32_t)(db * 10.0f + 0.5f);
+    if (nvs_set_i32(h, MIC_GAIN_NVS_KEY, x10) == ESP_OK) {
+        (void)nvs_commit(h);
+    }
+    nvs_close(h);
+}
+
+/*
+ * 把 s_gain_db 写进 codec 的 ADC PGA。
+ *
+ * ⚠ 必须在 `esp_codec_dev_open()` **之后**调：`es8389_open()` 自己会把 0x72/0x73
+ *   刷成 0 dB，先设后开等于白设（驱动还会打 "mic PGA: codec not open"）。
+ * ⚠ 失败不致命：退回 `host_audio_read()` 里的软件增益（音质稍差但能用）。
+ */
+static void mic_gain_apply(void)
+{
+    if (s_mic == NULL || !s_mic_open) {
+        return;
+    }
+    const esp_err_t err = esp_codec_dev_set_in_gain(s_mic, s_gain_db);
+    s_hw_gain_ok = (err == ESP_OK);
+    s_sw_mul = s_hw_gain_ok ? 1.0f : powf(10.0f, s_gain_db / 20.0f);
+    if (s_hw_gain_ok) {
+        ESP_LOGI(TAG, "麦克风 PGA 增益已设为 %.1f dB", s_gain_db);
+    } else {
+        ESP_LOGW(TAG, "设置麦克风 PGA 增益失败（%s）—— 改用软件增益 %.1f dB",
+                 esp_err_to_name(err), s_gain_db);
+    }
+}
 
 static esp_err_t mic_ensure_open(void)
 {
@@ -146,6 +246,7 @@ static esp_err_t mic_ensure_open(void)
         ESP_LOGI(TAG, "麦克风就绪：总线 %u Hz %uch %ubit → 降采样输出 %u Hz 单声道（板载 MIC1/MIC2）",
                  (unsigned)VOICE_BUS_RATE, (unsigned)VOICE_BUS_CHANNELS, (unsigned)VOICE_MIC_BITS,
                  (unsigned)VOICE_MIC_RATE);
+        mic_gain_apply();     /* ★ 必须在 open 之后（open 会把 PGA 刷回 0 dB） */
     }
     return ESP_OK;
 }
@@ -186,13 +287,52 @@ static int host_audio_read(void *user, void *buf, size_t len, uint32_t timeout_m
      *   语音识别对这种质量的输入完全够用（讯飞自己还会做降噪/AGC）。
      */
     int16_t *out = (int16_t *)buf;
+    int32_t peak = 0;
     for (int i = 0; i < VOICE_FRAME_FRAMES; i++) {
         int32_t acc = 0;
         for (int k = 0; k < VOICE_DECIM; k++) {
             const int16_t *f = &s_mic_raw[(i * VOICE_DECIM + k) * VOICE_BUS_CHANNELS];
             acc += f[0] + f[1];
         }
-        out[i] = (int16_t)(acc / (VOICE_DECIM * VOICE_BUS_CHANNELS));
+        int32_t s = acc / (VOICE_DECIM * VOICE_BUS_CHANNELS);
+        /*
+         * 软件增益只在"硬件 PGA 写不进去"时才用（见 mic_gain_apply()）。
+         * 带饱和：麦克风本来就可能已经接近满量程，乘完溢出会变成刺耳的翻转噪声。
+         */
+        if (!s_hw_gain_ok && s_sw_mul > 1.0f) {
+            s = (int32_t)((float)s * s_sw_mul + (s >= 0 ? 0.5f : -0.5f));
+            if (s > 32767) {
+                s = 32767;
+            } else if (s < -32768) {
+                s = -32768;
+            }
+        }
+        out[i] = (int16_t)s;
+
+        const int32_t a = (s < 0) ? -s : s;
+        if (a > peak) {
+            peak = a;
+        }
+    }
+    /*
+     * 电平自诊断（每秒一行，DEBUG 级：`idf.py monitor` 默认 INFO 看不到，排查时
+     * 用 `CONFIG_LOG_MAXIMUM_LEVEL=Debug` 或临时改成 INFO）。
+     * 判据与设置页一致：-20 dBFS 以上算正常，-40 以下基本等于静音。
+     */
+    static int s_level_tick;
+    if (++s_level_tick >= 25) {
+        s_level_tick = 0;
+        int db = -96;
+        if (peak > 0) {
+            /* 20·log10(peak / 32768)，不引 libmath：用整数近似够用了 */
+            db = 0;
+            int32_t v = peak;
+            while (v < 32768 && db > -96) {
+                v <<= 1;
+                db -= 6;
+            }
+        }
+        ESP_LOGD(TAG, "mic level: peak %ld (%d dBFS)", (long)peak, db);
     }
     return VOICE_FRAME_BYTES;
 }
@@ -387,6 +527,7 @@ esp_err_t voice_service_init(void)
         ESP_LOGW(TAG, "组件没开语音（CONFIG_LV_PINYIN_IME_VOICE_ENABLE=n），语音输入不可用");
         return ESP_ERR_NOT_SUPPORTED;
     }
+    mic_gain_load();      /* 把上次调的麦克风增益读出来（开麦时才真正写进 codec） */
     if (s_ws_connected == NULL) {
         s_ws_connected = xSemaphoreCreateBinary();
         if (s_ws_connected == NULL) {
@@ -439,4 +580,33 @@ lv_obj_t *voice_service_ime(void)
 lv_pinyin_ime_voice_t *voice_service_voice(void)
 {
     return s_voice;
+}
+
+/* ------------------------------------------------------------------ 麦克风增益 */
+
+float voice_service_mic_gain_db(void)
+{
+    return s_gain_db;
+}
+
+int voice_service_mic_gain_steps(const float **steps)
+{
+    if (steps != NULL) {
+        *steps = k_mic_gain_steps;
+    }
+    return (int)MIC_GAIN_STEP_COUNT;
+}
+
+esp_err_t voice_service_set_mic_gain_db(float db)
+{
+    s_gain_db = mic_gain_nearest(db);   /* 吸附到硬件档位，UI 才不会"调了没反应" */
+    mic_gain_save(s_gain_db);
+    /*
+     * 没开麦时 mic_gain_apply() 是 no-op —— 增益会留着，下次 mic_ensure_open()
+     * 打开 codec 后立刻写进去（顺序很重要，见 mic_gain_apply 的注释）。
+     */
+    mic_gain_apply();
+    ESP_LOGI(TAG, "麦克风增益 → %.1f dB%s", s_gain_db,
+             s_hw_gain_ok ? "" : "（硬件 PGA 写不进去，改走软件增益）");
+    return ESP_OK;
 }

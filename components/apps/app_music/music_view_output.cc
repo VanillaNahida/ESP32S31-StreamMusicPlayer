@@ -18,6 +18,7 @@
 #include "ui_ba.h"          /* 碧蓝档案风格弹窗工具箱 */
 #include "ui_core.h"
 #include "ui_metrics.h"
+#include "usb_audio_service.h"   /* USB 声卡是否插着（决定这一行要不要出现） */
 
 #include "music_view_internal.h"
 #include "music_view_player.h"   /* music_view_make_round_btn_ex：与其它控制键同一套圆按钮 */
@@ -42,6 +43,7 @@ static const char *out_icon_of(audio_out_t o)
 {
     switch (o) {
     case AUDIO_OUT_BLUETOOTH: return LV_SYMBOL_BLUETOOTH;
+    case AUDIO_OUT_USB:       return LV_SYMBOL_USB;   /* 0xF287，UI 字体里有这个字形 */
     case AUDIO_OUT_NONE:      return LV_SYMBOL_MUTE;
     default:                  return LV_SYMBOL_VOLUME_MAX;
     }
@@ -72,6 +74,17 @@ static const char *out_name_of(audio_out_t o)
         }
         return "蓝牙音频设备";
     }
+    case AUDIO_OUT_USB: {
+        /* 插着就报设备名（UAC 的 iProduct，例如 "USB PnP Audio Device"），
+         * 这样用户能确认切到的是哪台声卡（板子可能会换着插）。 */
+        static char usb_desc[96];
+        const char *nm = usb_audio_device_name();
+        if (nm && nm[0]) {
+            snprintf(usb_desc, sizeof(usb_desc), "USB 声卡 %s", nm);
+            return usb_desc;
+        }
+        return "USB 声卡";
+    }
     case AUDIO_OUT_NONE:      return "静音";
     default:                  return "板载扬声器";
     }
@@ -91,7 +104,15 @@ static void on_out_pick(lv_event_t *e)
     const audio_out_t o = (audio_out_t)(intptr_t)lv_event_get_user_data(e);
     esp_err_t ret = audio_service_set_output(o);
     if (ret == ESP_ERR_INVALID_STATE) {
-        ui_toast("请先在「设置 → 蓝牙」里连接设备", 2000);   /* 弹窗留着，方便连完再来 */
+        /* 弹窗留着，方便连完/插好再来 */
+        if (o == AUDIO_OUT_USB) {
+            ui_toast("USB 声卡不在了（刚被拔出？）", 2000);
+        } else {
+            ui_toast("请先在「设置 → 蓝牙」里连接设备", 2000);
+        }
+        if (o == AUDIO_OUT_USB) {
+            out_picker_close();      /* 这一行已经不该存在了，重开时会重扫 */
+        }
         return;
     }
     if (ret != ESP_OK) {
@@ -154,6 +175,16 @@ static void out_picker_row(lv_obj_t *col, audio_out_t o, const char *sym, uint32
                  : "未连接设备";
     } else if (o == AUDIO_OUT_SPEAKER) {
         st = "ES8389 + NS4150B";
+    } else if (o == AUDIO_OUT_USB) {
+        /* 位深是**自动判断**的（有 24bit alt 就用 24），这里如实显示实际用了多少 */
+        static char usb_st[48];
+        const int bd = usb_audio_bit_depth();
+        if (usb_audio_is_ready() && bd) {
+            snprintf(usb_st, sizeof(usb_st), "已连接 · 48 kHz · %dbit", bd);
+            st = usb_st;
+        } else {
+            st = "已拔出";
+        }
     } else {
         st = "关功放（完全静音）";
     }
@@ -185,6 +216,13 @@ static void on_output_click(lv_event_t *e)
 
     out_picker_row(s_out_dlg.body, AUDIO_OUT_SPEAKER,   LV_SYMBOL_VOLUME_MAX, 0xE8973A);
     out_picker_row(s_out_dlg.body, AUDIO_OUT_BLUETOOTH, LV_SYMBOL_BLUETOOTH,  0x4A6FA5);
+    /*
+     * USB 声卡：**只有插着（且流已起来）才列出这一行**（需求）。
+     * 弹窗是一次性快照（关掉再开才会重扫），所以插上声卡后要重新点开这个按钮。
+     */
+    if (usb_audio_is_ready()) {
+        out_picker_row(s_out_dlg.body, AUDIO_OUT_USB, LV_SYMBOL_USB, 0x2E9E6B);
+    }
     out_picker_row(s_out_dlg.body, AUDIO_OUT_NONE,      LV_SYMBOL_MUTE,       0x6E6E78);
 
     ui_ba_hint(s_out_dlg.body, "长按这个按钮可以直接进「设置 → 蓝牙」");

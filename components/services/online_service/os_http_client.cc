@@ -18,6 +18,10 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include "internal/os_state.h"
 #include "internal/os_util.h"
@@ -166,20 +170,49 @@ void os_http_join_location(const char *cur, const char *loc, char *out, size_t c
     }
 }
 
-esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max_len)
+/*
+ * 哪些失败值得"换一条新连接再发一次"。
+ *
+ * ★ 2026-11 真机（用户报"网易云封面有时出不来"）：HTTPS 偶发在**握手成功后的
+ *   第一次读**就失败，日志是
+ *     I esp-x509-crt-bundle: Certificate validated
+ *     E esp-tls-mbedtls: read error :-0x0087
+ *     E transport_base: esp_tls_conn_read error, errno=I/O error
+ *     E HTTP_CLIENT: Incomlete data received, ret=-135, 0/8967 bytes
+ *   -0x0087 = -135 = PSA_ERROR_INVALID_ARGUMENT，落在 **PSA 的错误空间**里
+ *   （mbedtls 的 SSL 错误码最短也只到 -0x7080，而且 mbedtls_print_error_msg()
+ *   对它打不出任何人类可读的解释 —— 日志里那行是空的正是这个原因）。也就是
+ *   失败点在 mbedtls 解 TLS record → PSA → ESP 硬件 AES/GCM 驱动那段预编译库，
+ *   **不是**网络不通、URL 不对、请求头缺失：同一时刻别的 HTTPS 请求能成，
+ *   服务器侧（主机 curl / node）取同一个地址是 200 + 43 KB 正常图片。
+ *
+ *   所以这里的判据只有两类：①"连接/读写"层面的瞬时失败；② 我们自己的笼统失败。
+ *   服务器**明确表态**的失败（非 200、重定向缺 Location、超上限、没内存）不重试 ——
+ *   那些重试也只是白白多打三次请求，把失败延迟拖长三倍。
+ */
+static bool get_err_retryable(esp_err_t e)
 {
-    if (!url || !out || max_len == 0) {
-        return ESP_ERR_INVALID_ARG;
+    switch (e) {
+    case ESP_ERR_HTTP_CONNECT:            /* TCP/TLS 建链失败 */
+    case ESP_ERR_HTTP_FETCH_HEADER:       /* ← 上面那条 -0x0087 走的就是它 */
+    case ESP_ERR_HTTP_INCOMPLETE_DATA:    /* 读到一半断流 / ret=-135 */
+    case ESP_ERR_HTTP_EAGAIN:             /* 读数据超时（见 HTTP_TIMEOUT_MS 的注释） */
+    case ESP_ERR_TIMEOUT:
+    case ESP_FAIL:                        /* esp_http_client_init/perfom 的笼统失败 */
+        return true;
+    default:
+        return false;
     }
-    *out = NULL;
-    if (out_len) {
-        *out_len = 0;
-    }
+}
 
-    char cur[1024];
-    snprintf(cur, sizeof(cur), "%s", url);
-    os_state_set_last_error("");
-
+/*
+ * 一次 GET = 最多四跳（自管 302，见文件头）。
+ * `cur` 是**输入输出**：重试时可以从已经解析出来的最终地址继续，
+ * 不必每次都从 http 重新跳一次 https（meting 就是这么 302 的）。
+ */
+static esp_err_t http_get_hops(char *cur, size_t cur_cap, char **out, size_t *out_len,
+                               size_t max_len)
+{
     for (int hop = 0; hop < 4; hop++) {
         http_sink_t sink = {};
         sink.limit = max_len;          /* 上限只当门限：缓冲按需增长（见 sink_reserve） */
@@ -241,7 +274,7 @@ esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max
                 os_state_set_last_error("重定向缺少 Location");
                 return ESP_ERR_INVALID_RESPONSE;
             }
-            os_http_join_location(cur, loc, cur, sizeof(cur));
+            os_http_join_location(cur, loc, cur, cur_cap);
             ESP_LOGI(TAG, "redirect -> %s", cur);
             continue;
         }
@@ -285,6 +318,64 @@ esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max
     }
     os_state_set_last_error("重定向次数过多");
     return ESP_ERR_INVALID_RESPONSE;
+}
+
+/*
+ * GET 的重试外壳（判据与根因见上面 get_err_retryable 的注释）。
+ *
+ * 三条纪律：
+ *   1) **只重试瞬时失败**，服务器明确表态的（非 200 / 缺 Location / 超上限 / 没内存）
+ *      立刻返回，别把失败延迟拖三倍；
+ *   2) **保留已经解析出来的 URL**：meting 的 http 会 302 到 https，每次重新从 http
+ *      起跳等于多打一个请求（首跳虽然是明文、很快，但也是一次完整建链）；
+ *   3) **慢失败不再重试**：`timeout_ms` 是"两次读之间"的上限，一次读超时就是 30 s，
+ *      叠三次等于 90 s —— 而起播任务 / 歌单刷新都在这条线程上等着。
+ */
+esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t max_len,
+                           int attempts)
+{
+    if (!url || !out || max_len == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *out = NULL;
+    if (out_len) {
+        *out_len = 0;
+    }
+    if (attempts < 1) {
+        attempts = 1;
+    }
+
+    char cur[1024];
+    snprintf(cur, sizeof(cur), "%s", url);
+    os_state_set_last_error("");
+
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0) {
+            const unsigned wait_ms = (unsigned)(HTTP_GET_RETRY_BACKOFF_MS * attempt);
+            /* ⚠ url_for_log()：查询串里可能有登录 cookie，不能原样打（见它的注释） */
+            ESP_LOGW(TAG, "GET retry %d/%d (%s, wait %u ms): %s", attempt, attempts - 1,
+                     esp_err_to_name(ret), wait_ms, url_for_log(cur));
+            vTaskDelay(pdMS_TO_TICKS(wait_ms));
+        }
+        const int64_t t0 = esp_timer_get_time();
+        ret = http_get_hops(cur, sizeof(cur), out, out_len, max_len);
+        if (ret == ESP_OK) {
+            return ESP_OK;
+        }
+        if (!get_err_retryable(ret)) {
+            return ret;
+        }
+        if ((esp_timer_get_time() - t0) / 1000 > HTTP_GET_RETRY_FAST_MS) {
+            return ret;
+        }
+    }
+    return ret;
+}
+
+esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max_len)
+{
+    return http_get_text_ex(url, out, out_len, max_len, HTTP_GET_ATTEMPTS);
 }
 
 esp_err_t http_download(const char *url, const char *dest, size_t min_size,

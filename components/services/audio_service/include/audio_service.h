@@ -90,18 +90,31 @@ bool audio_service_seek_landing_ms(uint32_t *out_ms);
 
 typedef enum {
     AUDIO_OUT_SPEAKER = 0,   /* ES8389 → NS4150B ×2 → 左右扬声器 */
-    AUDIO_OUT_BLUETOOTH,     /* 经典蓝牙 A2DP（需要 GMF bt_audio，当前未接入） */
+    AUDIO_OUT_BLUETOOTH,     /* 经 esp_bt_audio 推 PCM，由耳机自己解码 */
+    AUDIO_OUT_USB,           /* USB 声卡（UAC 1.0）：**只有插着时**才允许切 */
     AUDIO_OUT_NONE,          /* 静音：静音 + 关功放 */
 } audio_out_t;
 
 /*
- * 切换输出通道（开发指南 5.12 的防爆音时序在切换管线时才有意义；
- * 这里目前只有"扬声器 / 静音"两条真实通路）。
- * AUDIO_OUT_BLUETOOTH 会返回 ESP_ERR_NOT_SUPPORTED —— A2DP 还没接，
- * 不假装成功，也不把声音偷偷留在扬声器上。
+ * 切换输出通道。两条通道有前置条件，**不满足就返回 ESP_ERR_INVALID_STATE**
+ * （不假装成功，也不把声音偷偷留在原通道上）：
+ *   AUDIO_OUT_BLUETOOTH —— 必须 A2DP 已连接；
+ *   AUDIO_OUT_USB       —— 必须插着 USB 声卡（`usb_audio_is_ready()`）。
  */
 esp_err_t   audio_service_set_output(audio_out_t out);
 audio_out_t audio_service_get_output(void);
+
+/*
+ * USB 声卡**插入 / 拔出**的 UI 提示（取走即清）。
+ *
+ * 拔出时的切换是**在 USB 驱动任务里立即完成**的（需求：必须立刻切回内置输出），
+ * 这条消息只负责让 UI 补一句话，**不参与**切换本身，所以没 UI 也不影响音频。
+ * 消息形如：
+ *   "USB 声卡已连接：MCHOSE V9 PRO（24bit）" / "USB 声卡已拔出" /
+ *   "USB 声卡已断开，已切回扬声器"。
+ * UI 侧由状态栏的定时器消费（见 ui_status_bar.cc 的 poll_usb_audio）。
+ */
+bool audio_service_take_usb_msg(char *buf, size_t size);
 
 /* 主音量 0~100（走 ES8389 数字音量寄存器） */
 esp_err_t audio_service_set_volume(int percent);

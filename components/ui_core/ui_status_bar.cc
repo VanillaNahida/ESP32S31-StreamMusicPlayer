@@ -43,6 +43,7 @@
 #include "bsp.h"               /* bsp_sdcard_capacity_kb（插入时报个容量） */
 #include "wifi_service.h"      /* Wi-Fi 开关 / 连接状态 / RSSI */
 #include "bt_service.h"        /* 蓝牙开关 / 连接 / 搜索状态 */
+#include "audio_service.h"     /* USB 声卡被拔出：切换已在服务里做完，这里只提示 */
 
 static const char *TAG = "ui_status";
 
@@ -307,6 +308,21 @@ static void poll_sd(void)
     }
 }
 
+/*
+ * USB 声卡**插入 / 拔出**的提示。
+ *
+ * **路由切换本身**已经在 audio_service 的 USB 状态回调里瞬间做完了（需求：必须立刻
+ * 切回内置输出）—— 这里只把那条人话弹出来。放状态栏这个全局定时器里，是因为
+ * "正在听歌"时用户完全可能不在播放器页。
+ */
+static void poll_usb_audio(void)
+{
+    char msg[96];
+    if (audio_service_take_usb_msg(msg, sizeof(msg))) {
+        ui_toast(msg, 2200);
+    }
+}
+
 /* ---------------------------------------------------------------- 轮询 */
 
 static void poll_cb(lv_timer_t *t)
@@ -330,6 +346,7 @@ static void poll_cb(lv_timer_t *t)
     }
 
     poll_sd();
+    poll_usb_audio();
 }
 
 /*

@@ -44,6 +44,17 @@ $env:HTTPS_PROXY = "http://127.0.0.1:7890"
 # 未安装 esp-bmgr-assist 时，让 idf.py 找到 board manager 扩展
 $env:IDF_EXTRA_ACTIONS_PATH = (Resolve-Path "$PSScriptRoot\..\managed_components\espressif__esp_board_manager").Path
 
+# ⚠⚠ 必须清掉 MSYSTEM（2026-11 踩）：从 git-bash 里起的 PowerShell 会继承 MSYSTEM=UCRT64，
+#   而 idf.py 一看到它就判定"运行在 MSys/Mingw 下"，只打一行
+#     MSys/Mingw is no longer supported. ... continue at your own risk.
+#   然后**直接 exit 0、什么都不做** —— 表现就是 `idf.ps1 build` / `idf.ps1 flash`
+#   只打印环境横幅、既没编译也没烧写（极易误判成"已经成功"）。
+#
+# ⚠ 只删 `Env:` 驱动项**不够**（实测删完 `$env:MSYSTEM` 还是 UCRT64），必须走
+#   [Environment]::SetEnvironmentVariable(..., 'Process') 才真的清掉。
+Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue
+[Environment]::SetEnvironmentVariable('MSYSTEM', $null, 'Process')
+
 if ($IdfArgs.Count -gt 0 -and $IdfArgs[0] -eq 'cmakebuild') {
     $rest = @()
     if ($IdfArgs.Count -gt 1) { $rest = $IdfArgs[1..($IdfArgs.Count - 1)] }

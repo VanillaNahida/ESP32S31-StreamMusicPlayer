@@ -29,8 +29,7 @@ static const char *TAG = "ui_home";
 static lv_obj_t *placeholder_page(const app_desc_t *app)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
+    ui_screen_apply_default_bg(scr);   /* 壁纸由 ui_home_bg 再叠上来 */
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(scr);
@@ -160,8 +159,7 @@ lv_obj_t *ui_home_create(void)
     }
 
     lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
+    ui_screen_apply_default_bg(scr);   /* 壁纸由 ui_home_bg 再叠上来 */
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
     /* 状态栏预留上边距 */

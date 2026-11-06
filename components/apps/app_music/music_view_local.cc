@@ -392,8 +392,7 @@ static void local_sd_tick(lv_timer_t *t)
 lv_obj_t *music_view_local_build(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
+    ui_screen_apply_default_bg(scr);   /* 深色不透明底（见 ui_core.h 的说明） */
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     /* pad_all 必须在 pad_top 之前（否则标题被状态栏压住） */
     lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);

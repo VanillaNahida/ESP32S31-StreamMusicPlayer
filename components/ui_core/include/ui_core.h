@@ -122,6 +122,18 @@ void ui_back_button_place(lv_obj_t *btn);
  */
 void ui_back_button_suppress(bool suppress);
 
+/* ------------------------------------------------------------------ 页面底色 */
+
+/*
+ * 页面 screen 的**默认深色底**（`UI_COLOR_BG`，不透明）。
+ *
+ * 每个页面建完 screen 就调它，**不要**自己写 `remove_style_all + bg_color` ——
+ * `lv_obj_remove_style_all()` 之后 `bg_opa` 是 **0（透明）**，只设颜色等于一个像素
+ * 都不画，栅格里留着**上一屏的画面**：从首页进设置看到首页壁纸、从播放器进设置
+ * 看到播放器那张背景图（2026-10-21 真机就这么"串"过一次）。
+ */
+void ui_screen_apply_default_bg(lv_obj_t *scr);
+
 /* ------------------------------------------------------------------ 状态栏
  *
  * 状态栏右半边那四个图标（Wi-Fi / 蓝牙 / 输出通道 / microSD）**由状态栏自己的

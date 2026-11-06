@@ -195,10 +195,16 @@ static void online_prepare_task(void *arg)
         ESP_LOGW(TAG, "stream url failed (%s), fallback to download", esp_err_to_name(ret));
         ret = online_song_prepare(&req->song, path, sizeof(path));
         local_only = 1;
-    } else {
-        /* 只有封面与歌词要提前抓好（进 PSRAM 缓存，不落 SD） */
-        online_song_prepare_stream(&req->song);
     }
+    /*
+     * ⚠ 原来这里还有一个 "流式地址拿得到" 的 else 分支，只调一句
+     *   online_song_prepare_stream(&req->song);
+     * 那是**纯冗余**：紧跟着的 207/208 行已经在取封面 + 歌词了，而
+     * online_song_prepare_stream() 干的就是"取封面、取歌词、再各 free 掉"。
+     * 缓存命中时它不花钱，但**失败时会真的再下一次** —— 真机上就表现为
+     * 同一张封面 5 秒内下两遍、两遍都失败（`read error :-0x0087`），
+     * 白白多占十几秒 Wi-Fi。删掉，让封面只有"取一份给播放器"这一条路。
+     */
     /* 封面/歌词各取一份拷贝（PSRAM），起播时直接给解码/解析用 */
     uint8_t *jpg = NULL;
     size_t   jpg_len = 0;

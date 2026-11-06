@@ -20,6 +20,7 @@
 #include "audio_service.h"   /* 建页时读一次"是不是在播"用于按钮图标（纯取数） */
 #include "online_service.h"  /* 建页时从在线队列取标题/歌手 */
 #include "storage_service.h" /* 建页时从曲目表取标题/歌手 */
+#include "ui_core.h"        /* ui_screen_apply_default_bg（页面底色：连 opa 一起设） */
 #include "ui_metrics.h"
 
 #include "music_cover.h"
@@ -143,8 +144,8 @@ lv_obj_t *music_view_player_build(void)
     const music_state_t *st = music_state();
 
     lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
+    /* 底色不透明（启动图/背景图还没贴好时也不能露出上一屏），背景图随后贴上来 */
+    ui_screen_apply_default_bg(scr);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     /*
      * 顺序要紧：lv_obj_set_style_pad_all() 展开成上下左右四个 pad，

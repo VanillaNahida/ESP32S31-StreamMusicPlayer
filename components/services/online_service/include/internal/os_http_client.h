@@ -94,11 +94,43 @@ const char *url_for_log(const char *url);
 /* ---------------------------------------------------------------- 发送原语 */
 
 /*
+ * 一次 GET 最多发几次（首次 + 重试）。
+ *
+ * ★ 为什么要有重试（2026-11 真机，用户报"在线歌封面有时出不来"）：HTTPS 请求会
+ *   **偶发地在握手成功后的第一次读**就失败，日志是
+ *     I esp-x509-crt-bundle: Certificate validated
+ *     E esp-tls-mbedtls: read error :-0x0087
+ *     E transport_base: esp_tls_conn_read error, errno=I/O error
+ *     E HTTP_CLIENT: Incomlete data received, ret=-135, 0/8967 bytes
+ *   `-0x0087` = -135 = **PSA_ERROR_INVALID_ARGUMENT**（mbedtls 的 SSL 错误码最短
+ *   也只到 -0x7080，而且 mbedtls_print_error_msg() 对它打不出任何解释 —— 日志里
+ *   紧跟的那行人类可读文案是空的正是因为这个）。也就是失败点在
+ *   mbedtls 解 TLS record → PSA → ESP 硬件 AES/GCM 驱动这一段，不在网络、
+ *   不在 URL、也不在请求头（同一时刻别的 HTTPS 请求能成，服务器侧也验过是 200）。
+ *   那一层是预编译库，改不了；能做的只有"重开一条连接再要一次"。
+ */
+#define HTTP_GET_ATTEMPTS        3
+/* 重试退避：线性 250 ms、500 ms（连接刚被掐掉时立刻重连往往再被掐） */
+#define HTTP_GET_RETRY_BACKOFF_MS 250
+/* 单次已经耗掉这么多毫秒就不再重试 —— 典型是 30 s 读超时，别再叠一个 30 s */
+#define HTTP_GET_RETRY_FAST_MS   6000
+
+/*
  * GET 一段数据（JSON / LRC / 封面字节都走这里）。成功时 *out 为 malloc 的缓冲
  * （对文本是 NUL 结尾的字符串；对二进制则按 out_len 给长度，不保证 NUL 语义）。
  * max_len 是这一跳的单次响应上限（防止坏响应吃光内存）。
+ *
+ * 内部已按 HTTP_GET_ATTEMPTS 自动重试可恢复的失败（见 .cc 的 get_err_retryable）。
  */
 esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max_len);
+
+/*
+ * 同 http_get_text，但显式指定**最多发几次**（attempts >= 1）。
+ * 封面那种"两种协议方案各试一次"的调用点用它把总请求数压住
+ * （默认 3 次 × 2 种方案 = 6 次，会把起播拖慢好几秒）。
+ */
+esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t max_len,
+                           int attempts);
 
 /*
  * 下载二进制到文件。自动跟随 302；成功条件是 HTTP 200 且落盘字节数 >= min_size。

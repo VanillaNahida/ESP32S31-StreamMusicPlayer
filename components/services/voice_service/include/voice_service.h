@@ -63,6 +63,40 @@ lv_obj_t *voice_service_ime(void);
  */
 lv_pinyin_ime_voice_t *voice_service_voice(void);
 
+/*
+ * ---------------------------------------------------------------- 麦克风增益
+ *
+ * 用户原话（2026-11）："每次都得靠麦克风很大声才能识别到，能不能帮我调下增益"。
+ *
+ * 根因是 **ES8389 开麦时驱动把 ADC 侧的模拟 PGA 写成 0 dB**（`es8389_open()` 里
+ * `write_reg(0x72/0x73, (InputSel << 4) + 0)`，低 4 bit 就是增益 = 0 dB）。
+ * 真机实测峰值只有 **-50…-29 dBFS**，而正常说话应该是 -20…-6 dBFS ——
+ * 电平低到服务端 VAD 直接把一整段当静音，表现为"要大喊才偶尔有字 / 识别为空"。
+ *
+ * 解决办法是把这个 PGA 抬起来（模拟域，比软件乘数字干净：不会连量化噪声一起放大）。
+ * 档位是硬件固定的 0 / 6.5 / 12.5 / 18.5 / 24.5 / 30.5 / 36.5 dB（`es8389_mic_gain_t`）。
+ * 设置存 NVS（`voice_cfg/gain_x10`），下次开麦沿用。
+ *
+ * 调法：设置 → 麦克风测试，看电平条到 **-20 dBFS 以上"正常"** 即可；
+ * 再高就只剩底噪了（PGA 也会放大麦克风自噪）。
+ */
+
+/** 当前麦克风增益（dB）。没设过就是默认值（30.5 dB）。 */
+float voice_service_mic_gain_db(void);
+
+/**
+ * 设置麦克风增益（dB）：会**吸附到最近的硬件档位**，立即写进已打开的 ADC，并存 NVS。
+ * 传 0 表示关掉增益。返回 ESP_OK 表示"已按档位设置"；写 NVS 失败也返回 ESP_OK
+ * （只是下次开机会回到旧值），硬件写失败会打 WARN 并退化到软件增益。
+ */
+esp_err_t voice_service_set_mic_gain_db(float db);
+
+/**
+ * 取可选的硬件档位表（升序）。返回档位个数，`*steps` 指向静态数组（别 free）。
+ * UI 用它做 ± 步进，这样显示值和驱动实际取到的值永远一致。
+ */
+int voice_service_mic_gain_steps(const float **steps);
+
 #ifdef __cplusplus
 }
 #endif

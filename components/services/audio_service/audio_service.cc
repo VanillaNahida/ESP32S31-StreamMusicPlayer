@@ -9,7 +9,7 @@
  *
  * 实现分散在：
  *   audio_engine.cc   espaudiocore 会话与事件
- *   audio_output.cc   输出级（重采样 + 三路输出 + 时间轴）
+ *   audio_output.cc   输出级（重采样 + 四路输出：扬声器/蓝牙/USB 声卡/静音 + 时间轴）
  *   audio_http.cc     在线 HTTP 传输
  *   audio_seek.cc     拖动定位
  * 契约见 audio_internal.h（**三条线程纪律写在那里，改代码前先读**）。
@@ -33,6 +33,7 @@
 #include "bsp.h"
 #include "bt_service.h"
 #include "play_state.h"
+#include "usb_audio_service.h"   /* USB 声卡插拔：拔出要立刻切回板载 */
 
 static const char *TAG = "audio_svc";
 
@@ -94,6 +95,65 @@ static void on_bt_volume_from_peer(int percent, void *user)
  * 初始化
  * =========================================================================*/
 
+/*
+ * USB 声卡插拔的 UI 提示（**单生产者/单消费者**：写的是 USB 驱动任务，读的是状态栏）。
+ * 只存一句人话 + 一个"有新消息"标志；字符串先写、标志后置，读到 true 时内容一定完整。
+ */
+static char           s_usb_msg[96];
+static volatile bool  s_usb_msg_pending;
+
+bool audio_service_take_usb_msg(char *buf, size_t size)
+{
+    if (!s_usb_msg_pending) {
+        return false;
+    }
+    s_usb_msg_pending = false;
+    if (buf && size) {
+        snprintf(buf, size, "%s", s_usb_msg);
+    }
+    return true;
+}
+
+/*
+ * USB 声卡插拔（**在 USB/UAC 驱动任务里调用**：不碰 LVGL、不做重活）。
+ *
+ * 插入：只提示（`USB 声卡已连接：<产品名>（24bit）`）—— 需求是"连着的时候才出现
+ *       可切换项"，切不切由用户决定；
+ * 拔出：**立即**把路由切回板载扬声器（硬需求），并提示是"已断开"还是"已拔出"。
+ *       三条保险里的第二条：
+ *   ① USB 设备回调已经先把 s_ready 清了；
+ *   ② 这里把 audio_output 的路由切回去（纯标志 + 功放/静音时序，不阻塞）；
+ *   ③ write_out() 万一还拿到旧路由，写失败时也会就地回落。
+ */
+static void on_usb_audio_state(bool ready, void *user)
+{
+    (void)user;
+    if (ready) {
+        ESP_LOGI(TAG, "USB audio device ready (%s, %d bit)",
+                 usb_audio_device_name(), usb_audio_bit_depth());
+        return;                      /* 提示文案由 notice 回调给（带设备名/位深） */
+    }
+    if (audio_output_route() == AUDIO_OUT_USB) {
+        ESP_LOGW(TAG, "USB audio gone -> switch back to speaker immediately");
+        audio_output_set_route(AUDIO_OUT_SPEAKER);
+        /* 覆盖 notice 刚写好那句，让用户知道声音去哪了 */
+        snprintf(s_usb_msg, sizeof(s_usb_msg), "USB 声卡已断开，已切回扬声器");
+        s_usb_msg_pending = true;
+    }
+}
+
+/* USB 驱动任务给的"一句话"（插入 / 拔出 / 用不了）：抄下来给状态栏弹 Toast */
+static void on_usb_audio_notice(const char *msg, void *user)
+{
+    (void)user;
+    if (!msg || !msg[0]) {
+        return;
+    }
+    ESP_LOGI(TAG, "USB notice: %s", msg);
+    snprintf(s_usb_msg, sizeof(s_usb_msg), "%s", msg);
+    s_usb_msg_pending = true;
+}
+
 esp_err_t audio_service_init(void)
 {
     if (s_inited) {
@@ -131,6 +191,10 @@ esp_err_t audio_service_init(void)
     /* 蓝牙 AVRCP 绝对音量：对端改了音量要回到这里（蓝牙可能还没 init，
      * 这只是把回调记下来，bt_service 初始化时会用）。 */
     bt_service_set_volume_cb(on_bt_volume_from_peer, NULL);
+
+    /* USB 声卡插拔回调：只登记，USB 主机由 main 在首帧之后 usb_audio_init() 起来 */
+    usb_audio_set_state_cb(on_usb_audio_state, NULL);
+    usb_audio_set_notice_cb(on_usb_audio_notice, NULL);
 
     s_inited = true;
     ESP_LOGI(TAG, "ready: espaudiocore decode -> asrc -> %d Hz/%dch/%dbit, volume %d",
@@ -339,6 +403,9 @@ esp_err_t audio_service_set_output(audio_out_t out)
     if (out == AUDIO_OUT_BLUETOOTH && !bt_service_is_connected()) {
         return ESP_ERR_INVALID_STATE;   /* 没连上就别假装切过去了 */
     }
+    if (out == AUDIO_OUT_USB && !usb_audio_is_ready()) {
+        return ESP_ERR_INVALID_STATE;   /* 没插声卡（或还没起流）同理 */
+    }
     audio_output_set_route(out);
     return ESP_OK;
 }
@@ -374,5 +441,9 @@ int audio_service_get_volume(void)
 
 esp_err_t audio_service_set_mute(bool mute)
 {
+    /* USB 声卡没有"codec 静音寄存器"可写，走 UAC 的 volume（0 = 静音） */
+    if (audio_output_route() == AUDIO_OUT_USB) {
+        usb_audio_set_volume(mute ? 0 : s_volume);
+    }
     return bsp_audio_set_mute(mute);
 }

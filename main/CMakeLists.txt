@@ -11,6 +11,7 @@ idf_component_register(
         ui_core
         media_meta
         audio_service
+        usb_audio_service   # 首帧之后起 USB 声卡检测（UAC 1.0）
         voice_service
         app_music
         app_settings

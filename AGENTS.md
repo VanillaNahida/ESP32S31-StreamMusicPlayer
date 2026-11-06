@@ -178,6 +178,15 @@ AMOLED、ES8311。
 
 - **任何 UI 代码都不准出现 800 / 480 字面量**，一律用 `ui_metrics.h` 的 `UI_W` / `UI_H` 与百分比
 - 布局用 flex + 百分比，不用绝对坐标
+- ⚠⚠ **页面 screen 的底色必须用 `ui_screen_apply_default_bg(scr)`**（2026-10-21 加）。
+  它做三件事：`remove_style_all` + `bg_color = UI_COLOR_BG` + **`bg_opa = COVER`**。
+  自己写 `remove_style_all + bg_color` 会漏掉 opa：`remove_style_all()` 之后 `bg_opa` 是 **0**，
+  screen 一个像素都不画，栅格里留着**上一屏的内容** —— 真机症状是"从播放器进设置，
+  设置页显示的是播放器那张 `player_background.jpg`"（`num_fbs=1` 时必现）。
+  现有 8 处建 screen 的地方（`as_make_screen` / 首页两处 / 在线 / 图库 / 播放器 /
+  文件管理 / momotalk）都遵守；momotalk 用自己的深色，但同样设了 `bg_opa`。
+  **自定义背景图只允许出现在播放器页**（`music_player_bg`）和首页壁纸
+  （`ui_home_bg`，素材 `assets/background.jpg`）—— 其它页面一律纯 `UI_COLOR_BG`。
 - 播放器页是**横屏左右分栏**（左封面 / 右歌词与信息）
 - 图标用矢量/位图，**不用 emoji**
 - 800×480 下中文最小 14 px
@@ -429,6 +438,68 @@ meting 退居**辅助**：歌词 / 封面 / 歌单列表；并且在"没登录 /
   历史遗留的 `/sdcard/online/cover/`、`/sdcard/online/lrc/` 目录与 `audio/*.lrc`
   文件在 `online_service_init()` 时清掉；`online_cache_clear()` 连 PSRAM 缓存一起清。
 - 歌单 ID 存 NVS `online`（`n` + `id0..id7`，最多 8 个）
+
+#### 11.4.1 ⚠ 封面"有时候直接不显示"= HTTPS **读**失败，不是 URL / 服务器的事（2026-11 修）
+
+真机日志（用户报："在线播放的歌封面有时出不来"）：
+
+```
+I (367562) esp-x509-crt-bundle: Certificate validated
+E (369541) esp-tls-mbedtls: read error :-0x0087
+E (369542) transport_base: esp_tls_conn_read error, errno=I/O error
+E (369543) HTTP_CLIENT: Incomlete data received, ret=-135, 0/8967 bytes
+W (369544) online: GET failed (ESP_ERR_HTTP_FETCH_HEADER): https://p3.music.126.net/...jpg
+W (369553) online: cover 2755332551 download failed (ESP_ERR_HTTP_FETCH_HEADER, 0 bytes): ...
+```
+
+判读：`-0x0087` = **-135 = `PSA_ERROR_INVALID_ARGUMENT`**（PSA 错误空间，不是 mbedtls 的
+SSL 码 —— 所以 `mbedtls_print_error_msg()` 那行人类可读的解释是**空的**）。握手明明
+成功了（`Certificate validated` 就在前面一行），死在**解 TLS record** 那一段：
+mbedtls → PSA → ESP 硬件 AES/GCM 驱动。**不是**网络、**不是** URL、**不是**缺请求头 ——
+同一时刻别的 HTTPS 请求能成，主机侧取同一个地址是 `200 image/jpg 43001`。
+`meting.xcnahida.cn` 的接口也会撞上（`ESP_ERR_HTTP_INCOMPLETE_DATA`, `0/8967 bytes`），
+所以**这是通用故障，不是封面专属** ⇒ 重试必须加在 `http_get_text()` 这一层。
+
+修法（三层，都在 `components/services/online_service/`）：
+
+| 层 | 做法 |
+| --- | --- |
+| `os_http_client.cc` | `http_get_text()` 拆成 `http_get_hops()`（一跳，实现未动）+ `http_get_text_ex()`（重试外壳）。默认 `HTTP_GET_ATTEMPTS`=3 次；只对**瞬时**失败重试（`ESP_ERR_HTTP_CONNECT/FETCH_HEADER/INCOMPLETE_DATA/EAGAIN`、`ESP_ERR_TIMEOUT`、`ESP_FAIL`），服务器明确表态的（非 200 / 缺 Location / 超上限 / 没内存）立刻返回。退避 `HTTP_GET_RETRY_BACKOFF_MS`(250 ms) × 第几次；单次已耗掉 `HTTP_GET_RETRY_FAST_MS`(6 s) 就不再叠（`timeout_ms` 是"两次读之间"的上限，一次读超时就是 30 s，叠三下等于 90 s，而起播任务 / 歌单刷新都在这条线程上等）。**`cur` 放在循环外**：meting 的 http 会 302 到 https，重试直接从已解析的地址继续，不重跳 |
+| `os_media_cache.cc` | `cover_download()`：https 失败后**换同一路径的明文 http 再试**（`p*.music.126.net` 同时服务明文，实测 200 + 同一张图），把 TLS 解密那段整个绕开；`static bool s_cover_plain_ok` 记住上次成功的协议，`COVER_GET_ATTEMPTS`=2（别让 3×2=6 个请求拖慢起播）。封面是缩略图、无隐私，这个降级划算 |
+| `music_online.cc` | 删掉"流式地址拿得到"分支里多余的 `online_song_prepare_stream(&req->song);` —— 紧跟着的两行已经在取封面+歌词，而它干的就是"取封面、取歌词、再各 free" ⇒ 缓存命中时白跑，**失败时真的再下一次**（真机就是"同一张封面 5 秒内下两遍、两遍都失败"） |
+
+日志判读（新）：`online: GET retry 1/2 (ESP_ERR_HTTP_INCOMPLETE_DATA, wait 250 ms): <url>`
+是重试；`cover N: https 失败(...)，改用 http 再试一次` 是换协议；
+`cover N: 走明文 http 成功，本次开机后面都优先明文` 之后封面都走明文（重启归零）。
+
+⚠ **同一个坑把"歌曲搜索"整块打死了**（2026-11 修）。`meting` 的 `type=search` 响应是
+**每次都读不出来**的（真机稳定 3/3 次 `Incomlete data received, ret=-135, 0/8967 bytes`），
+而搜索**没有明文退路**（`http://meting…/meting/api` 会 301 到 https）⇒ 服务端搜索 100%
+失败，只剩"扫本地已保存歌单"这个兜底（没存过歌单时就是"搜什么都没结果"）。
+`online_search()` 现在改三级：
+① **自建中间件 `GET /search?keywords=<enc>&type=1&limit=<≤50>`**（2026-11 用户指定，
+就是 `https://ncmapi.ysnb.com.cn/search?keywords=xxx`；走 `os_net_api_get_ex()`，与取播放直链
+**同一条实测可用**的通道）。**鉴权是中间件自己的 `Authorization: Bearer <token>`
+（`CONFIG_ONLINE_NETEASE_API_TOKEN`，见 `net_auth_hdr()`），与网易云 CK 无关，
+所以**不再判断"是否登录"**（以前那道 `online_netease_logged_in()` 门槛会让未登录用户
+必然掉回 meting = 搜索整块不可用）。返回的是**老版 /search 格式**
+`{"result":{"songs":[{"id","name","duration","artists":[…],"album":{"id","picId",…}}]}}`：
+`os_song_from_json()` 的 `artists[]` 分支能吃，`os_fill_songs()` 照旧，还会顺手补上
+meting 的 `type=lrc` 地址；但 **`album` 里没有 `picUrl`（只有 picId，拼不出封面地址）**
+⇒ 搜出来的歌 `cover_url` 为空。搜索结果列表本身不显示封面（无影响），
+**想连播放页封面也带上就改用 `/cloudsearch`**（返回新格式 `al.picUrl`/`ar[]`，
+同样一条通道、同样免登录，只是形状不同）；
+② meting 的 `type=search` 兜底（中间件不可达时）；
+③ `os_search_local()` 扫已存歌单。
+日志：`search 'X': N hit(s) from netease api` / `… from meting` /
+`meting search failed, fallback to local`。
+
+**还没做的（要真机验证才敢上）**：底层那个 PSA 报错本身没修（在预编译库里）。两个
+`sdkconfig` 候选缓解，都影响**整条 TLS**、要重新烧机验证，没动：
+`CONFIG_MBEDTLS_HARDWARE_GCM=n`（"partially hardware accelerated GCM…GHASH 仍走软件"）、
+`CONFIG_MBEDTLS_AES_HW_SMALL_DATA_LEN_OPTIM=n`（按长度在硬件 block/DMA 模式间切换那段）。
+另外 `CONFIG_MBEDTLS_AES_SOFT_FALLBACK`（默认 n）的语义是"硬件不支持时回落到软件 AES"，
+值得试但会让每个 record 多一次判断。
 
 **设计选择：默认流式播放**（`online_song_stream_info` 解析 302 拿到 https 音频地址，
 `audio_service_play_uri()` 边下边播；流地址拿不到才回退"先下载到 SD 再当本地文件播"）。
@@ -1367,6 +1438,140 @@ static esp_audio_err_t aud_dec_open_patched(esp_audio_simple_dec_cfg_t *cfg, voi
   它多读一段元数据；普通文件首帧就在开头，零影响。
 - 升级 `esp_audio_codec` 后如果这个符号没了，**链接会失败**（正好能发现），
   那时去看新版本有没有公开的配置入口。
+
+### 11.8 USB 声卡输出（UAC 1.0，2026-10）
+
+需求原文："添加输出音频到 USB 声卡的功能，该选项在连接到了声卡的时候才会显示且可切换；
+**如果遇到设备在播放的时候意外拔出，必须立即切换到默认的内置音频输出**。"
+
+实测过的两台设备：
+
+| 设备 | 播放 alt | 说明 |
+| --- | --- | --- |
+| 0C76:1710「USB PnP Audio Device」 | 16 bit(192 B/ms) 与 24 bit(288 B/ms) 各一档 | `docs/uac-audio.md` 里的目标设备 |
+| 291D:385D「MCHOSE V9 PRO」无线接收器 | **只有 24 bit 一档** | 早期版本硬性要求 16bit → 直接判"不可用"，已适配 |
+
+两台都是 **48 kHz 单一声率**、UAC 1.0、同步等时端点、无反馈端点。
+
+| 项 | 落点 |
+| --- | --- |
+| 组件 | `components/services/usb_audio_service/`（USB Host + UAC 类驱动 + 推流，**不碰 UI/路由**） |
+| 枚举 | `audio_service.h` 新增 `AUDIO_OUT_USB`（在 `BLUETOOTH` 与 `NONE` 之间） |
+| 分流 | `audio_output.cc` 的 `write_out()` / `audio_output_set_route()` / `audio_output_set_volume()` |
+| UI | `music_view_output.cc` 输出弹窗**只在 `usb_audio_is_ready()` 时**多一行「USB 声卡」 |
+| 启动 | `main.cc` **首帧之后** `usb_audio_init()`（装 USB PHY + 两个任务，别放关键路径） |
+| 提示 | 状态栏定时器消费 `audio_service_take_usb_msg()` → Toast（插入 / 拔出 / 用不了） |
+
+**位深是自动判断的**（2026-10-21 需求）：`open_speaker()` 按 **24 → 16 → 32** 的顺序找
+`2ch + 48 kHz` 的 alt —— 设备有 24bit 就用 24bit，没有就回退到它自己的默认。
+24/32bit 时 `usb_audio_write()` 把 16-bit PCM **左移 8/16 位扩宽**（`pcm16_widen()`，
+逐字节读写避免对齐问题）；注意这只是"装进更宽的容器"，**不增加信息量**。
+UI 里那一行会显示实际位深（`已连接 · 48 kHz · 24bit`），来源是 `usb_audio_bit_depth()`。
+
+**插拔提示**：`usb_audio_service` 有两条回调 —— `state(ready)` 只回答"能不能往 USB 推 PCM"
+（决定路由），`notice(msg)` 负责给用户一句话（含"插上了但用不了"这种 ready 恒 false 的情况）。
+`audio_service` 把 notice 抄进单槽消息里，状态栏定时器取走弹 Toast；
+文案：`USB 声卡已连接：<产品名>（24bit）` / `USB 声卡已拔出` /
+`USB 声卡已断开，已切回扬声器` / `USB 声卡不支持 48 kHz 立体声，无法使用`。
+⚠ 拔出时**先发 notice 再 notify(false)**：正在用 USB 的话后者会把文案改写成"已切回扬声器"，
+那句更准确。
+
+**为什么一行重采样都不用加**：输出级已经恒为 48 kHz/16bit/2ch（§0.2），
+目标设备恰好只支持这个格式 —— 同一块 PCM 原样写进 UAC 端点，192 B/ms 与时间轴口径一致。
+
+**拔出立即切回内置输出的三道保险**（缺一不可，别删任何一道）：
+
+1. `usb_audio_service` 的**设备回调**（UAC 后台任务上下文）：`DISCONNECTED`/`TRANSFER_ERROR`
+   → 只清 `s_ready` + 回调上层，**微秒级**。这里**绝不能**去 `close/stop`：对已拔掉的设备做
+   控制传输会一直超时，那就不是"立即"了（收尾交给事件队列）。
+2. `audio_service` 的 `on_usb_audio_state()`：当前路由是 USB 就**立刻**
+   `audio_output_set_route(AUDIO_OUT_SPEAKER)`（解静音 + 开功放，纯标志/GPIO）。
+3. `write_out()`：写 USB 失败时就地改走板载并把路由切回去 —— 堵住第 1、2 道之间的竞态。
+
+⚠⚠ **泵 `usb_host_lib_handle_events()` 的任务绝对不能做阻塞动作**（2026-10-21 真机崩过）：
+USB 主机库把"控制传输完成"分发出去是在 `usb_host_lib_handle_events()` 的处理循环里
+（`usb_host.c:362` 的 `USBH_EVENT_CTRL_XFER`：非内部 client 只把 URB 挂到 client 的
+done 队列，再由 `usb_host_client_handle_events()` 回调）。所以如果同一个任务里调了
+`uac_host_device_open()/start()`（里面是**同步**控制传输，最长等 5 s），那 5 s 里没人泵
+lib 事件 → 完成事件永远不派发 → 连锁崩：
+
+```
+E uac-host: Control Transfer Timeout
+E USB HOST: Get EP handle error: ESP_ERR_INVALID_ARG   ← EP0 没有 EP handle，HALT 必然失败
+E uac-host: Unable to submit control transfer          ← 同一个 ctrl URB 还挂着 → NOT_FINISHED
+E uac-host: uac_host_device_start failed: ESP_ERR_NOT_FINISHED
+assert failed: usbh_dev_close usbh.c:1334 (num_ctrl_xfers_inflight == 0)   ← 直接 panic
+```
+
+正确结构（与官方 audio_player 例程一致，`usb_audio_service.cc` 现在就是这么写的）：
+`usb_lib_task` 只做 `usb_host_install()` + `usb_host_lib_handle_events(portMAX_DELAY)`；
+`usb_action_task`（+ UAC 驱动自带的事件任务）负责装驱动、开关设备。
+
+⚠ 另一个必要条件：**`CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE` 默认 256 太小**。
+这个 UAC 声卡（1 个 AudioControl + 4 个 AudioStreaming alt + HID）的配置描述符超过 256 B，
+枚举阶段直接 `CHECK_SHORT_CONFIG_DESC FAILED`（设备插着但永远认不到，连类驱动都到不了）。
+已改成 **1024**（`sdkconfig` + `sdkconfig.defaults` 都写了，代价 1 KB 内部 RAM）。
+
+⚠ **ASRC 的 in/out 缓冲必须来自内部 RAM，而内部 RAM 要「提前抢」**（2026-10-21 真机）：
+每首歌 `asrc_open()` 现分配时会撞上这种降级：
+
+```
+W audio_out: asrc out: 内部 RAM 分配 4352 B 失败，退回 PSRAM（含 cache 同步）
+```
+
+此时内存里已有 LVGL 缓冲 / PCM ringbuf / UAC 环形缓冲，再要一块 **64 字节对齐 +
+可 DMA 的连续 4.3 KB** 就可能失败。退到 PSRAM 之后 GDMA 要穿 PSRAM，
+和 LCD 取帧、LVGL 绘制抢带宽 → **用户听到偶发卡顿**；而 `play stats` 里的
+`asrc 95 ms / 墙 5017 ms` 只统计运算时间，**看不见 msync 和等 PSRAM 的时间**，
+所以统计上看起来很闲（别被那个 1.9% 骗了）。
+
+修法：`audio_output_init()`（显示还没起、内存最干净）一次性预留 **14 KB** 内部 RAM 池，
+`asrc_open()` 从池子里切 in/out（`s_in_cap` 向上对齐后再切，保证 out 地址仍对齐），
+`asrc_close()` **不 free 池子里的块**（`s_bufs_from_pool`）。日志：
+`asrc buffer pool: 14336 B @ 0x… (internal RAM, 64B aligned)`。
+池子装不下（16k/8k→48k 这种高倍率）会打 `asrc pool … too small … fallback to heap`
+并退回按需分配 —— 正常音乐（44.1k/48k/32k/24k）都在池子里。
+
+⚠⚠ **内部 RAM 已经是紧平衡**（2026-10-21 真机：`esp-aes: Failed to allocate memory` →
+`esp_tls_conn_write error` → `online: GET failed (ESP_ERR_HTTP_WRITE_DATA)`）：
+常驻消费是 LVGL、PCM ringbuf(PSRAM)、**UAC 环形缓冲 19.2 KB(内部)**、**ASRC 池 14 KB(内部)**、
+USB 三个任务栈 ≈11 KB；而 `CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC=y` 把 TLS 缓冲**钉在内部 RAM**，
+每次 HTTPS 连接要 `MBEDTLS_SSL_IN_CONTENT_LEN` 那么大的一块（+4 KB out），还要和
+`esp-aes` 的 DMA 描述符抢同一块地。已把 IN 从 16 KB 降到 **8 KB**（省 8 KB，仍大于常见 TLS 记录）。
+
+`play stats` 末尾现在带内存实况：`| mem int N KB (max M) dma K psram P KB` ——
+- `max` < 16 KB ⇒ TLS 握手可能失败（要的是**连续**块）；
+- `dma` 见底 ⇒ `esp-aes` / GDMA 类分配先挂；
+- 要再腾内部 RAM，按代价从低到高：UAC 环形 19.2→9.6 KB（24bit 下 33 ms）、
+  ASRC 池 14→10 KB（44.1k 需 8.1 KB）、`CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y`（TLS 进 PSRAM，
+  但 HW-AES 读 PSRAM 有兼容性风险，只在确实需要时用）。
+
+⚠ `usb_audio_write()` 与 `close_dev()` 之间**必须有句柄互斥锁**（`s_dev_mtx`）：
+写路径在音频输出任务、close 在 USB 任务，没锁就是 use-after-free。
+
+⚠⚠ **`ESP_FAIL` 不等于"拔出"**（最容易踩的一条，已经踩过一次）：
+`uac_host_device_write()` 内部是 `xRingbufferSend()` —— **环形缓冲满就返回 `ESP_FAIL`**
+（`uac_host.c` 的 `_ring_buffer_push`），只有接口不再是 ACTIVE（真拔了/真出错）才返回
+`ESP_ERR_INVALID_STATE`。所以：
+
+| 返回值 | 含义 | 该做什么 |
+| --- | --- | --- |
+| `ESP_OK` | 整块进了环形缓冲 | 继续 |
+| `ESP_ERR_INVALID_STATE` | **设备真的不在了** | 清 ready + 通知上层 → 切回板载 |
+| `ESP_FAIL` / 其它 | 只是这块没写进去（缓冲满） | **丢这块，路由别动** |
+
+判据错了的后果是：USB 播放中抖一下 → 莫名其妙跳回扬声器。另外 `usb_audio_write()`
+内部把任意大小的 PCM **按 10 ms（1920 B）分块**喂（`USB_WRITE_CHUNK`），
+配合 100 ms 的 UAC 环形缓冲，基本不会走到满；拆分也让大块不会一次撞墙。
+
+⚠ **依赖的是托管件**，不是 IDF：IDF 6.x 的 `components/` 里**已经没有 `usb` 组件**
+（搜不到 `usb_host.h`），USB Host 库与 UAC 类驱动都来自
+`managed_components/espressif__usb` + `espressif__usb_host_uac`（1.5.0，targets 含 `esp32s31`，
+由 esp_video/UVC 带进来）。**别去 IDF 树里找 `usb_host_install`**。
+
+日志（判读见 `docs/uac-audio.md` 末节）：`UAC host installed, waiting for a USB sound card` /
+`USB sound card ready: "..." alt 1 @ 48000 Hz/2ch/16bit` /
+`USB audio disconnected -> not ready` / `USB audio gone -> switch back to speaker immediately`。
 
 ---
 
@@ -2497,3 +2702,33 @@ bsp_init → play_state_init → bsp_audio_init → audio_service_init
   否则下一个 tick 会写到已释放的对象上（use-after-free，见 `home_deleted()`）。
 
 
+
+## 17. 语音输入（讯飞 IAT）与麦克风增益（2026-11 修"要很大声才识别"）
+
+链路：`lvgl_pinyin_ime` 只做讯飞协议（WS 封装 + 签名 + JSON），**宿主全在
+`components/services/voice_service/`**：`esp_websocket_client` 收发 + 板级 `audio_adc`
+（ES8389 ADC）采集 + 识别期间自动暂停播放/结束恢复。键盘入口是
+`voice_service_attach_ime(ime)`，设置 → 麦克风测试走同一个 `audio_read` 回调。
+
+- **采集口径不能改**：I2S0（TDM）是播放与录音共用的总线，必须**按 48 kHz / 2ch 采**
+  再软件 ÷3 降采样到 16 kHz 单声道（按 16 kHz 开麦时 ES8389 直接
+  `Failed to set data interface format, ret=0x106`，见 `voice_service.cc` 里的长注释）。
+  每 40 ms 一帧 = 1280 B，`esp_codec_dev_read()` 本身就是阻塞读。
+- ⚠⚠ **根因（2026-11 用户报"每次都得靠麦克风很大声才能识别到"）**：
+  `es8389_open()` 把 ADC 侧的模拟 PGA 写成 **0 dB**
+  （`write_reg(0x72/0x73, (InputSel << 4) + 0)`，低 4 bit 就是增益）。
+  真机实测峰值只有 **-50…-29 dBFS**，而正常说话是 -20…-6 dBFS —— 电平低到服务端
+  VAD 把整段当静音，表现就是"识别为空 / 漏字 / 只有大喊才偶尔有字"。
+- **修法**：`mic_ensure_open()` 打开 codec **之后**立刻
+  `esp_codec_dev_set_in_gain(handle, db)`（驱动 `es8389_adc_set_vol` → 写 0x72/0x73）。
+  ⚠ 顺序不能反：`es8389_open()` 自己会把 PGA 刷回 0 dB，先设后开等于白设
+  （还会打 `mic PGA: codec not open`）。档位是硬件固定的
+  **0 / 6.5 / 12.5 / 18.5 / 24.5 / 30.5 / 36.5 dB**（`es8389_mic_gain_t`，注意
+  9.5→12.5 之间跳过了 0b0100/0b0101），默认 **+30.5 dB**，存 NVS
+  `voice_cfg/gain_x10`（整数 ×10，NVS 没有 float）。写硬件失败时自动退化到软件增益
+  （`s_sw_mul`，带饱和，避免溢出成刺耳的翻转噪声）。
+- **调法**：设置 → 麦克风测试，看电平条到 **-20 dBFS 以上"正常"** 即可；`−/+` 按钮
+  走的是硬件档位（吸附到档位值，UI 显示必然等于驱动实际值），立刻生效并落 NVS。
+  再往上只剩底噪（PGA 也放大麦克风自噪）。
+- 日志：`voice_svc: 麦克风 PGA 增益已设为 30.5 dB` / `麦克风增益 → 24.5 dB`；
+  DEBUG 级每秒一行 `mic level: peak N (M dBFS)`（判据与设置页一致）。

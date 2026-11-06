@@ -33,6 +33,7 @@
 #include "bt_service.h"
 #include "play_state.h"
 #include "online_service.h"
+#include "usb_audio_service.h"   /* USB 声卡（UAC 1.0）输出的启动点 */
 
 /*
  * 让链接器把 ime_dict_stub.c.obj 从 libmain.a 里拉出来。
@@ -293,6 +294,18 @@ extern "C" void app_main(void)
     boot_splash_set_status("正在挂载存储卡…");
     bsp_sdcard_mount();
     boot_mark("sdcard mounted");
+
+    /*
+     * USB 声卡（UAC 1.0）：装 USB Host + UAC 类驱动，之后后台自动检测插拔。
+     * 放在首帧之后是刻意的 —— 它会装 USB PHY、起两个任务，
+     * 挂在开机关键路径上只会白白拖慢第一帧。
+     * 插上声卡后播放器页的输出弹窗会多出一行「USB 声卡」；
+     * 播放中被拔出则**立即**切回板载（见 usb_audio_service.cc 顶部说明）。
+     */
+    if (usb_audio_init() != ESP_OK) {
+        ESP_LOGW(TAG, "usb_audio_init failed (USB 声卡不可用)");
+    }
+    boot_mark("usb audio");
 
     /*
      * 本地曲库服务：这里必须显式初始化一次 —— SD 热插拔监控任务就是在

@@ -11,6 +11,7 @@
  *                    └─ 按 s_route 分流
  *                         ├─ SPEAKER    : esp_codec_dev_write() → ES8389(TDM) → NS4150B
  *                         ├─ BLUETOOTH  : 软件音量 → bt_service_write_pcm()
+ *                         ├─ USB        : usb_audio_write() → UAC 1.0 等时端点（声卡）
  *                         └─ NONE       : 只走时间轴，不写硬件
  *
  * ── 为什么必须有这一层（而不是直接用 espaudiocore 的 I2S 输出）────────────────
@@ -72,6 +73,7 @@
 #include "bsp.h"
 #include "bt_service.h"
 #include "espaudiocore.h"
+#include "usb_audio_service.h"   /* USB 声卡（UAC 1.0）输出 */
 
 static const char *TAG = "audio_out";
 
@@ -182,6 +184,33 @@ static uint16_t          s_out_smp_bytes;  /**< 目标：每帧字节数（恒 4
 static uint8_t          *s_in_buf;
 static size_t            s_in_cap;         /**< ASRC 输入缓冲容量（字节） */
 static uint8_t          *s_out_buf;
+
+/*
+ * ASRC 的 in/out 缓冲**预分配池**（内部 RAM，开机一次）。
+ *
+ * 为什么不能每次 asrc_open() 现分配：真机出现过
+ *   `asrc out: 内部 RAM 分配 4352 B 失败，退回 PSRAM（含 cache 同步）`
+ * —— 那时内部 RAM 已被 LVGL 缓冲 / PCM ringbuf / UAC 环形缓冲占得差不多，
+ * 再要一块 **64 字节对齐 + 可 DMA 的连续 4.3 KB** 就失败了，WARN 之后退到 PSRAM。
+ * 代价不是"慢一点"那么简单：GDMA 从此要穿 PSRAM，和 LCD 取帧、LVGL 绘制抢带宽，
+ * 用户听到的就是**偶发卡顿**（而 `asrc 95 ms/5000 ms` 那个计数只统计运算时间，
+ * 看不见 msync 与等 PSRAM 的时间，所以统计上"看起来很闲"）。
+ *
+ * 所以在 audio_service_init() 阶段（显示还没起来、内存最干净）一次性预留，
+ * 之后每首歌复用；只有装不下（换到极端比率）才退回按需分配。
+ */
+/*
+ * 池子大小按「最大 chunk 的输入 + 它对应的输出」算：
+ *   44.1k→48k ：in 3712 + out 4352 ≈ 8.1 KB（最常见）
+ *   32k→48k   ：in 4096 + out 6120 ≈ 10.2 KB
+ *   24k→48k   ：in 4096 + out 8416 ≈ 12.2 KB
+ *   16k/8k→48k：out 会到 12~24 KB，超出池子上限 → 自动退回按需分配（会打 WARN）
+ * 音乐文件 99% 是 44.1k/48k，14 KB 永久的内部 RAM 换来「永不退 PSRAM」很划算。
+ */
+#define ASRC_POOL_BYTES   (14 * 1024)
+static uint8_t          *s_asrc_pool;
+static size_t            s_asrc_pool_sz;
+static bool              s_bufs_from_pool;   /* 这两个指针不能 free */
 static uint32_t          s_out_frames_cap;
 static uint32_t          s_chunk_frames;   /**< 一次喂给 ASRC 的输入帧数（软 512 / 硬 ≤1024，再按 4080 B 压） */
 static bool              s_asrc_hw;        /**< 本会话的重采样是否真的在硬件上跑（只影响日志/诊断） */
@@ -340,13 +369,18 @@ static void asrc_close(void)
         ESP_LOGI(TAG, "asrc closed");
     }
     if (s_in_buf) {
-        heap_caps_free(s_in_buf);
-        s_in_buf = NULL;
+        if (!s_bufs_from_pool) {
+            heap_caps_free(s_in_buf);
+        }
+        s_in_buf = NULL;          /* 池子里的那块留在 s_asrc_pool，下一首接着用 */
     }
     if (s_out_buf) {
-        heap_caps_free(s_out_buf);
+        if (!s_bufs_from_pool) {
+            heap_caps_free(s_out_buf);
+        }
         s_out_buf = NULL;
     }
+    s_bufs_from_pool = false;
     s_in_cap = 0;
     s_out_frames_cap = 0;
     s_chunk_frames = 0;
@@ -548,8 +582,25 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
     s_out_frames_cap = (uint32_t)(cap_sz / s_out_smp_bytes);
     s_in_cap = (size_t)s_chunk_frames * s_in_smp_bytes;
 
-    s_in_buf  = asrc_buf_alloc(s_in_cap, align, "asrc in");
-    s_out_buf = asrc_buf_alloc(cap_sz, align, "asrc out");
+    /*
+     * 优先从**预分配的内部 RAM 池**里切：池基址本身按 align 对齐，
+     * 进缓冲向上取整到 align 之后，出缓冲的地址也仍然对齐。
+     * 池装不下才退回按需分配（会再走一次"内部 RAM → PSRAM"的两级降级）。
+     */
+    const size_t in_al = (s_in_cap + align - 1) & ~(align - 1);
+    if (s_asrc_pool && (in_al + cap_sz) <= s_asrc_pool_sz) {
+        s_in_buf        = s_asrc_pool;
+        s_out_buf       = s_asrc_pool + in_al;
+        s_bufs_from_pool = true;
+    } else {
+        s_bufs_from_pool = false;
+        if (s_asrc_pool) {
+            ESP_LOGW(TAG, "asrc pool %u B too small for in %u + out %u — fallback to heap",
+                     (unsigned)s_asrc_pool_sz, (unsigned)in_al, (unsigned)cap_sz);
+        }
+        s_in_buf  = asrc_buf_alloc(s_in_cap, align, "asrc in");
+        s_out_buf = asrc_buf_alloc(cap_sz, align, "asrc out");
+    }
     if (!s_in_buf || !s_out_buf) {
         ESP_LOGE(TAG, "asrc buffer alloc failed (in %u B / out %u B)",
                  (unsigned)s_in_cap, (unsigned)cap_sz);
@@ -566,6 +617,18 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
              AUDIO_OUT_RATE, AUDIO_OUT_CHANNELS,
              (unsigned)s_chunk_frames, (unsigned)s_out_frames_cap,
              (unsigned)s_in_cap, (unsigned)cap_sz, (unsigned)align, ASRC_TIMEOUT_MS);
+    if (!s_asrc_hw) {
+        /*
+         * 软件路径 = esp_ae_rate_cvt，真机上 44.1k→48k 立体声就要吃掉**一整个核**，
+         * 96k/192k 这种高倍率的源必然卡顿（真机症状：一卡一卡、play stats 里
+         * `产 N ms / 墙 W ms` 掉到 100% 以下、`asrc` ≈ `cpu` ≈ 满窗口）。
+         * S31 的硬件 ASRC 只认 **16-bit + 1~2ch + 8/16/24/32/44.1/48 kHz** 这六档
+         * （esp_asrc/hw/caps/esp32s31/asrc_caps_check.c），96k/192k 根本不在表里。
+         */
+        ESP_LOGW(TAG, "asrc: %u Hz 走**软件**重采样（硬件只支持 16bit + "
+                      "8/16/24/32/44.1/48 kHz）—— 高倍率（96k/192k 源）会明显卡顿",
+                 (unsigned)src_rate);
+    }
     return true;
 }
 
@@ -615,6 +678,25 @@ static void pump_format(void)
 static void write_out(const uint8_t *pcm, size_t bytes, audio_out_t route, int vol)
 {
     const int64_t t0 = esp_timer_get_time();
+
+    /*
+     * USB 声卡：先试着写。**写失败就地回落板载并把路由也切回去** ——
+     * 这是"拔出必须立刻切回内置输出"的最后一道保险（前两道是 USB 设备回调
+     * 清 s_ready + audio_service 的状态回调切路由）：
+     * 万一这两道都还没跑到（拔出瞬间的竞态），这一块 PCM 也不会丢进黑洞。
+     */
+    if (route == AUDIO_OUT_USB) {
+        const esp_err_t uerr = usb_audio_write(pcm, bytes, 0);
+        if (uerr == ESP_ERR_INVALID_STATE) {
+            /* 设备真的没了：**这一块**就直接走板载，别留一段静音 */
+            route = AUDIO_OUT_SPEAKER;
+            audio_output_set_route(AUDIO_OUT_SPEAKER);
+            ESP_LOGW(TAG, "usb device gone -> fall back to speaker");
+        } else if (uerr != ESP_OK) {
+            /* 环形缓冲满之类的软错误：丢这一块就好，路由不动（否则会莫名其妙跳回扬声器） */
+            ESP_LOGD(TAG, "usb write soft error (%s), drop block", esp_err_to_name(uerr));
+        }
+    }
 
     if (route == AUDIO_OUT_SPEAKER) {
         esp_codec_dev_handle_t dev = bsp_audio_codec();
@@ -704,9 +786,21 @@ static void stats_tick(void)
      * 频率用编译期常量：本项目 CONFIG_PM_ENABLE 没开（无 DFS），CPU 一直跑在这个频率上。 */
     const uint32_t cpu_khz = (uint32_t)CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ * 1000u;
     const uint64_t asrc_cpu_ms = cpu_khz ? (s_stats_asrc_cyc / cpu_khz) : 0;
+    /*
+     * 内存实况（2026-10-21 加）：`esp-aes: Failed to allocate memory` / TLS 写失败这类
+     * 症状的根因永远是内部 RAM，而以前这行完全没有内存数字，只能猜。
+     * 关键看 `int`（内部空闲）和 `intmax`（内部最大可分配块 = 碎片程度）：
+     *   intmax < 16 KB 时 HTTPS 握手（MBEDTLS_SSL_IN_CONTENT_LEN=16K）就可能失败；
+     *   `dma` 那一列见底 ⇒ esp-aes / GDMA 类分配先挂。
+     */
+    const uint32_t mem_int    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024u;
+    const uint32_t mem_intmax = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024u;
+    const uint32_t mem_dma    = heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024u;
+    const uint32_t mem_psram  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024u;
     ESP_LOGI(TAG, "play stats: PCM %u KB/s | 产 %u ms / 墙 %u ms (%u.%u%%) | codec %llu ms, "
                   "asrc %llu ms (cpu %llu ms), wait %llu ms | gap max %u ms, calls %u, "
-                  "ring free %u B, route %d, src %u Hz %uch%s%s",
+                  "ring free %u B, route %d, src %u Hz %uch/%ubit%s%s | mem int %u KB "
+                  "(max %u) dma %u psram %u KB",
              (unsigned)kbps, (unsigned)audio_ms, (unsigned)win,
              (unsigned)(permille / 10), (unsigned)(permille % 10),
              (unsigned long long)(s_stats_codec_us / 1000),
@@ -714,9 +808,10 @@ static void stats_tick(void)
              (unsigned long long)asrc_cpu_ms,
              (unsigned long long)(s_stats_wait_us / 1000),
              (unsigned)s_stats_gap_max_ms, (unsigned)s_stats_calls, (unsigned)ring_free,
-             (int)s_route, (unsigned)s_src_rate, s_src_ch,
+             (int)s_route, (unsigned)s_src_rate, s_src_ch, (unsigned)s_src_bits,
              s_asrc ? (s_asrc_hw ? " (asrc-hw)" : " (asrc-sw)") : "",
-             s_codec_err ? " [codec write errors!]" : "");
+             s_codec_err ? " [codec write errors!]" : "",
+             (unsigned)mem_int, (unsigned)mem_intmax, (unsigned)mem_dma, (unsigned)mem_psram);
 
     /*
      * 硬件路径的承诺是"ASRC 每 5 秒只花几百微秒"。若请求了硬件却仍占掉两成以上
@@ -972,6 +1067,27 @@ esp_err_t audio_output_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    /*
+     * ASRC 的 in/out 缓冲池：**趁现在（显示还没起来、内存最干净）一次性预留在内部 RAM**。
+     * 不留这块的话，每首歌 asrc_open() 都要再要一块 64 字节对齐、可 DMA 的 4.3 KB ——
+     * 真机上就是这么失败的：
+     *   `asrc out: 内部 RAM 分配 4352 B 失败，退回 PSRAM（含 cache 同步）`
+     * 退到 PSRAM 之后 GDMA 要和 LCD/LVGL 抢带宽，听感是偶发卡顿。
+     * 预分配失败也不致命：asrc_open() 会自动退回按需分配。
+     */
+    if (!s_asrc_pool) {
+        s_asrc_pool = (uint8_t *)heap_caps_aligned_alloc(
+            64, ASRC_POOL_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+        if (s_asrc_pool) {
+            s_asrc_pool_sz = ASRC_POOL_BYTES;
+            ESP_LOGI(TAG, "asrc buffer pool: %u B @ %p (internal RAM, 64B aligned)",
+                     (unsigned)s_asrc_pool_sz, s_asrc_pool);
+        } else {
+            ESP_LOGW(TAG, "asrc buffer pool 预留失败（%u B）—— 将退回按需分配/PSRAM",
+                     (unsigned)ASRC_POOL_BYTES);
+        }
+    }
+
     if (xTaskCreatePinnedToCore(out_task, "audio_out", OUT_TASK_STACK, NULL, OUT_TASK_PRIO,
                                 &s_task, OUT_TASK_CORE) != pdPASS) {
         vRingbufferDelete(s_pcm_rb);
@@ -1103,6 +1219,15 @@ void audio_output_set_route(audio_out_t out)
         bt_service_set_volume(s_volume);
         break;
 
+    case AUDIO_OUT_USB:
+        /* 先掐掉板载出声（与扬声器同时出声就是回声），蓝牙也停掉 */
+        bsp_audio_set_mute(true);
+        bsp_audio_pa_enable(false);
+        bt_service_media_stop();
+        /* 音量交给声卡自己（UAC volume control），与蓝牙 AVRCP 同一个思路 */
+        usb_audio_set_volume(s_volume);
+        break;
+
     case AUDIO_OUT_NONE:
     default:
         bsp_audio_set_mute(true);
@@ -1136,6 +1261,9 @@ void audio_output_set_volume(int percent)
          * 由对端去衰减，我们不碰 PCM；只有它不可用时 write_out() 才退回软件缩放。
          */
         bt_service_set_volume(percent);
+    } else if (s_route == AUDIO_OUT_USB) {
+        /* USB 声卡：走 UAC 的 volume control，同样不做逐样本缩放 */
+        usb_audio_set_volume(percent);
     }
 }
 

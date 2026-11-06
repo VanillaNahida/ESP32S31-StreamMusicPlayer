@@ -89,8 +89,7 @@ static lv_obj_t *page_online(void)
     ao_session_begin(lv_tick_get());
 
     lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
+    ui_screen_apply_default_bg(scr);   /* 深色不透明底：否则会露出上一页（常见是播放器背景图） */
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);
     /* pad_top = UI_TITLEBAR_Y：标题行正好落在状态栏下面那条标题栏里，

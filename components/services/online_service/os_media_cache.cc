@@ -80,10 +80,105 @@ const char *os_cover_format(const uint8_t *d, size_t n, const char **why)
 }
 
 /*
+ * 封面每次下载允许的尝试次数（http_get_text_ex 的 attempts）。
+ *
+ * 封面是"锦上添花"的东西，不值得按默认的 3 次去重试 —— 而且它有两种协议方案
+ * （见下面的 cover_download），两次一乘就变成 6 个请求，会把起播拖慢好几秒。
+ */
+#define COVER_GET_ATTEMPTS   2
+
+/*
+ * 上次是靠**明文 http** 拿到封面的吗？
+ *
+ * true 只可能由"https 失败、http 成功"这一条路径置上：之后同一台机器的封面先走
+ * 明文，省掉一次注定失败、还要等一个 TLS 往返的 https 尝试。重启归零（重新试 https，
+ * 因为底层那个故障是偶发的，新的一次可能就好了）。
+ */
+static bool s_cover_plain_ok;
+
+static esp_err_t cover_fetch(const char *url, uint8_t **raw, size_t *len)
+{
+    char *buf = NULL;
+    esp_err_t ret = http_get_text_ex(url, &buf, len, COVER_MAX_BYTES, COVER_GET_ATTEMPTS);
+    *raw = (uint8_t *)buf;
+    return ret;
+}
+
+/*
+ * 下封面：先试 API 给的地址（通常是 https），失败再试**同一路径的明文 http**。
+ *
+ * ★ 为什么要换协议再来一次（2026-11 用户报"封面有时候直接不显示"）：
+ *   HTTPS 请求会偶发地在握手成功后的**第一次读**就失败，真机日志
+ *     I esp-x509-crt-bundle: Certificate validated
+ *     E esp-tls-mbedtls: read error :-0x0087        ← = PSA_ERROR_INVALID_ARGUMENT
+ *     E transport_base: esp_tls_conn_read error, errno=I/O error
+ *     W online: GET failed (ESP_ERR_HTTP_FETCH_HEADER): https://p3.music.126.net/...
+ *   失败点是 mbedtls 解 TLS record（走 PSA + ESP 硬件 AES/GCM），不是网络、不是 URL
+ *   —— 详见 os_http_client.cc 里 get_err_retryable() 那段。重开连接（http_get_text
+ *   内部已重试）有时能好，有时连着撞两次；而网易云封面主机 p*.music.126.net
+ *   **同时服务明文**（实测同一路径 http 也是 200 + 同一张 43 KB 图），走明文就把
+ *   解密那一段整个绕开。封面只是张缩略图、没有隐私，这个降级是划算的。
+ *
+ * 返回 ESP_OK 时 *out 是调用方所有（free）的缓冲；否则 *out 为 NULL。
+ */
+static esp_err_t cover_download(uint32_t id, const char *https_url, uint8_t **out, size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0;
+
+    char plain[ONLINE_URL_MAX + 32];
+    plain[0] = '\0';
+    if (strncmp(https_url, "https://", 8) == 0) {
+        snprintf(plain, sizeof(plain), "http://%s", https_url + 8);
+    }
+
+    esp_err_t last = ESP_FAIL;
+    bool last_plain = false;
+    /* 原 URL 不是 https（没有明文版本可换）时只发一次，别拿同一个地址打两遍 */
+    const bool have_alt = plain[0] != '\0';
+    const int tries = have_alt ? 2 : 1;
+    for (int i = 0; i < tries; i++) {
+        /* i == 0 → 上次成功的那种协议；i == 1 → 另一种 */
+        bool use_plain = s_cover_plain_ok ? (i == 0) : (i == 1);
+        if (!have_alt) {
+            use_plain = false;             /* 没有明文版本：就用给进来的那条 */
+        }
+        const char *u = use_plain ? plain : https_url;
+        uint8_t *raw = NULL;
+        size_t len = 0;
+        const esp_err_t ret = cover_fetch(u, &raw, &len);
+        if (ret == ESP_OK && len >= 64) {
+            if (use_plain != s_cover_plain_ok) {
+                s_cover_plain_ok = use_plain;
+                ESP_LOGW(TAG, "cover %u: 走明文 http 成功，本次开机后面都优先明文", (unsigned)id);
+            }
+            *out = raw;
+            *out_len = len;
+            return ESP_OK;
+        }
+        free(raw);
+        if (ret == ESP_OK) {
+            last = ESP_ERR_NOT_FOUND;      /* 下到了但太小：多半是错误页/空响应 */
+        } else {
+            last = ret;
+        }
+        last_plain = use_plain;
+        if (have_alt && i + 1 < tries) {
+            /* 只打"换协议"这一次，别把两跳的失败刷成两条一样的日志 */
+            ESP_LOGW(TAG, "cover %u: %s 失败(%s)，改用 %s 再试一次", (unsigned)id,
+                     use_plain ? "http" : "https", esp_err_to_name(last),
+                     use_plain ? "https" : "http");
+        }
+    }
+    ESP_LOGD(TAG, "cover %u: all attempts failed (last %s over %s)", (unsigned)id,
+             esp_err_to_name(last), last_plain ? "http" : "https");
+    return last;
+}
+
+/*
  * 封面字节（PSRAM 缓存，不落 SD）。
- * 命中缓存直接拷贝给调用方；没命中就下（封面 URL 是 http://p*.music.126.net，
- * 直接 http_get_text 即可），进缓存 + 拷贝。
- * *out 是调用方所有的新缓冲，用 free() 释放。
+ * 命中缓存直接拷贝给调用方；没命中就下（见 cover_download 的两种协议方案），
+ * 进缓存 + 拷贝。*out 是调用方所有的新缓冲，用 free() 释放。
  */
 esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_t *out_len)
 {
@@ -130,20 +225,13 @@ esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_
 
     char *raw = NULL;
     size_t len = 0;
-    esp_err_t ret = http_get_text(url, &raw, &len, COVER_MAX_BYTES);
+    esp_err_t ret = cover_download(song->id, url, (uint8_t **)&raw, &len);
     if (ret != ESP_OK || len < 64) {
-        /* 超上限时给一句能看懂的话（下载器只会回一个笼统的错误码） */
-        if (len >= COVER_MAX_BYTES) {
-            char msg[64];
-            snprintf(msg, sizeof(msg), "封面太大(>%u MB)",
-                     (unsigned)(COVER_MAX_BYTES / (1024u * 1024u)));
-            os_state_set_last_error(msg);
-            ESP_LOGW(TAG, "cover %u too large (>%u bytes): %s",
-                     (unsigned)song->id, (unsigned)COVER_MAX_BYTES, url);
-        } else {
-            ESP_LOGW(TAG, "cover %u download failed (%s, %u bytes): %s",
-                     (unsigned)song->id, esp_err_to_name(ret), (unsigned)len, url);
-        }
+        /* 具体原因（过大/没内存/网络/TLS）已经由 http_get_text 写进 last_error，
+         * 这里只负责打日志 + 把错误码交回去 —— 换协议的第二跳也是在 cover_download
+         * 里试过的，所以这里就是"两种方案都不行"的最终结论。 */
+        ESP_LOGW(TAG, "cover %u download failed (%s, %u bytes): %s",
+                 (unsigned)song->id, esp_err_to_name(ret), (unsigned)len, url);
         free(raw);
         return (ret == ESP_OK) ? ESP_ERR_NOT_FOUND : ret;
     }

@@ -14,6 +14,7 @@
 
 #include "esp_log.h"
 
+#include "internal/os_api.h"
 #include "internal/os_fs.h"
 #include "internal/os_http_client.h"
 #include "internal/os_json.h"
@@ -64,8 +65,63 @@ esp_err_t os_search_local(const char *keyword, online_song_t **out, size_t *coun
 }
 
 /*
- * 搜索歌曲：**先走服务端搜索**（Meting 的 type=search，关键词放 id=），
- * 失败或没网时退化成"扫本地已保存歌单"。
+ * 网易云官方搜索：走自建中间件 `GET /search?keywords=<关键词>`（用户 2026-11 指定）。
+ *
+ * 完整地址就是 `CONFIG_ONLINE_NETEASE_API_BASE` + 这里的 path，即
+ *   https://ncmapi.ysnb.com.cn/search?keywords=xxx&type=1&limit=N
+ * （`os_net_api_get_ex()` 自己拼基地址并按需追加 `cookie=`）。
+ *
+ * ★ 为什么它排第一位、meting 退到兜底：meting 的 `type=search` 响应在 TLS 层
+ *   **读不出来**（真机稳定 3/3 次 `Incomlete data received, ret=-135, 0/8967 bytes`，
+ *   根因见 AGENTS.md §11.4.1），而搜索**没有"换明文 http"那条退路**（meting 只认
+ *   https，`http://` 会 301 过去）—— 于是那头 100% 失败 = 搜索整个不能用。
+ *   中间件这条通道是**每次取播放直链都在用**的，实测通。
+ *
+ * ★ 不需要网易云登录：访问鉴权是中间件自己的 `Authorization: Bearer <token>`
+ *   （`net_auth_hdr()`，来自 CONFIG_ONLINE_NETEASE_API_TOKEN），与 CK 无关；
+ *   没登录也能搜（只是结果不带个性化/会员信息）。
+ *
+ * 返回形状（**老版 /search 格式**，与 /cloudsearch 的 `al`/`ar` 不同）：
+ *   {"result":{"songs":[{"id":…,"name":…,"duration":…,"artists":[…],
+ *                        "album":{"id":…,"picId":…,"name":…}}]}}
+ *   → `os_song_from_json()` 的 `artists[]` 分支能吃；但 `album` 里**没有 picUrl**
+ *     （只有 picId，没法拼封面地址），所以搜出来的歌 `cover_url` 为空 —— 搜索结果
+ *     列表本身不显示封面（无影响），要封面就得改用 `/cloudsearch`。
+ *   失败/未授权时是 401 或 200 + `{"code":…}` 无 songs，由 os_pick_array 返回 NULL
+ *   → os_fill_songs 报 NOT_FOUND → 调用方继续退到 meting。
+ */
+static esp_err_t search_via_netease(const char *enc_keyword, size_t max, online_song_t *acc,
+                                    size_t *out_n)
+{
+    *out_n = 0;
+    const unsigned limit = (max > 50) ? 50U : (unsigned)max;   /* 老接口上限 100，50 条足够 UI */
+    char path[320];
+    const int n = snprintf(path, sizeof(path), "/search?keywords=%s&type=1&limit=%u",
+                           enc_keyword, limit);
+    if (n <= 0 || n >= (int)sizeof(path)) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    char *json = NULL;
+    const esp_err_t err = os_net_api_get_ex(path, true, &json);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "netease search failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    cJSON *root = cJSON_Parse(json);
+    free(json);
+    if (!root) {
+        ESP_LOGW(TAG, "netease search: bad JSON");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const cJSON *arr = os_pick_array(root, "songs");
+    const esp_err_t ret = os_fill_songs(arr, acc, max, out_n);
+    cJSON_Delete(root);
+    return ret;
+}
+
+/*
+ * 搜索歌曲：① 中间件 `/search?keywords=`（首选，不需要登录）→ ② Meting 的
+ * type=search（关键词放 id=）→ ③ 扫本地已保存歌单。
  */
 esp_err_t online_search(const char *keyword, online_song_t **out, size_t *count, size_t max)
 {
@@ -83,6 +139,18 @@ esp_err_t online_search(const char *keyword, online_song_t **out, size_t *count,
     if (online_has_network()) {
         char enc[192];
         os_url_encode(keyword, enc, sizeof(enc));
+
+        /* ① 中间件官方搜索：结果最全，且绕开 meting 那条读不出来的 TLS 响应。
+         *    鉴权走 Bearer token（不是 CK），所以**不判断是否登录**。 */
+        size_t n = 0;
+        if (search_via_netease(enc, max, acc, &n) == ESP_OK && n > 0) {
+            *out = acc;
+            *count = n;
+            ESP_LOGI(TAG, "search '%s': %u hit(s) from netease api", keyword, (unsigned)n);
+            return ESP_OK;
+        }
+
+        /* ② meting 兜底（未登录 / 中间件不可用） */
         char url[320];
         snprintf(url, sizeof(url), API_SEARCH_BASE "?server=netease&type=search&id=%s", enc);
         char *json = NULL;
@@ -97,12 +165,12 @@ esp_err_t online_search(const char *keyword, online_song_t **out, size_t *count,
                 }
                 *out = arr;
                 *count = n;
-                ESP_LOGI(TAG, "search '%s': %u hit(s) from server", keyword, (unsigned)n);
+                ESP_LOGI(TAG, "search '%s': %u hit(s) from meting", keyword, (unsigned)n);
                 free(acc);
                 return ESP_OK;
             }
             free(arr);
-            ESP_LOGW(TAG, "server search failed, fallback to local");
+            ESP_LOGW(TAG, "meting search failed, fallback to local");
         }
     }
 

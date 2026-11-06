@@ -364,8 +364,7 @@ static void on_scr_deleted(lv_event_t *e)
 lv_obj_t *gallery_page_build(void)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
-    lv_obj_remove_style_all(scr);
-    lv_obj_set_style_bg_color(scr, UI_COLOR_BG, LV_PART_MAIN);
+    ui_screen_apply_default_bg(scr);   /* 深色不透明底（见 ui_core.h 的说明） */
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
     /* 先 pad_all 再 pad_top（顺序反了会把状态栏留白覆盖掉，见播放器页的注释） */
     lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);

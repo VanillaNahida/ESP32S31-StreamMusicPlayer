@@ -64,6 +64,7 @@ static const char *TAG = "app_settings";
 static lv_obj_t *s_body;         /* 页面 body（离开时置 NULL，定时器据此退出） */
 static lv_obj_t *s_level_bar;
 static lv_obj_t *s_level_text;   /* "峰值 -29 dBFS（偏小）" */
+static lv_obj_t *s_gain_text;    /* "增益 +30.5 dB" */
 static lv_obj_t *s_status_text;  /* 录音状态 / 进度 */
 static lv_obj_t *s_btn_rec;      /* 大按钮：开始 / 停止录音 */
 static lv_obj_t *s_btn_play;     /* 回放上一次录音 */
@@ -175,6 +176,72 @@ static void mic_update_level(void)
     snprintf(buf, sizeof(buf), "峰值 %d dBFS · %s", lv.peak_dbfs,
              mic_level_verdict(lv.peak_dbfs));
     as_label_set_if_changed(s_level_text, buf);
+}
+
+/* ---------------------------------------------------------------- 增益调节 */
+/*
+ * 用户原话（2026-11）："每次都得靠麦克风很大声才能识别到，能不能帮我调下增益"。
+ *
+ * 根因在 codec 侧：ES8389 开麦时驱动把 ADC 的模拟 PGA 写成 **0 dB**（见
+ * voice_service.cc 里 k_mic_gain_steps 上面的长注释），于是正常说话也只有
+ * -50…-29 dBFS。这一行 ± 按钮就是在调那个 PGA（不是音量、不是软件增益）：
+ * 每按一次走一个硬件档位，立刻生效并存 NVS。
+ */
+static void mic_gain_update_text(void)
+{
+    if (s_gain_text == NULL) {
+        return;
+    }
+    const float db = voice_service_mic_gain_db();
+    char buf[64];
+    if (db <= 0.0f) {
+        snprintf(buf, sizeof(buf), "增益 关（0 dB）");
+    } else {
+        snprintf(buf, sizeof(buf), "增益 +%.1f dB", db);
+    }
+    as_label_set_if_changed(s_gain_text, buf);
+}
+
+static void mic_gain_step(int dir)
+{
+    const float *steps = NULL;
+    const int n = voice_service_mic_gain_steps(&steps);
+    if (n <= 0 || steps == NULL) {
+        return;
+    }
+    const float cur = voice_service_mic_gain_db();
+    int idx = 0;
+    for (int i = 0; i < n; i++) {
+        if (steps[i] <= cur + 0.05f) {
+            idx = i;
+        }
+    }
+    idx += dir;
+    if (idx < 0) {
+        idx = 0;
+    } else if (idx >= n) {
+        idx = n - 1;
+    }
+    (void)voice_service_set_mic_gain_db(steps[idx]);
+    mic_gain_update_text();
+    /* 换了增益就把峰值统计清零，否则电平条还挂着加增益之前的旧峰值 */
+    lv_obj_t *ime = voice_service_ime();
+    if (ime != NULL) {
+        lv_pinyin_ime_voice_reset_level(ime);
+    }
+    ESP_LOGI(TAG, "mic gain -> %.1f dB", voice_service_mic_gain_db());
+}
+
+static void mic_on_gain_down(lv_event_t *e)
+{
+    (void)e;
+    mic_gain_step(-1);
+}
+
+static void mic_on_gain_up(lv_event_t *e)
+{
+    (void)e;
+    mic_gain_step(+1);
 }
 
 /** 定时器：录音中刷状态，平时只刷电平。 */
@@ -324,6 +391,7 @@ static void mic_on_delete(lv_event_t *e)
     s_body = NULL;
     s_level_bar = NULL;
     s_level_text = NULL;
+    s_gain_text = NULL;
     s_status_text = NULL;
     s_btn_rec = NULL;
     s_btn_play = NULL;
@@ -357,7 +425,9 @@ lv_obj_t *page_mic(void)
                       "这一页不连网、不识别，只读麦克风 —— 用的是和语音输入完全相同\n"
                       "的采集路径，所以这里看到的电平就是讯飞会听到的电平。\n"
                       "正常说话应该是 -20 ~ -6 dBFS；低于 -40 基本等于静音，\n"
-                      "那正是「识别为空」的原因。");
+                      "那正是「识别为空 / 要很大声说话」的原因。\n"
+                      "电平偏低就按下面的 ＋ 加增益（改的是 ES8389 的模拟 PGA，\n"
+                      "默认已开到 +30.5 dB），到「正常」即可 —— 再往上只剩底噪。");
     lv_obj_set_style_text_color(hint, UI_COLOR_FG_DIM, LV_PART_MAIN);
     lv_obj_set_style_pad_bottom(hint, 8, LV_PART_MAIN);
 
@@ -386,6 +456,31 @@ lv_obj_t *page_mic(void)
     s_level_text = lv_label_create(card);
     lv_label_set_text(s_level_text, "等待麦克风数据…");
     lv_obj_set_style_text_color(s_level_text, UI_COLOR_FG, LV_PART_MAIN);
+
+    /* --- 增益：[−] 增益 +30.5 dB [＋]（见 mic_gain_step 上方的说明） --- */
+    lv_obj_t *gain_row = lv_obj_create(card);
+    lv_obj_set_width(gain_row, LV_PCT(100));
+    lv_obj_set_height(gain_row, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(gain_row, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(gain_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(gain_row, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(gain_row, 4, LV_PART_MAIN);
+    lv_obj_set_flex_flow(gain_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(gain_row, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(gain_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *btn_dn = as_make_flat_btn(gain_row, "−", mic_on_gain_down, NULL);
+    lv_obj_set_size(btn_dn, 56, 40);
+
+    s_gain_text = lv_label_create(gain_row);
+    lv_obj_set_flex_grow(s_gain_text, 1);
+    lv_obj_set_style_text_align(s_gain_text, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_set_style_text_color(s_gain_text, UI_COLOR_FG, LV_PART_MAIN);
+
+    lv_obj_t *btn_up = as_make_flat_btn(gain_row, "＋", mic_on_gain_up, NULL);
+    lv_obj_set_size(btn_up, 56, 40);
+    mic_gain_update_text();
 
     /* --- 录音/回放 --- */
     s_status_text = lv_label_create(s_body);

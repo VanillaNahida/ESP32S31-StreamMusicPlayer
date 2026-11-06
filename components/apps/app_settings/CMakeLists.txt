@@ -20,6 +20,7 @@ idf_component_register(
         storage_service
         wifi_service
         bt_service
+        usb_audio_service   # 声音与输出页：插着 USB 声卡时多一行，并显示实际位深
         esp_app_format
         esp_hw_support      # esp_chip_info / esp_mac / esp_clk（"关于本机"页）
         heap                # heap_caps_*：SRAM / PSRAM 用量
