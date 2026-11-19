@@ -36,6 +36,8 @@
 #include "ui_icons.h"
 
 #include <stdio.h>
+#include <string.h>
+#include <time.h>
 
 #include "esp_log.h"
 
@@ -51,6 +53,7 @@ static const char *TAG = "ui_status";
 
 static lv_obj_t *s_bar;      /* 状态栏根对象（ui_status_bar_set_visible 用） */
 static lv_obj_t *s_clock;
+static char      s_clock_txt[16];   /* 已画出来的时钟文本（没变就不重写，省堆抖动） */
 static lv_obj_t *s_row;        /* 右侧图标行（flex，从右往左：Wi-Fi→蓝牙→输出→SD） */
 static lv_obj_t *s_wifi;
 static lv_obj_t *s_bt;
@@ -65,6 +68,7 @@ static bool     s_wifi_enabled_seen;
 static bool     s_bt_enabled_seen;
 
 static void poll_cb(lv_timer_t *t);
+static void poll_clock(void);      /* 定义在文件末尾（时钟文本生成器旁边） */
 
 /* 单色位图图标：创建即隐藏，由第一次 poll 填上 */
 static lv_obj_t *make_icon(lv_obj_t *parent)
@@ -331,6 +335,7 @@ static void poll_cb(lv_timer_t *t)
 
     apply_wifi();
     apply_bt();
+    poll_clock();     /* 时钟自己刷（含"显秒"）—— 不再依赖首页的 tick */
 
     /*
      * 两个无线开关的状态：开关一关，service 会把资源整个释放掉，图标要立刻
@@ -430,10 +435,47 @@ lv_obj_t *ui_status_bar_create(lv_obj_t *parent)
     return bar;
 }
 
-void ui_status_set_clock(const char *hhmm, const char *date_text)
+/*
+ * 时钟文本（状态栏与首页大时钟共用，格式统一由"显示设置 → 时钟显秒"决定）。
+ *
+ * 未校时（SNTP 前）返回占位 `--:--`，别显示 1970 年 —— 判定口径与首页一致
+ * （年份 < 2024 就当没校时：本工程没有更早的有效时间来源）。
+ */
+void ui_clock_text(char *buf, size_t n)
 {
-    (void)date_text;   /* 日期在首页大字下方显示 */
-    if (s_clock && hhmm) {
-        lv_label_set_text(s_clock, hhmm);
+    if (!buf || n == 0) {
+        return;
     }
+    const time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    if (tmv.tm_year + 1900 < 2024) {
+        snprintf(buf, n, "--:--");
+    } else if (wifi_service_clock_show_seconds()) {
+        snprintf(buf, n, "%02d:%02d:%02d", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+    } else {
+        snprintf(buf, n, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+    }
+}
+
+/*
+ * 状态栏时钟**自己刷**（2026-11 改）。
+ *
+ * 以前是首页的 1 s 定时器调 ui_status_set_clock() —— 于是"不在首页"时状态栏
+ * 时钟是**停的**（进设置页待两分钟，时钟还停在离开首页那一刻），而"时钟显秒"
+ * 更是只有首页能动。现在跟别的东西一样由 poll 每 500 ms 取一次系统时间；
+ * 500 ms < 1 s，所以秒数不会跳格。文本没变就不写 label（同 as_label_set_if_changed 的理由）。
+ */
+static void poll_clock(void)
+{
+    if (!s_clock) {
+        return;
+    }
+    char buf[16];
+    ui_clock_text(buf, sizeof(buf));
+    if (strcmp(buf, s_clock_txt) == 0) {
+        return;
+    }
+    snprintf(s_clock_txt, sizeof(s_clock_txt), "%s", buf);
+    lv_label_set_text(s_clock, s_clock_txt);
 }

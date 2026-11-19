@@ -24,9 +24,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
-#include "internal/os_fs.h"        /* online_has_network() */
-#include "internal/os_http_client.h"
-#include "internal/os_json.h"
+#include "internal/os_fs.h"        /* online_has_network() / os_psram_alloc() */
 #include "internal/os_pl_format.h"
 #include "internal/os_state.h"
 #include "internal/os_util.h"
@@ -94,6 +92,18 @@ void os_playlists_nvs_save(void)
     nvs_close(h);
 }
 
+/*
+ * 一次抓取最多落多少首。
+ *
+ * meting 时代是"服务端一次给整份 JSON 数组"，条数不受控；现在改成分页
+ * `/playlist/track/all`（100 首/页，见 online_netease_playlist_page），
+ * 内存与磁盘都得先划个上限：
+ *   - 内存：PSRAM 里先按上限预留（online_song_t ≈ 1.2 KB/首），1000 首 ≈ 1.2 MB；
+ *   - 磁盘：定长记录 1252 B/首，1000 首 ≈ 1.25 MB —— 歌单文件本来就在 MB 级。
+ * 超过就截断（打日志），别让一个几千首的"每日推荐"把 PSRAM/存储卡打满。
+ */
+#define ONLINE_PL_FETCH_MAX 1000
+
 esp_err_t online_playlist_add(const char *id)
 {
     if (!id || !id[0]) {
@@ -103,21 +113,25 @@ esp_err_t online_playlist_add(const char *id)
         return ESP_ERR_INVALID_STATE;
     }
 
-    char url[256];
-    snprintf(url, sizeof(url), API_BASE "?server=netease&type=playlist&id=%s", id);
-
-    char *json = NULL;
-    esp_err_t ret = http_get_text(url, &json, NULL, JSON_MAX_LEN);
+    /*
+     * ★ 2026-11：meting 代理已下线（`?server=netease&type=playlist` 现在 404），
+     *   歌单改走自建 API 的原生分页接口 —— 与"账号歌单懒加载"复用**同一个**函数
+     *   （/playlist/track/all?id=&limit=100&offset=…，首屏失败自动退 /playlist/detail）。
+     */
+    online_song_t *songs =
+        (online_song_t *)os_psram_alloc(ONLINE_PL_FETCH_MAX * sizeof(online_song_t));
+    if (!songs) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t count = 0;
+    esp_err_t ret = online_netease_playlist_page(id, 0, songs, ONLINE_PL_FETCH_MAX, &count);
     if (ret != ESP_OK) {
+        free(songs);
+        os_state_set_last_error("歌单抓取失败（空歌单 / 接口变了 / 歌单不存在？）");
         return ret;
     }
-    online_song_t *songs = NULL;
-    size_t count = 0;
-    ret = os_parse_songs_json(json, &songs, &count);
-    free(json);
-    if (ret != ESP_OK) {
-        os_state_set_last_error("歌单解析失败（空歌单或格式变了？）");
-        return ret;
+    if (count >= ONLINE_PL_FETCH_MAX) {
+        ESP_LOGW(TAG, "playlist %s: 只取前 %u 首（分页上限）", id, (unsigned)count);
     }
 
     ret = os_pl_save(id, songs, count);

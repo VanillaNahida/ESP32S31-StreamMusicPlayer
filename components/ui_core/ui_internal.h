@@ -19,6 +19,12 @@ lv_obj_t *ui_volume_panel_create(lv_obj_t *parent);   /* 音量悬浮条（ui_vo
 /* 手势层：把边缘热区与状态栏下拉接上 */
 void ui_gesture_attach(lv_obj_t *status_bar);
 
+/*
+ * 时钟文本（状态栏 + 首页大时钟共用）：按"显示设置 → 时钟显秒"决定是否带秒，
+ * 未校时给 `--:--`。实现在 ui_status_bar.cc（状态栏时钟的宿主）。
+ */
+void ui_clock_text(char *buf, size_t n);
+
 /* 面板展开期间挂起/恢复手势热区：热区在 z 序上高于遮罩，
  * 不停用的话点击屏幕最左/最右 24 px 会被热区吃掉，遮罩收不到"点任意处关闭"。 */
 void ui_gesture_suspend(bool suspend);

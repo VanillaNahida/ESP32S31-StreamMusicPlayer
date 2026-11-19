@@ -10,9 +10,9 @@
  * （原来在 517–534 与 640–656 各写了一遍，逻辑完全相同）。
  *
  * ★ 为什么自己处理 302（原注释照搬）：
- *   这个实例把 http://meting.xcnahida.cn/api?... 302 到 https 同一路径，
+ *   这个实例把 http://<api-host>/api?... 302 到 https 同一路径，
  *   而 IDF 的自动跳转在实测里会把查询串弄丢（服务器直接回 400，
- *   日志就是 "GET status 400: http://meting.xcnahida.cn/api...playlist..."）。
+ *   日志就是 "GET status 400: http://<api-host>/api...playlist..."）。
  *   我们改成 disable_auto_redirect + 自己读 Location 再发一次，
  *   顺便把每一跳打进日志，方便定位。
  */
@@ -87,7 +87,7 @@ esp_err_t http_evt(esp_http_client_event_t *e);
  * 绝不能把 token 泄露给 meting 那种第三方代理。 */
 const char *net_auth_hdr(void);
 
-/* 打日志用的 URL：**砍掉查询串**（账号接口把 cookie 放在 ?cookie=… 里）。
+/* 打日志用的 URL：**砍掉查询串**（历史版本把 cookie 放在 ?cookie=… 里）。
  * 返回静态缓冲，只保证"取完立刻用"（HTTP 都在同一个工作线程里跑）。 */
 const char *url_for_log(const char *url);
 
@@ -131,6 +131,24 @@ esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max
  */
 esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t max_len,
                            int attempts);
+
+/*
+ * ★ 同 http_get_text，但带上**网易云账号 cookie**（2026-11 服务端策略变更）。
+ *
+ * 新策略（参考工程 src/platform/http/netease-cookie.js）：
+ *   - cookie 只认 `X-Netease-Cookie: NAME=VALUE; NAME=VALUE` 请求头；
+ *   - 查询串里的 `?cookie=` 默认被**拒绝**（HTTP 400 cookie_query_not_allowed）。
+ * 所以所有账号类接口都必须走这个入口，不能再往 URL 上拼 cookie。
+ *
+ * 安全约束（与 Authorization 一致）：**只**在 URL 以 online_netease_api_base()
+ * 开头时才加这个头，302 跳到 CDN / 第三方时一律不发 —— cookie 就是账号凭证。
+ *
+ * cookie 传 NULL 或空串 = 不加头（未登录）。
+ */
+esp_err_t http_get_text_hdr(const char *url, const char *cookie, char **out, size_t *out_len,
+                            size_t max_len);
+esp_err_t http_get_text_hdr_ex(const char *url, const char *cookie, char **out, size_t *out_len,
+                               size_t max_len, int attempts);
 
 /*
  * 下载二进制到文件。自动跟随 302；成功条件是 HTTP 200 且落盘字节数 >= min_size。

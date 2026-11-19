@@ -57,3 +57,11 @@ assets/icons/sd_card_WARN_24dp.svg  sd_warn             22
 #   必须与 ui_metrics.h 的 UI_BACK_BTN_SIZE 一致，改一处就得改两处。
 assets/icons/back.png               back_arrow          64
 
+# 播放器页红心（进度条右上方）—— 点亮 = 实心、未点亮 = 空心环。
+# 源 SVG 是用户给的填充红心（viewBox 1024），空心那份把同一路径绕中心缩 0.8 再
+# **反向缠绕**（nonzero 填充自然出环），两份都按白色烘、运行时 recolor：
+# 点亮 #FF3E4C / 未点亮 UI_COLOR_FG_DIM。
+# ⚠ 边长要与 music_view_page.cc 里的红心显示尺寸一致（按显示尺寸烘，不做运行期缩放）。
+assets/icons/heart.svg              heart_on            26
+assets/icons/heart_hollow.svg       heart_off           26
+

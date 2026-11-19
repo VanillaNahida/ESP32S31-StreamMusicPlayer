@@ -61,6 +61,12 @@ void audio_service_set_event_cb(audio_event_cb_t cb, void *user)
     s_evt_user = user;
 }
 
+/* PCM 监视（可视化）：真正的回调点在 audio_output.cc 的 write_out() 末尾 */
+void audio_service_set_pcm_monitor(audio_service_pcm_cb_t cb, void *user)
+{
+    audio_output_set_pcm_monitor(cb, user);
+}
+
 /* ===========================================================================
  * 蓝牙 AVRCP 绝对音量：对端改了音量
  *

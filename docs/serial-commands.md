@@ -2,7 +2,7 @@
 
 实现在 [`main/console_cmds.cc`](../main/console_cmds.cc)，由 `main.cc` 末尾的
 `console_cmds_init()` 启动（IDF 6.1 的 `esp_console_new_repl_stdio()`）。
-与日志**共用 console UART**（COM20，115200，见 AGENTS §3.1），所以提示符会和日志交错，
+与日志**共用 console UART**（COMx，115200，见 AGENTS §3.1），所以提示符会和日志交错，
 属正常现象。
 
 为什么有它：排查"某个文件卡顿 / 速度不对 / 拖不动"时，光看播放日志看不出**文件本身**

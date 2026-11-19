@@ -449,6 +449,7 @@ esp_err_t online_netease_logout(void)
     s_net_cookie_loaded = true;
     remove(NET_COOKIE_FILE);
     online_netease_nickname_set(NULL);  /* 昵称跟着一起清，别让下个账号看到上个的 */
+    online_netease_uid_set(NULL);       /* uid 同理：留着会让 /likelist 查错人 */
     online_cache_clear();              /* 顺手清 PSRAM 缓存，账号歌单下次重新拉 */
     ESP_LOGI(TAG, "netease logged out");
     return ESP_OK;

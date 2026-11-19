@@ -21,6 +21,18 @@ dependencies:
   # ---- 网络 / JSON ----
   espressif/cjson: "^1.7.19"
 
+  # ---- DSP（播放器页频谱柱的 FFT）----
+  # 乐鑫官方 esp-dsp：music_spectrum.cc 用 dsps_fft2r_fc32()（基 2 复数 FFT）
+  # + dsps_bit_rev_fc32() + dsps_wind_hann_f32()。
+  #
+  # S31 走的是 **PIE 汇编**（不是 ansi C）：dsps_fft2r_platform.h 的
+  #   #if CONFIG_IDF_TARGET_ESP32P4 || CONFIG_IDF_TARGET_ESP32S31   (v1.8.0 起就有)
+  #   #ifdef CONFIG_DSP_OPTIMIZED → dsps_fft2r_fc32_arp4_enabled 1
+  # 而它的 Kconfig 把 S31 算进 DSP_OPTIMIZATIONS_SUPPORTED，默认就是
+  #   CONFIG_DSP_OPTIMIZED=y、CONFIG_DSP_MAX_FFT_SIZE=4096（我们的 N=1024 在范围内）。
+  # ⚠ 汇编入口要求 **16 字节对齐**的复数缓冲（music_spectrum.cc 里已保证）。
+  espressif/esp-dsp: "^1.8.0"
+
   # ---- 封面解码 ----
   # JPEG 走 esp_new_jpeg；PNG 走官方 libpng 组件（自带上游 zlib）。
   # 有些专辑图 / 在线封面是 PNG（Meting 的 pic 接口不保证 jpg），

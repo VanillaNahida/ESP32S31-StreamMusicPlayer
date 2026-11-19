@@ -8,22 +8,15 @@
  *   pick_array      2804–2822
  *   song_from_json  2825–2885
  *   fill_songs      2887–2903
- *   parse_songs      904–958
- * 依赖只有 cJSON + os_util + os_fs（psram_alloc），注释一律跟着搬。
+ *
+ * 依赖只有 cJSON（2026-11：meting 的 parse_songs 删了，psram_alloc / os_util 也就
+ * 不需要了 —— 旧的 audio_url/lrc_url 合成逻辑一并移除）。
  */
 #include "internal/os_json.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#include "esp_log.h"
-
-#include "internal/os_fs.h"
-#include "internal/os_state.h"   /* API_BASE：song_from_json 合成的 lrc_url 用它 */
-#include "internal/os_util.h"
-
-static const char *TAG = "online";
 
 /*
  * 在 JSON 里找字段：**先看最外层，再递归进去**。
@@ -157,14 +150,13 @@ bool os_song_from_json(const cJSON *song, online_song_t *out)
     }
 
     /*
-     * 歌词：账号歌没有 meting 生成的 lrc_url，这里按同一个 meting 接口补一条
-     * （播放端 online_song_lyrics_data() 就是去取这个 URL 的**纯文本 LRC**，
-     *  所以不能换成网易云 /lyric 那个返回 JSON 的接口）。
+     * 歌词 / 播放地址都**不在这里填**（2026-11 改）：
+     *   - meting 代理已下线，以前合成的 `?type=lrc` 地址会 404；
+     *   - 真歌词要 `GET /lyric?id=<id>` 再从 JSON 的 lrc.lyric 里取（见 os_media_cache.cc），
+     *     播放直链则按需 `GET /song/url/v1`（见 os_account.cc）。
+     * 所以 online_song_t 里的 audio_url / lrc_url 只是**历史字段**（兼容旧歌单文件），
+     * 新抓到的歌一律留空，由 id 现场换。
      */
-    if (!out->lrc_url[0] && out->id != 0) {
-        snprintf(out->lrc_url, sizeof(out->lrc_url),
-                 API_BASE "?server=netease&type=lrc&id=%u", (unsigned)out->id);
-    }
     return true;
 }
 
@@ -186,59 +178,5 @@ esp_err_t os_fill_songs(const cJSON *arr, online_song_t *out, size_t max, size_t
     return cnt ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
-/* 解析 meting 返回的 JSON 数组 → 歌曲数组 */
-esp_err_t os_parse_songs_json(const char *json, online_song_t **out, size_t *out_count)
-{
-    cJSON *root = cJSON_Parse(json);
-    if (!root || !cJSON_IsArray(root)) {
-        if (root) {
-            cJSON_Delete(root);
-        }
-        ESP_LOGW(TAG, "bad JSON from meting");
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    const int n = cJSON_GetArraySize(root);
-    if (n <= 0) {
-        cJSON_Delete(root);
-        return ESP_ERR_NOT_FOUND;
-    }
-    online_song_t *arr = (online_song_t *)os_psram_alloc((size_t)n * sizeof(online_song_t));
-    if (!arr) {
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
-    }
-    size_t got = 0;
-    for (int i = 0; i < n; i++) {
-        cJSON *it = cJSON_GetArrayItem(root, i);
-        if (!it) {
-            continue;
-        }
-        cJSON *jt = cJSON_GetObjectItem(it, "title");
-        cJSON *ja = cJSON_GetObjectItem(it, "author");
-        cJSON *jp = cJSON_GetObjectItem(it, "pic");
-        cJSON *ju = cJSON_GetObjectItem(it, "url");
-        cJSON *jl = cJSON_GetObjectItem(it, "lrc");
-        if (!cJSON_IsString(jt) || !cJSON_IsString(ju)) {
-            continue;
-        }
-        online_song_t *s = &arr[got];
-        memset(s, 0, sizeof(*s));
-        os_str_copy(s->title, sizeof(s->title), jt->valuestring);
-        os_str_copy(s->artist, sizeof(s->artist), cJSON_IsString(ja) ? ja->valuestring : "");
-        os_str_copy(s->cover_url, sizeof(s->cover_url), cJSON_IsString(jp) ? jp->valuestring : "");
-        os_str_copy(s->audio_url, sizeof(s->audio_url), ju->valuestring);
-        os_str_copy(s->lrc_url, sizeof(s->lrc_url), cJSON_IsString(jl) ? jl->valuestring : "");
-        s->id = os_id_from_url(s->audio_url);
-        if (s->title[0]) {
-            got++;
-        }
-    }
-    cJSON_Delete(root);
-    if (got == 0) {
-        free(arr);
-        return ESP_ERR_NOT_FOUND;
-    }
-    *out = arr;
-    *out_count = got;
-    return ESP_OK;
-}
+/* ⚠ 2026-11：原 os_parse_songs_json()（解析 meting 的 JSON 数组）已随 meting 下线删除。
+ * 歌单/搜索现在都用网易云原生对象（ar/al/songs[]），走 os_song_from_json()。 */

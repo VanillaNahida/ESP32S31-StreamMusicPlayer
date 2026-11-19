@@ -100,7 +100,14 @@ static void settings_tick(lv_timer_t *t)
              audio_service_get_volume());
     as_label_set_if_changed(s_sum[SET_OUT], buf);
 
-    as_label_set_if_changed(s_sum[SET_DISPLAY], bsp_backlight_get() >= 0 ? "无软件背光" : "—");
+    /* 显示设置摘要：时钟口径 + 校时状态（原来这行写"无软件背光"，等于没信息） */
+    {
+        static char disp_txt[32];
+        snprintf(disp_txt, sizeof(disp_txt), "%s · %s",
+                 wifi_service_clock_show_seconds() ? "时钟显秒" : "时钟不显秒",
+                 wifi_service_time_ready() ? "已校时" : "未校时");
+        as_label_set_if_changed(s_sum[SET_DISPLAY], disp_txt);
+    }
     /*
      * 存储行摘要：把"已用百分比 + 可用容量"直接摆在设置主页上（用户点进去之前就能看到）。
      * ⚠ esp_vfs_fat_info() 每次都走一遍 FATFS（f_getfree），不能每 500 ms 调一次 ——
@@ -150,7 +157,12 @@ static void on_setting_row(lv_event_t *e)
         p.create = page_output;
         break;
     case SET_DISPLAY:
-        ui_toast("本板板级配置没有背光器件，软件无法调亮度", 2000);
+        /*
+         * 显示设置（2026-11）：以前这行点了只弹「本板没有背光器件」的 Toast，
+         * 等于没有任何显示相关的设置。现在是真的子页：时钟显秒 + 手动校时，
+         * 亮度那句说明挪到子页底部（见 as_page_display.cc）。
+         */
+        as_push_subpage(as_sub_display());
         return;
     case SET_STORAGE:
         /* 存储现在有详情页：容量 / 可用 / 占用条 / 卡的物理信息（见 page_storage） */
@@ -192,7 +204,7 @@ lv_obj_t *page_settings(void)
         int         id;
     } rows[] = {
         { LV_SYMBOL_VOLUME_MAX, 0xE8973A, "声音与输出",   SET_OUT },
-        { LV_SYMBOL_EYE_OPEN,   0x6E6E78, "显示与亮度",   SET_DISPLAY },
+        { LV_SYMBOL_EYE_OPEN,   0x6E6E78, "显示设置",     SET_DISPLAY },
         { LV_SYMBOL_SD_CARD,    0x5B6FB5, "存储",         SET_STORAGE },
         { LV_SYMBOL_SETTINGS,   0x6E6E78, "关于本机",     SET_ABOUT },
     };

@@ -21,14 +21,19 @@
 
 #include "audio_service.h"   /* 缓冲提示要取 速度/百分比（纯查询，取值给绘制用） */
 #include "ui_core.h"
+#include "ui_icons.h"        /* heart_on / heart_off */
 #include "ui_metrics.h"
 
 #include "music_app.h"       /* music_view_player_ensure_timers（两个常驻定时器） */
 #include "music_cover.h"
 #include "music_info.h"
+#include "music_like.h"
 #include "music_logic.h"
+#include "music_menu.h"      /* 页面销毁时关掉"播放器设置"弹窗 */
 #include "music_player.h"
+#include "music_spectrum.h"  /* 频谱柱的底色跟着主题色走 */
 #include "music_state.h"
+#include "music_theme.h"     /* 封面取色的当前主题色 */
 #include "music_view_internal.h"
 #include "music_view_lyric.h"
 #include "music_view_output.h"
@@ -115,13 +120,68 @@ void music_view_player_apply_src_badge(void)
     s_c.src_badge_state = (int)st->on_mode;
     if (st->on_mode) {
         lv_label_set_text(s_c.src_badge, "在线播放");
-        lv_obj_set_style_bg_color(s_c.src_badge, UI_COLOR_ACCENT, LV_PART_MAIN);
+        /* 底色用**主题色**（跟封面走）而不是全局琥珀色；深色字在亮底上更清楚 */
+        lv_obj_set_style_bg_color(s_c.src_badge, lv_color_hex(music_theme_accent_rgb()),
+                                  LV_PART_MAIN);
         lv_obj_set_style_text_color(s_c.src_badge, lv_color_hex(0x14141A), LV_PART_MAIN);
     } else {
         lv_label_set_text(s_c.src_badge, "本地播放");
         lv_obj_set_style_bg_color(s_c.src_badge, UI_COLOR_PILL, LV_PART_MAIN);
         lv_obj_set_style_text_color(s_c.src_badge, UI_COLOR_FG_DIM, LV_PART_MAIN);
     }
+}
+
+/*
+ * 主题色应用（需求：进度条与按钮的主题色跟着封面动态取色；无封面回落蔚蓝）。
+ *
+ * 分工：取色在解码线程（music_cover.cc → music_state.cover_accent），
+ * 这里只把 music_theme_accent_rgb() 的结果贴到控件上。
+ *
+ * ★ 必须缓存上次的 rgb：tick 每 500 ms 调一次，而 lv_obj_set_style_* 会让对象
+ *   失效重绘（还会打断转圈动画），颜色没变就一个字节都别写。
+ *   缓存初值 0（memset 得来）而主题色恒非 0，所以重进页面一定重新画一次。
+ */
+void music_view_player_accent_apply(void)
+{
+    const uint32_t rgb    = music_theme_accent_rgb();
+    const lv_color_t accent = lv_color_hex(rgb);
+
+    /*
+     * ★ 页面不在（s_c.seek 是"页面建好了"的标志：bind_times 在建页中途就填它）时
+     *   **绝不能**把 rgb 记进缓存：否则"tick 先跑、页面后建"时缓存里已经是当前色，
+     *   建页末尾那次 apply 会直接 return，控件就停在 view_page 里的默认琥珀色上。
+     */
+    if (!s_c.seek) {
+        music_spectrum_set_accent(rgb);     /* 柱子不在就只是记账，attach 时用得上 */
+        music_view_lyric_set_accent(rgb);
+        return;
+    }
+
+    if (s_c.accent_rgb != rgb) {
+        s_c.accent_rgb = rgb;
+        lv_obj_set_style_bg_color(s_c.seek, accent, LV_PART_INDICATOR);   /* 进度条已播填充 */
+        if (s_c.btn) {                  /* 播放/暂停键（唯一的实心强调色按钮） */
+            lv_obj_set_style_bg_color(s_c.btn, accent, LV_PART_MAIN);
+        }
+        if (s_c.mode_badge) {           /* 单曲循环的 "1" 角标 */
+            lv_obj_set_style_text_color(s_c.mode_badge, accent, LV_PART_MAIN);
+        }
+        if (s_c.btn_spinner) {          /* 加载态：播放键里的转圈 */
+            lv_obj_set_style_arc_color(s_c.btn_spinner, accent, LV_PART_INDICATOR);
+        }
+        if (s_c.like_spin) {            /* 红心请求中的转圈 */
+            lv_obj_set_style_arc_color(s_c.like_spin, accent, LV_PART_INDICATOR);
+        }
+        /* 来源药丸的在线底色由 apply_src_badge 画：作废它的缓存再让它重画一次
+         * （本地分支是灰底主题色无关，重画一次也没有副作用）。 */
+        s_c.src_badge_state = -1;
+        music_view_player_apply_src_badge();
+    }
+
+    /* 这两处不属于控件表（频谱柱归 music_spectrum.cc、缓冲转圈归歌词模块），
+     * 它们内部各自缓存，可以每 tick 无条件调。 */
+    music_spectrum_set_accent(rgb);
+    music_view_lyric_set_accent(rgb);
 }
 
 /*
@@ -604,6 +664,85 @@ void music_view_player_bind_seek(lv_obj_t *hit)
     lv_obj_add_event_cb(hit, on_seek_lost, LV_EVENT_PRESS_LOST, NULL);
 }
 
+/* ------------------------------------------------------------------ 红心（"我喜欢"） */
+
+static void on_like_click(lv_event_t *e)
+{
+    (void)e;
+    music_like_toggle();     /* 业务动作（未登录 / 状态未知时的提示都在里面） */
+    /* 立刻重画一次：转圈要"点下去就出现"，而 tick 是 500 ms 一轮 ——
+     * 只等 tick 的话用户会觉得点了没反应。 */
+    music_view_player_like_apply();
+}
+
+void music_view_player_bind_like(lv_obj_t *btn, lv_obj_t *img, lv_obj_t *spin)
+{
+    s_c.like_btn  = btn;
+    s_c.like_img  = img;
+    s_c.like_spin = spin;
+    s_c.like_drawn = -1;                 /* 页面刚建：强制重画一次 */
+    if (btn) {
+        lv_obj_add_event_cb(btn, on_like_click, LV_EVENT_CLICKED, NULL);
+    }
+    music_view_player_like_apply();
+}
+
+/*
+ * 红心状态 = 三个布尔量：显不显示 / 转不转圈 / 亮不亮。
+ * 合成一个位图 int 缓存起来，值没变就直接返回 —— tick 每 500 ms 调一次，
+ * 每 tick 重设 src + recolor 会白白让 LVGL 失效重绘那块区域（还会打断转圈）。
+ *
+ * 只在**在线曲目**显示：本地文件没有网易云 id，收藏无从谈起。
+ * 判断用 music_state.like_cur_id（music_like_tick 维护"当前曲目 id"），
+ * 而不是自己再查一遍队列 —— 两边口径必须一致，否则会出现"按钮显示了但点不动"。
+ */
+void music_view_player_like_apply(void)
+{
+    if (!s_c.like_btn) {
+        return;
+    }
+    const music_state_t *st = music_state();
+    const bool show  = st->on_mode && st->like_cur_id[0];
+    const bool busy  = show && st->like_busy;
+    /* ★ 只有"代次对得上"的结果才敢画：换歌时 like_seq 会 ++，而旧请求的工作线程
+     *   可能刚好在换歌之后才把 like_state 写出来（音乐 A 的红心贴到音乐 B 上）。
+     *   这种结果一律当"未知"处理 —— 亮不亮按未收藏画，tick 会重新同步一次。 */
+    const bool fresh = (st->like_pub == st->like_seq);
+    const bool liked = show && !busy && fresh && (st->like_state == 1);
+
+    const int code = (show ? 1 : 0) | (busy ? 2 : 0) | (liked ? 4 : 0);
+    if (code == s_c.like_drawn) {
+        return;
+    }
+    s_c.like_drawn = code;
+
+    if (!show) {
+        lv_obj_add_flag(s_c.like_btn, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_remove_flag(s_c.like_btn, LV_OBJ_FLAG_HIDDEN);
+
+    if (s_c.like_spin) {
+        if (busy) {
+            lv_obj_remove_flag(s_c.like_spin, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_c.like_spin, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+    if (s_c.like_img) {
+        if (busy) {
+            /* 转圈期间藏图标：转圈和图标叠在一起会糊成一团 */
+            lv_obj_add_flag(s_c.like_img, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(s_c.like_img, LV_OBJ_FLAG_HIDDEN);
+            lv_image_set_src(s_c.like_img, liked ? &heart_on : &heart_off);
+            lv_obj_set_style_image_recolor(s_c.like_img,
+                                           liked ? lv_color_hex(0xFF3E4C) : UI_COLOR_FG_DIM,
+                                           LV_PART_MAIN);
+        }
+    }
+}
+
 /* 轻点封面：在封面**右侧**展开 / 收起歌词 */
 void music_view_player_on_cover_click(lv_event_t *e)
 {
@@ -685,6 +824,9 @@ void music_view_player_on_delete(void)
     /* 弹窗挂在 top layer 上，不随页面销毁：离开播放器页就显式关掉它 */
     music_view_output_on_page_delete();
     music_info_on_page_delete();      /* 歌曲信息弹窗同理（含它的实时刷新定时器） */
+    music_menu_on_page_delete();      /* "播放器设置"弹窗（FFT 开关 / 歌曲信息入口） */
+    /* 频谱柱：删定时器、解绑子控件（柱子是页面里的对象，随页面一起销毁） */
+    music_spectrum_detach();
     /* 歌词控件归 music_view_lyric.cc；只解绑，**歌词数据留着**（重进页面直接重建） */
     music_view_lyric_on_page_delete();
 

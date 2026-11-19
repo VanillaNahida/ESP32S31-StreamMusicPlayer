@@ -41,6 +41,8 @@ bool music_view_lyric_timed(void);
  * 这两个小口子让"缓冲提示"不必知道歌词控件的布局。 */
 lv_obj_t *music_view_lyric_hint_label(void);
 void      music_view_lyric_spin_show(void);
+/* 主题色变化（music_view_player_accent_apply）：缓冲转圈的弧色跟着封面主题走 */
+void      music_view_lyric_set_accent(uint32_t rgb);
 
 /* 页面销毁时调：清掉歌词控件引用与高亮行（歌词**数据**留着，重进页面直接用） */
 void music_view_lyric_on_page_delete(void);

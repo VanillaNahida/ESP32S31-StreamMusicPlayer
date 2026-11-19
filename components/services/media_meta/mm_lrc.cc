@@ -25,6 +25,7 @@
  * esp_log/esp_err 桩就能直接单测（拆分蓝图 §6.3 / §C）。
  */
 #include "internal/mm_lrc.h"
+#include "internal/mm_mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -263,7 +264,7 @@ esp_err_t mm_lrc_load_file(const char *path, lrc_t *out)
         fclose(f);
         return (sz <= 0) ? ESP_ERR_NOT_FOUND : ESP_ERR_INVALID_SIZE;
     }
-    char *buf = (char *)malloc((size_t)sz + 1);
+    char *buf = (char *)mm_alloc_big((size_t)sz + 1);
     if (!buf) {
         fclose(f);
         return ESP_ERR_NO_MEM;

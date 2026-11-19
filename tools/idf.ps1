@@ -14,7 +14,7 @@
 #     & .\tools\idf.ps1 build
 #     & .\tools\idf.ps1 -B build_x build
 #     & .\tools\idf.ps1 fullclean
-#     & .\tools\idf.ps1 -p COM20 flash monitor
+#     & .\tools\idf.ps1 -p COMx flash monitor
 #
 # ⚠ 本机沙箱下 `idf.py build` 有时会因为 asyncio 建管道失败而报
 #   `PermissionError: [WinError 5]`；那条路可以直接退化成
@@ -37,23 +37,25 @@ if (Test-Path $profilePath) {
     $env:PATH = "D:\Espressif\EIM\tools\python\v6.1\venv\Scripts;" + $env:PATH
 }
 
-# 组件管理器拉依赖必须显式设置 https_proxy（否则报"组件找不到"）
-$env:https_proxy = "http://127.0.0.1:7890"
-$env:HTTPS_PROXY = "http://127.0.0.1:7890"
+# 组件管理器拉依赖如需代理，请提前在环境中设置 https_proxy / HTTPS_PROXY
 
 # 未安装 esp-bmgr-assist 时，让 idf.py 找到 board manager 扩展
 $env:IDF_EXTRA_ACTIONS_PATH = (Resolve-Path "$PSScriptRoot\..\managed_components\espressif__esp_board_manager").Path
 
-# ⚠⚠ 必须清掉 MSYSTEM（2026-11 踩）：从 git-bash 里起的 PowerShell 会继承 MSYSTEM=UCRT64，
-#   而 idf.py 一看到它就判定"运行在 MSys/Mingw 下"，只打一行
-#     MSys/Mingw is no longer supported. ... continue at your own risk.
-#   然后**直接 exit 0、什么都不做** —— 表现就是 `idf.ps1 build` / `idf.ps1 flash`
-#   只打印环境横幅、既没编译也没烧写（极易误判成"已经成功"）。
+# ⚠⚠ 必须清掉 MSYSTEM（2026-11 踩）：从 git-bash / MSYS 环境里起的 PowerShell 会继承
+#   MSYSTEM=UCRT64，而 idf.py 的入口只有一句
+#       if 'MSYSTEM' in os.environ: print_warning('MSys/Mingw is no longer supported...')
+#   —— 打完警告**既不 main() 也不报错，直接 exit 0、什么都不做**。表现就是
+#   `idf.ps1 build` / `idf.ps1 flash` 只打印环境横幅、既没编译也没烧写
+#   （极易误判成"已经成功"）。
 #
-# ⚠ 只删 `Env:` 驱动项**不够**（实测删完 `$env:MSYSTEM` 还是 UCRT64），必须走
-#   [Environment]::SetEnvironmentVariable(..., 'Process') 才真的清掉。
-Remove-Item Env:MSYSTEM -ErrorAction SilentlyContinue
-[Environment]::SetEnvironmentVariable('MSYSTEM', $null, 'Process')
+# ⚠⚠ 2026-11-16 实测：**PowerShell 侧怎么删都删不干净**。`Remove-Item Env:MSYSTEM`、
+#   `[Environment]::SetEnvironmentVariable('MSYSTEM', $null, 'Process')`、
+#   `$env:MSYSTEM = [NullString]::Value` 三条路都会在 Windows 的环境块里留下一个
+#   **空值项**：PowerShell 里 `$env:MSYSTEM` 读出来是空串，而 Python 的
+#   `'MSYSTEM' in os.environ` 依然是 True（`repr(os.environ['MSYSTEM']) == "''"`）
+#   —— idf.py 于是照样走 MSys 分支、照样 exit 0。
+#   真正的删法只能在**子进程里**做（见文件末尾的 python 前导）。
 
 if ($IdfArgs.Count -gt 0 -and $IdfArgs[0] -eq 'cmakebuild') {
     $rest = @()
@@ -62,5 +64,17 @@ if ($IdfArgs.Count -gt 0 -and $IdfArgs[0] -eq 'cmakebuild') {
     exit $LASTEXITCODE
 }
 
-& idf.py @IdfArgs
+# idf.py 走一段 python 前导：先把 MSYSTEM 从 os.environ 里 pop 掉（PowerShell 侧删不掉，
+# 见上面那段注释），再按原样 runpy 执行 idf.py —— 参数、工作目录、退出码都不变。
+$idfPy = Join-Path $env:IDF_PATH 'tools\idf.py'
+$env:_IDF_LAUNCH_TARGET = $idfPy
+$prelude = "import os,runpy,sys;" +
+           "os.environ.pop('MSYSTEM',None);" +
+           "p=os.environ['_IDF_LAUNCH_TARGET'];" +
+           "sys.argv[0]=p;" +
+           "sys.path.insert(0,os.path.dirname(p));" +
+           "runpy.run_path(p,run_name='__main__')"
+$py = Join-Path $env:IDF_PYTHON_ENV_PATH 'Scripts\python.exe'
+if (-not (Test-Path $py)) { $py = 'python' }
+& $py -c $prelude @IdfArgs
 exit $LASTEXITCODE

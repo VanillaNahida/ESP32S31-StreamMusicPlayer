@@ -364,3 +364,72 @@ idf.py update-dependencies
 
 > 本机当时没有外网（组件仓库 `components-file.espressif.com` 不可达、代理未运行），
 > 硬改 yml 会让解析失败、整个配置过程报「Cannot establish a connection to the component registry」。
+
+## 11. 高解析源 + 切歌：SD 读失败 / `allocate_dma_buf` 内存不足（2026-11 修）
+
+### 11.1 现场
+
+96 kHz/24 bit FLAC（`ヨルシカ - 老人と海.flac`、`雨とカプチーノ.flac`）连播两首，切歌时：
+
+```
+I (14008) audio_out: play stats: ... | mem int 26 KB (max 26) dma 1 psram 13385 KB
+E (21910) sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101
+E (21910) diskio_sdmmc: sdmmc_read_blocks failed (0x101)
+E (89656) sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101
+I (89657) media_meta: parsed 0 plain lyric lines (no time tags)      ← 歌词文件根本没读出来
+E (89912) espaudiocore: FLAC process_single failed, state=FLAC__STREAM_DECODER_ABORTED
+```
+
+### 11.2 根因链（每一步都可验证）
+
+1. **`allocate_dma_buf` 只在一处报错**：`esp-idf/components/sdmmc/sdmmc_cmd.c` 里它把
+   请求的块大小**一路折半到单块 512 B**，只有"连 512 B 的 `MALLOC_CAP_DMA` 都拿不到"
+   才打印 `not enough mem, err=0x101`（`err=0x101` 就是 `ESP_ERR_NO_MEM`）。
+   ⇒ 报这一行 = **DMA 堆里连 512 B 都没有了**，stats 那行的 `dma 1` 正是 1 KB。
+2. SD 的读缓冲不是我们自己给的（FATFS 的 `fp->buf` / 窗口缓冲没有 DMA 能力），
+   所以**每一次 `fread` 都要临时申请一块 DMA 内部内存**再 memcpy —— 也就是说
+   "DMA 堆见底" 会直接让**所有 SD 读**失败，而不是只影响某一首。
+3. 谁把 DMA 堆吃光了：`audio_output.cc` 的 **ASRC 输入/输出池**
+   （`ASRC_POOL_BYTES` = 14 KB，`MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA`）在
+   `audio_output_init()` 里一次性预留、**之后永久占着**；而 96 kHz/24 bit 的源
+   **必然走软件重采样**（S31 硬件 ASRC 只认 16 bit + 8/16/24/32/44.1/48 kHz，
+   `esp_asrc/hw/caps/esp32s31/asrc_caps_check.c`），
+   软件路径由 CPU 读写缓冲，**根本不需要 DMA 能力** —— 这 14 KB 是纯浪费。
+4. 后果顺序：SD 读失败 → 歌词/封面读不出来、FLAC 解码器拿到空洞数据 → `ABORTED`；
+   app 层看到的是"切歌时解码崩溃/这首放不了"。
+
+### 11.3 修法
+
+| 位置 | 改动 |
+| --- | --- |
+| `asrc_buf_alloc(size, align, what, want_dma)` | 新增 `want_dma`：**软件路径直接走 PSRAM**（不进内部 DMA 堆）。硬件路径保持原样（GDMA 要内部 RAM） |
+| `asrc_open()` | 判定走软件路（`!s_asrc_hw`）且池子还在 ⇒ **立刻 `heap_caps_free` 把 14 KB 还给堆**，日志 `asrc: 软件路径不需要 DMA，释放 N B 内部池`；只有 `s_asrc_hw` 时才从池里切缓冲 |
+| `asrc_pool_ensure()` | 池子改成"可再预留"：开机预留一次（内存最干净），被软件会话还回后再遇到硬件会话时重新申请；失败不致命（退回按需分配 → PSRAM） |
+| stats 行 | 加 `dma (max N)` = `heap_caps_get_largest_free_block(MALLOC_CAP_DMA)`，这正是 SD 要的那块；以后看到 `dma 0 (max 0)` 就知道 SD 读马上要失败 |
+
+### 11.4 判读
+
+| 日志 | 含义 |
+| --- | --- |
+| `asrc: 软件路径不需要 DMA，释放 14336 B 内部池（还给 SD/蓝牙的 DMA 堆）` | 修复生效：高解析源不再占着 DMA |
+| `dma 15 (max 14)` 之类的 stats | DMA 堆够 SD 用（≥512 B 就不会报 0x101） |
+| 仍然 `dma 0 (max 0)` | 别的地方在吃 DMA（Wi-Fi/BT/LVGL），先用 `heap_caps_print_heap_info(MALLOC_CAP_DMA)` 查 |
+
+### 11.5 仍未解决：96 kHz 源的**软件**重采样吃满一个核
+
+同一段日志里第二首：
+
+```
+play stats: PCM 108 KB/s | 产 2906 ms / 墙 5000 ms (58.0%) | codec 7 ms,
+            asrc 4991 ms (cpu 4991 ms) ... src 96000 Hz 2ch/24bit (asrc-sw)
+```
+
+`产/墙 = 58%` ⇒ 解码管线跟不上实时（听感是持续断续），原因是 `esp_ae_rate_cvt`
+在 96k→48k 上把整个核吃满（第一首同一份代码是 23%，说明它与 CPU 竞争强相关）。
+可选方案（都未做）：
+
+1. **自己的 2:1 抽取**：96k/192k 恰好是 48k 的整数倍，先用短定点 FIR 抽取到 48k，
+   再把 ASRC 配成 48k→48k（等同直通，开销≈0）。质量靠 FIR 长度控制，代码 20 行左右。
+2. 让解码器直接按 48k 出（改库，风险大）。
+3. 高解析文件在 UI 上标注"高解析"，把这类源的输出限制在 44.1/48k 并提示（最省事）。
+

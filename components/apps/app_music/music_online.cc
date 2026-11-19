@@ -40,6 +40,29 @@ static const online_song_t *on_songs(void)
     return (const online_song_t *)music_state()->on_songs;
 }
 
+/* 当前曲目是不是在线曲目；是则把歌曲 id 写进 out（红心用）。
+ * 只读 music_state + 队列数组，任何任务都能调。 */
+bool music_online_current_id(char *out, size_t cap)
+{
+    if (!out || cap < 2) {
+        return false;
+    }
+    out[0] = '\0';
+    const music_state_t *st = music_state();
+    if (!st->on_mode) {
+        return false;                       /* 本地队列：没有网易云 id */
+    }
+    const online_song_t *songs = on_songs();
+    if (!songs || st->index < 0 || (size_t)st->index >= st->on_count) {
+        return false;
+    }
+    if (songs[st->index].id == 0) {
+        return false;
+    }
+    snprintf(out, cap, "%u", (unsigned)songs[st->index].id);
+    return true;
+}
+
 /* 本首已经"重刷过几次播放地址"。
  *
  * 网易云给的播放地址是**带时间戳 + 签名**的（`.../20261010132238/...mp3?vuutv=...`），

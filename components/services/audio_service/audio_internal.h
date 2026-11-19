@@ -217,6 +217,15 @@ uint64_t audio_output_played_bytes(void);
 /** 功放使能（扬声器路） */
 void audio_output_pa(bool on);
 
+/**
+ * PCM 监视回调（对外 audio_service_set_pcm_monitor 的实现落点）。
+ *
+ * 在 write_out() 末尾、**写硬件之后**调用 —— 那里已经在会话锁之外，
+ * 所以回调里绝不能反过来调会取锁的东西（见 audio_service.h 的说明）。
+ * 传 NULL 注销。
+ */
+void audio_output_set_pcm_monitor(audio_service_pcm_cb_t cb, void *user);
+
 /* ===========================================================================
  * 在线传输（audio_http.cc）
  *

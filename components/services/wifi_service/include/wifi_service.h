@@ -62,6 +62,30 @@ esp_err_t wifi_service_deinit(void);          /* = set_enabled(false) 的实现 
 bool      wifi_service_has_ip(void);
 /* SNTP 是否已同步（https 证书校验依赖系统时间） */
 bool      wifi_service_time_ready(void);
+
+/*
+ * ---------------------------------------------------------------- 时钟设置
+ *
+ * 为什么"时钟显秒"这个**纯显示**开关挂在 wifi_service 里：
+ *   1) 时间域本来就归它管（SNTP 在这里起、TZ 在这里设）；
+ *   2) 分层规则禁止 `ui_core/` 直接读写 NVS —— 只能通过服务层的 API 拿；
+ *   3) `ui_core` 与 `app_settings` **都已经依赖**本组件，不用新增依赖。
+ * 状态存 NVS（clock_cfg/secs），开机默认**不显秒**（与老固件行为一致）。
+ */
+
+/* 是否显示秒（首页大时钟 + 状态栏时钟都跟着它） */
+bool      wifi_service_clock_show_seconds(void);
+esp_err_t wifi_service_set_clock_show_seconds(bool on);
+
+/*
+ * 手动催一次 NTP 同步（"显示设置"页的按钮）。
+ *
+ * ⚠ **阻塞**，最长等 timeout_ms（建议 8000）：调用方必须是后台任务，
+ *   不能在 LVGL 任务里直接调（会和界面互相等死）。
+ * 返回：ESP_OK = 已同步；ESP_ERR_INVALID_STATE = 没联网；ESP_ERR_TIMEOUT = 等超时。
+ * 已经同步过时立刻返回 OK，不会真的再等。
+ */
+esp_err_t wifi_service_time_sync_now(uint32_t timeout_ms);
 /* NVS 里保存过这个 SSID 的密码？（"密码留空确认 → 用已保存的密码连"用它判断） */
 bool      wifi_service_is_saved(const char *ssid);
 

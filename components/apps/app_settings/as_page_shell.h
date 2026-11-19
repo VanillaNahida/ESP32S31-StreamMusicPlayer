@@ -33,6 +33,7 @@ lv_obj_t *as_page_shell(lv_obj_t *scr, const char *title,
 lv_obj_t *page_wifi(void);
 lv_obj_t *page_bt(void);
 lv_obj_t *page_output(void);
+lv_obj_t *page_display(void);      /* 显示设置：时钟显秒 + 手动校时（as_page_display.cc） */
 lv_obj_t *page_storage(void);
 lv_obj_t *page_about(void);
 
@@ -40,6 +41,7 @@ lv_obj_t *page_about(void);
 const subpage_desc_t *as_sub_wifi(void);
 const subpage_desc_t *as_sub_bt(void);
 const subpage_desc_t *as_sub_storage(void);
+const subpage_desc_t *as_sub_display(void);
 
 /* 点开关行的空白/名称区 = 进子页（点开关图案进不来，见 as_radio.cc） */
 void as_on_switch_row_click(lv_event_t *e);

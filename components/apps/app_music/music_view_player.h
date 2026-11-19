@@ -46,6 +46,10 @@ void music_view_player_bind_src_badge(lv_obj_t *badge);
 void music_view_player_bind_now_playing(lv_obj_t *title, lv_obj_t *artist);
 void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek);
 void music_view_player_bind_seek(lv_obj_t *seek_hit);
+/* 红心：btn（透明，只有图标）+ img（heart_on/off）+ spin（请求中转圈，初始隐藏） */
+void music_view_player_bind_like(lv_obj_t *btn, lv_obj_t *img, lv_obj_t *spin);
+/* tick 用：按 music_state 的 like_* 画红心（内部缓存上次画的状态，没变零开销） */
+void music_view_player_like_apply(void);
 void music_view_player_bind_mode_btn(lv_obj_t *mode_btn);
 void music_view_player_bind_mode_badge(lv_obj_t *badge);
 void music_view_player_wire_transport(lv_obj_t *prev_btn, lv_obj_t *play_btn, lv_obj_t *next_btn);
@@ -82,6 +86,13 @@ void music_view_player_refresh_timesliders(void);
 
 void music_view_player_apply_src_badge(void);
 void music_view_player_apply_play_mode(void);
+
+/*
+ * 主题色（跟随封面）应用到本页控件：进度条填充、播放键底色、单曲循环角标、
+ * 各种转圈的弧、来源药丸的在线底色、频谱柱、歌词区缓冲转圈。
+ * **幂等**（内部缓存上次的 rgb，没变直接返回），tick 每 500 ms 调一次。
+ */
+void music_view_player_accent_apply(void);
 
 /* 缓冲提示：显示 + 立刻刷一帧文字（速度/百分比）。内部置 music_state.buf_show。 */
 void music_view_player_set_buffering_hint(void);

@@ -12,6 +12,7 @@
  * 纯解析部分（mm_mp3_parse_header / mm_probe_fill_bitrate）无 IO，可 host 单测。
  */
 #include "internal/mm_container.h"
+#include "internal/mm_mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,7 +162,7 @@ esp_err_t mm_probe_mp3(const char *audio_path, audio_probe_t *out)
     }
 
     enum { PROBE_BYTES = 32 * 1024 };
-    uint8_t *buf = (uint8_t *)malloc(PROBE_BYTES);
+    uint8_t *buf = (uint8_t *)mm_alloc_big(PROBE_BYTES);
     if (!buf) {
         fclose(f);
         return ESP_ERR_NO_MEM;

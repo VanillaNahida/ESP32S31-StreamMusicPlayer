@@ -23,6 +23,7 @@
 
 #include "music_cover.h"
 #include "music_logic.h"
+#include "music_like.h"
 #include "music_online.h"
 #include "music_state.h"
 #include "music_view_player.h"
@@ -568,6 +569,11 @@ static void tick_refresh_widgets(void)
     music_view_player_set_play_icon(st->playing);
     /* 输出设备可能被设置页/蓝牙事件改过：按钮图标跟着走 */
     music_view_player_out_btn_sync();
+    /* 红心：先让业务侧消费工作线程的结果（含 toast），再把状态画到按钮上 */
+    music_like_tick();
+    music_view_player_like_apply();
+    /* 主题色（跟随封面）：封面/曲目变了才真的重设，颜色没变是空操作 */
+    music_view_player_accent_apply();
     if (music_view_player_lyric_expanded()) {
         music_view_player_lyric_tick();
     }

@@ -36,6 +36,7 @@
 #include "music_online.h"
 #include "music_player.h"
 #include "music_player_bg.h"
+#include "music_spectrum.h"   /* FFT 可视化：开机读一次 NVS 开关 + 挂 PCM 监视 */
 #include "music_state.h"
 #include "music_view_local.h"
 #include "music_view_player.h"
@@ -144,6 +145,15 @@ void app_music_register_apps(void)
      * 进页面时直接能用；否则第一次进播放页会先看到纯色再"啪"一下变出图。
      */
     music_player_bg_start();
+
+    /*
+     * 音频可视化（FFT 频谱柱）：与页面无关地开机初始化一次 ——
+     *   - 读 NVS(music_cfg/fft) 拿到开关（设置弹窗里改，重启后保持）；
+     *   - 注册 audio_service 的 PCM 监视回调（输出任务里只做 memcpy 进环形缓冲）；
+     *   - 建 FFT 的常数表与 Hann 窗（esp-dsp），失败时内部降级成"不显示柱子"。
+     * 真正的 FFT 在 LVGL 任务的 40 ms 定时器里做，这里不占时间。
+     */
+    music_spectrum_init();
 
     music_player_restore_last_session();
 }

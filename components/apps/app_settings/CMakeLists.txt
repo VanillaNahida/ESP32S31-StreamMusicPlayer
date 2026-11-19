@@ -9,6 +9,7 @@ idf_component_register(
         "as_page_wifi.cc"        # Wi-Fi 子页 + 密码浮层
         "as_page_bt.cc"          # 蓝牙子页
         "as_page_output.cc"      # 声音与输出子页
+        "as_page_display.cc"     # 显示设置子页（时钟显秒 + 手动校时）
         "as_page_storage.cc"     # 存储子页
         "as_page_about.cc"       # 关于本机 + 芯片温度
     INCLUDE_DIRS "include"

@@ -5,9 +5,15 @@
  * base 地址的常量与 online_netease_api_base(_set) 归 os_account.h / os_account.cc
  * （它们本来就是"账号体系"那一节的常量），这里 include 进来再导出，方便调用方少 include。
  *
- * ⚠ 缓冲区按"base(≤96) + path(≤200) + 编码后的 cookie(~4 KB)"取 NET_URL_MAX(4096)：
- *   netease 的 cookie 里 MUSIC_U 很长且含 % + = 等字符，**必须 URL 编码**，
- *   否则服务端只拿到半截 cookie → 表现为"随机未登录"。
+ * ★ 2026-11 服务端策略变更（本地跑同样的代码，"随机未登录"变成"必定 400"）：
+ *   以前 cookie 是以 `?cookie=<urlencoded>` **查询参数**发出去的；新版
+ *   @neteasecloudmusicapienhanced/api（v4.41.x）默认 `cookie.allowQuery=false`，
+ *   查询串里的 cookie 会被**直接 400 拒掉**：
+ *     {"code":400,"data":null,"msg":"Passing cookies in the query string is disabled;
+ *      send them in the X-Netease-Cookie header or a POST body"}
+ *   现在一律走请求头 **`X-Netease-Cookie: <压缩后的 cookie>`**（明文，不用再编码），
+ *   由 os_net_api_get_ex() 传给 http_get_text_hdr()，只在请求自家 base 时加
+ *   （见 os_http_client.cc 的 is_own_api()，绝不给 CDN/第三方）。上限 16 KiB。
  */
 #pragma once
 
@@ -50,7 +56,10 @@ extern "C" {
 
 /*
  * 拼 base + path 发 GET，返回 JSON 文本（调用方 free）。
- * with_cookie = true 时追加 `cookie=<urlencoded>`（账号类接口全部要它）。
+ * with_cookie = true 时加两个请求头（账号类接口全部要它）：
+ *   Authorization: Bearer <CONFIG_ONLINE_NETEASE_API_TOKEN>
+ *   X-Netease-Cookie: <online_netease_cookie() 的压缩串>
+ * 401/403 = key 不对或被拒；HTTP 400 且 msg 提到 cookie → 又变回查询串了。
  */
 esp_err_t os_net_api_get_ex(const char *path, bool with_cookie, char **out_json);
 esp_err_t os_net_api_get(const char *path, char **out_json);

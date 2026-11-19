@@ -136,12 +136,14 @@ void ui_screen_apply_default_bg(lv_obj_t *scr);
 
 /* ------------------------------------------------------------------ 状态栏
  *
- * 状态栏右半边那四个图标（Wi-Fi / 蓝牙 / 输出通道 / microSD）**由状态栏自己的
- * 定时器**从 wifi_service / bt_service / storage_service 读状态后画出来
- * （见 ui_status_bar.cc 的文件头）。这里只留时钟这一个入口：
- * 时间来自 SNTP + 首页的 tick，不是任何"服务状态"，没法轮询出来。
+ * 状态栏那四个图标（Wi-Fi / 蓝牙 / 输出通道 / microSD）**由状态栏自己的定时器**
+ * 从 wifi_service / bt_service / storage_service 读状态后画出来
+ * （见 ui_status_bar.cc 的文件头）。
+ *
+ * 时钟也一样（2026-11 改）：以前是首页的 1 s tick 往里塞文本，导致"不在首页时
+ * 状态栏时钟是停的"。现在由状态栏每 500 ms 自己取系统时间，格式由
+ * `wifi_service_clock_show_seconds()`（显示设置 → 时钟显秒）决定。
  */
-void ui_status_set_clock(const char *hhmm, const char *date_text);
 
 /*
  * 状态栏整条显隐（图库的"单击全屏看图"用它把状态栏收起来）。

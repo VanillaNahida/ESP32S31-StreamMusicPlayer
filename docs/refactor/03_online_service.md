@@ -305,7 +305,7 @@ cfg.buffer_size = 4096; cfg.buffer_size_tx = 4096;
 cfg.event_handler = http_evt; cfg.user_data = &sink;
 ```
 
-**为什么关自动跳转**（注释 386–391）：该实例把 `http://meting.xcnahida.cn/api?...` 302 到
+**为什么关自动跳转**（注释 386–391）：该实例把 `http://<api-host>/api?...` 302 到
 https 同路径，IDF 的自动跳转实测会**丢查询串** → 服务器回 400。
 
 ### A.2 响应接收：`http_sink_t` + `sink_reserve` + `http_evt`

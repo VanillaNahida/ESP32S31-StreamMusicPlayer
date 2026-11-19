@@ -88,6 +88,15 @@ LV_IMAGE_DECLARE(sd_warn);
  * **不要再叠 lv_button 的圆底背景**，否则会露出两层边（见 ui_core.cc 的说明）。 */
 LV_IMAGE_DECLARE(back_arrow);
 
+/* 播放器页的红心（"我喜欢"），**26x26**，两条都是**纯白**单色位图 ——
+ * 显示颜色由 image_recolor 决定（点亮 #FF3E4C / 未点亮 UI_COLOR_FG_DIM），
+ * 所以要换配色只改调用方，不用重烘。
+ *   heart_on  assets/icons/heart.svg         实心（用户给的路径）
+ *   heart_off assets/icons/heart_hollow.svg  空心轮廓（同一路径按 0.80 缩、反向缠绕，
+ *            nonzero 填充天然出"环"，不需要 stroke） */
+LV_IMAGE_DECLARE(heart_on);
+LV_IMAGE_DECLARE(heart_off);
+
 #ifdef __cplusplus
 }
 #endif

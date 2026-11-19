@@ -1,5 +1,5 @@
 /*
- * online_service.cc —— 在线音乐（网易云歌单 / Meting API）对外门面
+ * online_service.cc —— 在线音乐（网易云原生 API）对外门面
  *
  * 这个文件是拆分后的**薄门面**：只留 init、查询与几个需要跨模块编排的动作。
  * 各域的实现分布（拆分蓝图 docs/refactor/03_online_service.md §6）：
@@ -36,6 +36,7 @@
 
 #include "internal/os_fs.h"
 #include "internal/os_history.h"
+#include "internal/os_json_mem.h"
 #include "internal/os_login.h"
 #include "internal/os_media_cache.h"
 #include "internal/os_playlists.h"
@@ -50,6 +51,10 @@ esp_err_t online_service_init(void)
     if (os_state_ready()) {
         return ESP_OK;
     }
+    /* ★ 必须在**任何 cJSON 调用之前**装 hooks：cJSON 的 malloc/free 是全局函数指针，
+     *   装晚了就会"malloc 分配、heap_caps_free 释放"混用。likelist / 歌单详情的
+     *   节点海量（3 万首 ≈ 2 MB），不搬 PSRAM 就会把内部 RAM 抽干（见 os_json_mem.cc）。 */
+    os_json_use_psram();
     os_mkdir_if_needed(ONLINE_ROOT);
     os_mkdir_if_needed(ONLINE_AUDIO_DIR);
     /* 封面/歌词不再落 SD：把旧固件写下来的 cover/ 目录与 *.lrc 清掉，

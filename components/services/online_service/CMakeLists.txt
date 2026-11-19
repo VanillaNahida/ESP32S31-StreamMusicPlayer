@@ -6,6 +6,7 @@ idf_component_register(
         "os_fs.cc"
         "os_http_client.cc"
         "os_json.cc"
+        "os_json_mem.cc"
         "os_pl_format.cc"
         "os_playlists.cc"
         "os_search.cc"
@@ -17,6 +18,7 @@ idf_component_register(
         "os_api.cc"
         "os_login.cc"
         "os_account.cc"
+        "os_like.cc"
     INCLUDE_DIRS "include"
     REQUIRES
         esp_http_client

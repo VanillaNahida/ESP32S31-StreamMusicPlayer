@@ -36,6 +36,9 @@ extern "C" {
 #define MUSIC_TRACK_PATH_MAX 600
 #define MUSIC_STREAM_MAX     560
 
+/* music_state.like_pub 的"还没发布过任何结果"哨兵（与 like_seq 的取值空间不重叠） */
+#define MUSIC_LIKE_PUB_NONE  0xFFFFFFFFu
+
 typedef enum {
     MUSIC_MODE_LIST = 0,   /* 列表循环（默认）：顺序放完一轮再从第一首开始 */
     MUSIC_MODE_ONE,        /* 单曲循环：一首放完原样重来 */
@@ -103,6 +106,23 @@ typedef struct {
     volatile bool err_req;                            /* 出错请求 */
     volatile int  media_cmd;                          /* 蓝牙媒体键（1–5，0 = 无） */
 
+    /* ---------------------------------------------------------- 红心收藏（跨线程）
+     *
+     * 只有一个工作线程（music_like.cc 的 like_task）写、LVGL 任务读，
+     * 发布顺序：先写 like_pub_id / like_state → 再写 like_pub（发布标记）→ 最后清 like_busy。
+     * 消费方只在 like_pub == like_seq 时相信 like_state（代次不符 = 换过歌，整批丢弃）。
+     *
+     * 为什么要有"代次"：用户点了红心立刻切下一首是常态，若只按标志位消费，
+     * 上一首的结果会贴到新歌上（红心亮错歌）。 */
+    volatile bool     like_busy;          /* 工作线程占用中（UI 显示转圈） */
+    volatile uint32_t like_seq;           /* 曲目代次（换歌 / 切回本地时 ++） */
+    volatile uint32_t like_pub;           /* 已发布结果对应的代次（LIKE_PUB_NONE = 无） */
+    volatile int      like_state;         /* 0 未知 / 1 已喜欢 / 2 未喜欢 */
+    volatile int      like_result;        /* toast 队列：0 无 / 1 加成功 / 2 取消成功 / 3 未登录 / 4 失败 */
+    volatile bool     like_failed;        /* 同步失败（LVGL 侧据此退避，别每 tick 重试） */
+    char              like_pub_id[24];    /* 已发布结果对应的歌曲 id */
+    char              like_cur_id[24];    /* LVGL 侧记住"上一次看到的曲目 id"（不变就不重算） */
+
     /* ---------------------------------------------------------- 封面（跨线程产权在 music_cover.cc）
      *
      * 像素与描述符**故意与页面生命周期错位**：页面销毁时不释放（下次进页直接贴回），
@@ -117,6 +137,15 @@ typedef struct {
     int      cover_out_w;
     int      cover_out_h;
     volatile int cover_out_idx;                       /* 产出对应的曲目下标（对不上就丢） */
+
+    /*
+     * 封面主色（0xRRGGBB，0 = 没有封面 / 纯黑白灰 → 用默认蔚蓝）。
+     * 由**解码线程**在解出像素后写（music_theme_rgb_from_cover），
+     * LVGL 侧只读（music_theme_accent_rgb），换曲释放封面时清零。
+     * 写入点必须在"像素已就绪"之后、cover_ready 之前 —— 否则 UI 会先看到
+     * 新封面配旧主题色（下一 tick 才对齐，肉眼可见的一下跳色）。
+     */
+    volatile uint32_t cover_accent;
 } music_state_t;
 
 /* 固件唯一实例 */

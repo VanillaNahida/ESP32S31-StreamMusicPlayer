@@ -9,6 +9,8 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -132,6 +134,22 @@ esp_err_t audio_service_set_mute(bool mute);
  * 正确用法是"只置标志，由定时器/任务去处理"（app_music 就是这么做的）。
  */
 void audio_service_set_event_cb(audio_event_cb_t cb, void *user);
+
+/*
+ * PCM 监视回调（播放器页的音频可视化 / 频谱用）。
+ *
+ * 语义：每写完一块**最终 PCM**（恒为 48 kHz / 16 bit / **2ch**）回调一次，
+ * frames 是采样帧数（1 帧 = 左右各 1 个 int16），pcm 指向交错数据。
+ *
+ * ⚠ 三条纪律（破坏它们会直接卡播放）：
+ *   1. 回调跑在**输出任务**上下文（prio 6，直接喂 I2S）—— **必须立刻返回**：
+ *      只做 memcpy 进环形缓冲这类微秒级动作，禁止网络 / 文件 / LVGL / 大循环；
+ *   2. 禁止在里面调任何 audio_service_*（输出任务不取会话锁，也别让它取）；
+ *   3. 传 NULL 可注销。注销与回调之间存在竞态窗口，**注销前先确保没人再用**。
+ * 单声道化 / 加窗 / FFT 全部留给订阅方自己的任务或定时器做。
+ */
+typedef void (*audio_service_pcm_cb_t)(const int16_t *pcm, size_t frames, void *user);
+void audio_service_set_pcm_monitor(audio_service_pcm_cb_t cb, void *user);
 
 /* 当前曲目的流信息（由 ESP_ASP_EVENT_TYPE_MUSIC_INFO 事件填充，
  * bitrate/duration_ms 在 GMF 报 0 时会用自读帧头的探测结果兜底） */

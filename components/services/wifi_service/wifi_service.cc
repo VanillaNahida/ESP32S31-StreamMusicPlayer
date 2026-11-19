@@ -585,9 +585,33 @@ static void wifi_rssi_cb(void *arg)
     }
 }
 
-static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
+/*
+ * 起 SNTP（幂等）。时区固定东八区，`setenv` 在 IDF 里是线程安全的，只需做一次。
+ *
+ * 为什么要时间：
+ *   1) 在线音乐要访问 https CDN，证书校验依赖系统时间，时间不对会直接握手失败；
+ *   2) 首页大时钟与日期一直是"等待校时"，同步后自然就好了。
+ * 抽成函数是因为"开机拿到 IP 自动起"和"设置页手动催一次"两个入口都要用它。
+ */
+static bool sntp_start(void)
 {
-    (void)arg; (void)base;
+    if (s_sntp_started) {
+        return true;
+    }
+    setenv("TZ", "CST-8", 1);
+    tzset();
+    esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(SNTP_SERVER);
+    if (esp_netif_sntp_init(&sntp_cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "sntp init failed (https 可能因时间不准失败)");
+        return false;
+    }
+    s_sntp_started = true;
+    ESP_LOGI(TAG, "sntp started (%s)", SNTP_SERVER);
+    return true;
+}
+
+static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
+{    (void)arg; (void)base;
     if (id != IP_EVENT_STA_GOT_IP || !data) {
         return;
     }
@@ -607,22 +631,9 @@ static void on_ip_evt(void *arg, esp_event_base_t base, int32_t id, void *data)
 
     /*
      * 拿到 IP 就起 SNTP（非阻塞，就在这个回调里初始化也没关系）。
-     * 为什么需要时间：
-     *   1) 在线音乐要访问 https CDN，证书校验依赖系统时间，时间不对会直接握手失败；
-     *   2) 首页大时钟与日期一直是"等待校时"，同步后自然就好了。
-     * 时区固定东八区（setenv 在 IDF 里是线程安全的，只需要做一次）。
+     * 具体理由见 sntp_start() 上面的注释。
      */
-    if (!s_sntp_started) {
-        setenv("TZ", "CST-8", 1);
-        tzset();
-        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(SNTP_SERVER);
-        if (esp_netif_sntp_init(&sntp_cfg) == ESP_OK) {
-            s_sntp_started = true;
-            ESP_LOGI(TAG, "sntp started (%s)", SNTP_SERVER);
-        } else {
-            ESP_LOGW(TAG, "sntp init failed (https 可能因时间不准失败)");
-        }
-    }
+    sntp_start();
 }
 
 /* ---------------------------------------------------------------- 对外接口 */
@@ -822,6 +833,71 @@ bool wifi_service_is_saved(const char *ssid)
 bool wifi_service_time_ready(void)
 {
     return s_sntp_started && (esp_netif_sntp_sync_wait(0) == ESP_OK);
+}
+
+/* ------------------------------------------------------- 时钟显秒 / 手动校时 */
+
+#define CLOCK_NVS_NS    "clock_cfg"
+#define CLOCK_KEY_SECS  "secs"
+
+static int s_clock_secs = -1;   /* -1 = 还没从 NVS 读过；0/1 = 已读到的值 */
+
+bool wifi_service_clock_show_seconds(void)
+{
+    if (s_clock_secs < 0) {
+        s_clock_secs = 0;
+        nvs_handle_t h;
+        if (nvs_open(CLOCK_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(h, CLOCK_KEY_SECS, &v) == ESP_OK) {
+                s_clock_secs = v ? 1 : 0;
+            }
+            nvs_close(h);
+        }
+    }
+    return s_clock_secs != 0;
+}
+
+esp_err_t wifi_service_set_clock_show_seconds(bool on)
+{
+    (void)wifi_service_clock_show_seconds();    /* 先把旧值读进来，避免后面误判 */
+    s_clock_secs = on ? 1 : 0;
+
+    nvs_handle_t h;
+    if (nvs_open(CLOCK_NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        ESP_LOGW(TAG, "clock: nvs open failed (显秒只在本次开机有效)");
+        return ESP_FAIL;
+    }
+    esp_err_t err = nvs_set_u8(h, CLOCK_KEY_SECS, on ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(h);
+    }
+    nvs_close(h);
+    ESP_LOGI(TAG, "clock seconds -> %s", on ? "on" : "off");
+    return err;
+}
+
+esp_err_t wifi_service_time_sync_now(uint32_t timeout_ms)
+{
+    if (!s_ip[0]) {
+        ESP_LOGW(TAG, "sync now: no ip yet");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!sntp_start()) {
+        return ESP_FAIL;
+    }
+    /* 已经同步过：直接成功（不再等一轮 DNS + 请求） */
+    if (esp_netif_sntp_sync_wait(0) == ESP_OK) {
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "sync now: waiting up to %u ms", (unsigned)timeout_ms);
+    esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(timeout_ms));
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "sync now: ok (%s)", SNTP_SERVER);
+    } else {
+        ESP_LOGW(TAG, "sync now: %s (server unreachable?)", esp_err_to_name(err));
+    }
+    return err;
 }
 
 bool wifi_service_is_ready(void)          { return s_ready; }

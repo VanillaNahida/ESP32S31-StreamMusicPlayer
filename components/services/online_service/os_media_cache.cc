@@ -32,10 +32,12 @@
 
 #include "esp_log.h"
 
+#include "internal/os_api.h"
 #include "internal/os_audio_cache.h"
 #include "internal/os_cache.h"
 #include "internal/os_fs.h"
 #include "internal/os_http_client.h"
+#include "internal/os_json.h"
 #include "internal/os_state.h"
 #include "internal/os_util.h"
 
@@ -176,6 +178,50 @@ static esp_err_t cover_download(uint32_t id, const char *https_url, uint8_t **ou
 }
 
 /*
+ * 没有封面地址时，用 `GET /song/detail?ids=<id>` 补一条。
+ *
+ * ★ 为什么会有"没有封面地址"的歌（2026-11）：
+ *   `/search`（老格式）返回的 album 里只有 `picId`、没有 `picUrl` —— 拼不出封面地址，
+ *   于是搜出来的歌 cover_url 为空。`/cloudsearch`（新格式）有 al.picUrl，
+ *   但老歌单文件里存下的记录、以及 /search 兜底路径仍然可能缺。
+ *   这里现场问一次详情接口，songs[0].al.picUrl 就是封面。
+ *
+ * 成功时把地址写进 out 并返回 true；失败（没网 / 没这首歌 / 没封面）返回 false。
+ */
+static bool cover_from_detail(uint32_t id, char *out, size_t cap)
+{
+    char path[64];
+    snprintf(path, sizeof(path), API_PATH_SONG_DETAIL, (unsigned)id);
+    char *js = NULL;
+    if (os_net_api_get_ex(path, true, &js) != ESP_OK) {
+        return false;
+    }
+    cJSON *root = cJSON_Parse(js);
+    free(js);
+    if (!root) {
+        return false;
+    }
+    bool ok = false;
+    /* {"songs":[{"al":{"picUrl":"https://p4.music.126.net/….jpg"}, …}]} */
+    const cJSON *songs = os_pick_array(root, "songs");
+    const cJSON *first = cJSON_IsArray(songs) ? songs->child : NULL;
+    if (first) {
+        const cJSON *al = cJSON_GetObjectItemCaseSensitive(first, "al");
+        const cJSON *pic = cJSON_IsObject(al)
+                               ? cJSON_GetObjectItemCaseSensitive(al, "picUrl") : NULL;
+        if (cJSON_IsString(pic) && pic->valuestring && pic->valuestring[0]) {
+            snprintf(out, cap, "%.*s", (int)(cap - 1), pic->valuestring);
+            ok = true;
+        }
+    }
+    cJSON_Delete(root);
+    if (ok) {
+        ESP_LOGI(TAG, "cover %u: 用 /song/detail 补到封面地址", (unsigned)id);
+    }
+    return ok;
+}
+
+/*
  * 封面字节（PSRAM 缓存，不落 SD）。
  * 命中缓存直接拷贝给调用方；没命中就下（见 cover_download 的两种协议方案），
  * 进缓存 + 拷贝。*out 是调用方所有的新缓冲，用 free() 释放。
@@ -204,7 +250,19 @@ esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_
         return ESP_OK;
     }
 
-    if (!song->cover_url[0] || !online_has_network()) {
+    if (!online_has_network()) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    /*
+     * 封面地址有两种来源：歌记录里带的（cloudsearch / 歌单接口 / 旧文件），
+     * 或者现场问 `/song/detail` 补（见 cover_from_detail 的注释）。
+     */
+    char url[ONLINE_URL_MAX + 32];
+    url[0] = '\0';
+    if (song->cover_url[0]) {
+        snprintf(url, sizeof(url), "%s", song->cover_url);
+    } else if (!cover_from_detail(song->id, url, sizeof(url))) {
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -213,8 +271,6 @@ esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_
      * 万一是带签名的 URL，多一个参数会让签名失效（网易云封面链接没有查询串，
      * 这条路是安全的；检测到已有 '?' 就原样用）。
      */
-    char url[ONLINE_URL_MAX + 32];
-    snprintf(url, sizeof(url), "%s", song->cover_url);
     if (!strchr(url, '?')) {
         const size_t n = strlen(url);
         if (n + 24 < sizeof(url)) {
@@ -271,8 +327,15 @@ esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_
 }
 
 /*
- * 歌词文本（PSRAM 缓存，不落 SD）。命中缓存直接拷贝；没命中就下（纯文本 LRC，
- * UTF-8 原样），进缓存 + 拷贝。*out 用 free() 释放。
+ * 歌词文本（PSRAM 缓存，不落 SD）。命中缓存直接拷贝；没命中就取，进缓存 + 拷贝。
+ * *out 用 free() 释放。
+ *
+ * ★ 2026-11 改：以前 `song->lrc_url` 指向 meting 的 `?type=lrc`（**纯文本 LRC**），
+ *   那个代理已被服务端删除（404）。现在走网易云原生 `GET /lyric?id=<id>`，
+ *   返回的是 JSON：
+ *     {"lrc":{"version":22,"lyric":"[00:00.000] 作词…\n…"},"tlyric":{…}}
+ *   所以要解析出 **lrc.lyric** 这一串再交给播放端（media_meta_lrc_parse 只吃纯文本）。
+ *   没有歌词时 lrc.lyric 是空串 → 返回 ESP_ERR_NOT_FOUND（UI 显示"暂无歌词"）。
  */
 esp_err_t online_song_lyrics_data(const online_song_t *song, char **out, size_t *out_len)
 {
@@ -299,24 +362,60 @@ esp_err_t online_song_lyrics_data(const online_song_t *song, char **out, size_t 
         return ESP_OK;
     }
 
-    if (!song->lrc_url[0] || !online_has_network()) {
+    if (!online_has_network()) {
         return ESP_ERR_NOT_FOUND;
     }
-    char *text = NULL;
-    size_t len = 0;
-    esp_err_t ret = http_get_text(song->lrc_url, &text, &len, LRC_CACHE_BYTES_MAX);
-    if (ret != ESP_OK || len < 8) {
-        free(text);
-        return (ret == ESP_OK) ? ESP_ERR_NOT_FOUND : ret;
+
+    char path[64];
+    snprintf(path, sizeof(path), API_PATH_LYRIC, (unsigned)song->id);
+    char *js = NULL;
+    esp_err_t ret = os_net_api_get_ex(path, true, &js);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "lyric %u: 请求失败 %s", (unsigned)song->id, esp_err_to_name(ret));
+        return ret;
     }
-    os_cache_put(s_lrc_cache, LRC_CACHE_MAX, &s_lrc_cache_bytes,
-                 LRC_CACHE_BYTES_MAX, song->id, (uint8_t *)text, len);
+    cJSON *root = cJSON_Parse(js);
+    free(js);
+    if (!root) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const cJSON *lrc = cJSON_GetObjectItemCaseSensitive(root, "lrc");
+    const cJSON *ly = cJSON_IsObject(lrc)
+                          ? cJSON_GetObjectItemCaseSensitive(lrc, "lyric") : NULL;
+    if (!cJSON_IsString(ly) || !ly->valuestring || !ly->valuestring[0]) {
+        cJSON_Delete(root);
+        ESP_LOGD(TAG, "lyric %u: 无歌词（纯音乐 / 接口没给）", (unsigned)song->id);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t len = strlen(ly->valuestring);
+    if (len >= LRC_CACHE_BYTES_MAX) {
+        len = LRC_CACHE_BYTES_MAX - 1;          /* 超长歌词截断，别撑爆缓存 */
+    }
+    char *text = (char *)os_psram_alloc(len + 1);
+    if (!text) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(text, ly->valuestring, len);
+    text[len] = '\0';
+    cJSON_Delete(root);
+    if (len < 8) {
+        /* 只有 "[00:00.000]" 这种空壳，当成没有 */
+        free(text);
+        return ESP_ERR_NOT_FOUND;
+    }
+    /* ⚠ 先给调用方拷一份、再把 text 交给缓存（os_cache_put 接管所有权，
+     *   槽位拿不到时它会 free(text) —— 反过来写就会从已释放内存里拷贝）。 */
     char *copy = (char *)os_psram_alloc(len + 1);
     if (!copy) {
+        free(text);
         return ESP_ERR_NO_MEM;
     }
     memcpy(copy, text, len);
     copy[len] = '\0';
+    os_cache_put(s_lrc_cache, LRC_CACHE_MAX, &s_lrc_cache_bytes,
+                 LRC_CACHE_BYTES_MAX, song->id, (uint8_t *)text, len);
     *out = copy;
     if (out_len) {
         *out_len = len;
@@ -399,15 +498,14 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
 
     /*
      * ★ 下载也要走"登录 CK + 中间件"那条正路（online_song_stream_url 内部已经
-     *   优先取 CK 直链、失败才退回 meting）。直接用 `song->audio_url` 的话，
-     *   会员歌下到的是**30 秒试听片段** —— "下载兜底"的 m4a/ogg/opus 与手动缓存
-     *   都会中招。
+     *   优先取 CK 直链）。直接用 `song->audio_url` 的话，会员歌下到的是
+     *   **30 秒试听片段** —— "下载兜底"的 m4a/ogg/opus 与手动缓存都会中招。
      *   缓冲取 1024：网易 CDN 的签名直链（含 `?vuutv=…`）实测 200~400 字符，
      *   `online_song_t.audio_url` 只有 320，装不下。
      */
     char dl_url[1024] = {0};
     if (online_song_stream_url(song, dl_url, sizeof(dl_url)) != ESP_OK || !dl_url[0]) {
-        ESP_LOGW(TAG, "no stream url for id %u (account CK + meting 都没拿到)",
+        ESP_LOGW(TAG, "no stream url for id %u (账号 CK 直链拿不到)",
                  (unsigned)song->id);
         return ESP_ERR_NOT_FOUND;
     }

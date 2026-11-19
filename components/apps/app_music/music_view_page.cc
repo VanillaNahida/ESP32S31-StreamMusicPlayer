@@ -21,12 +21,14 @@
 #include "online_service.h"  /* 建页时从在线队列取标题/歌手 */
 #include "storage_service.h" /* 建页时从曲目表取标题/歌手 */
 #include "ui_core.h"        /* ui_screen_apply_default_bg（页面底色：连 opa 一起设） */
+#include "ui_icons.h"        /* heart_on / heart_off（红心位图，tools/icons 烘出来的） */
 #include "ui_metrics.h"
 
 #include "music_cover.h"
-#include "music_info.h"
-#include "music_player_bg.h"
+#include "music_menu.h"      /* 播放器设置弹窗（FFT 开关 + 歌曲信息入口） */
 #include "music_player.h"
+#include "music_player_bg.h"
+#include "music_spectrum.h"  /* 进度条上方的 FFT 频谱柱 */
 #include "music_state.h"
 #include "music_view_internal.h"
 #include "music_view_lyric.h"
@@ -34,11 +36,12 @@
 
 static const char *TAG = "app_music";
 
-/* ⓘ（歌曲信息）按钮：只开弹窗，不做别的（弹窗内容见 music_info.cc） */
+/* 控制排最左边那个按钮（原来的 ⓘ"歌曲信息"）→ 打开"播放器设置"弹窗。
+ * 需求（2026-11 用户）：点开是一个设置面板，里面放 FFT 开关与"歌曲信息"入口。 */
 static void info_btn_clicked(lv_event_t *e)
 {
     (void)e;
-    music_info_open();
+    music_menu_open();
 }
 
 /* ------------------------------------------------------------------ 左栏：封面 */
@@ -242,13 +245,23 @@ lv_obj_t *music_view_player_build(void)
     }
 
     /*
-     * 进度条：外层 30px 透明"抓取区"（自己按触点 x 算比例，松手才真定位），
-     * 里面 10px 的 lv_bar 只负责画：轨道 + 已播填充。
+     * FFT 频谱柱（需求：播放时在**进度条上方**显示）。
+     * ★ 必须建在 seek_hit **之前**：右栏是 flex 列，子对象的创建顺序就是视觉顺序。
+     * 开关状态与 PCM 数据都在 music_spectrum.cc 里，页面只负责给个容器。
+     */
+    music_spectrum_attach(right);
+
+    /*
+     * 进度条：外层 46px 透明"抓取区"（自己按触点 x 算比例，松手才真定位），
+     * 里面 10px 的 lv_bar 只负责画：轨道 + 已播填充，贴抓取区**底部**。
      * 用 lv_bar 而不是 lv_slider：按需求去掉拖拽小圆点，只保留进度条本体。
+     *
+     * ★ 为什么是 46（2026-11 加红心后从 30 加高）：红心要放在"进度条最右侧上方"，
+     *   而抓取区会裁剪子对象 —— 不倒出高度的话红心会被裁掉一半。46 = 红心 32 + 缝 4 + 条 10。
      */
     lv_obj_t *seek_hit = lv_obj_create(right);
     lv_obj_remove_style_all(seek_hit);
-    lv_obj_set_size(seek_hit, LV_PCT(100), UI_PX_H(30));
+    lv_obj_set_size(seek_hit, LV_PCT(100), UI_PX_H(46));
     lv_obj_set_style_bg_opa(seek_hit, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_remove_flag(seek_hit, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(seek_hit, LV_OBJ_FLAG_CLICKABLE);
@@ -260,7 +273,8 @@ lv_obj_t *music_view_player_build(void)
     lv_obj_remove_flag(bar, LV_OBJ_FLAG_CLICKABLE);   /* 触摸都交给抓取区 */
     lv_obj_set_width(bar, LV_PCT(100));
     lv_obj_set_height(bar, UI_PX_H(10));
-    lv_obj_center(bar);
+    /* 贴底：上面 36 px 留给红心（原来居中，加高后会把红心挤到条下面去） */
+    lv_obj_align(bar, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_bar_set_range(bar, 0, 1000);                   /* 千分比，与时长解耦 */
     lv_bar_set_value(bar, 0, LV_ANIM_OFF);
     lv_obj_set_style_bg_color(bar, UI_COLOR_PILL, LV_PART_MAIN);
@@ -272,6 +286,40 @@ lv_obj_t *music_view_player_build(void)
     lv_obj_set_style_border_opa(bar, LV_OPA_60, LV_PART_MAIN);
     lv_obj_set_style_bg_color(bar, UI_COLOR_ACCENT, LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, UI_PX_H(5), LV_PART_INDICATOR);
+
+    /*
+     * 红心（"我喜欢"）：需求是"进度条最右侧上方、只显示图标不显示按钮背景"。
+     * 建在抓取区**里面**：它是 seek_hit 的子对象，点它时事件交给它自己，
+     * 不会触发父对象的 PRESSED/PRESSING（那才是拖动定位）—— 所以两件事不打架。
+     * 图标 26 px 位图（assets/icons/heart*.svg 烘的），运行期只换 recolor。
+     */
+    lv_obj_t *like_btn = lv_obj_create(seek_hit);
+    lv_obj_remove_style_all(like_btn);
+    lv_obj_set_size(like_btn, UI_PX_H(32), UI_PX_H(32));
+    lv_obj_set_style_bg_opa(like_btn, LV_OPA_TRANSP, LV_PART_MAIN);  /* 不加按钮底 */
+    lv_obj_remove_flag(like_btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(like_btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_align(like_btn, LV_ALIGN_TOP_RIGHT, 0, 0);
+
+    lv_obj_t *like_img = lv_image_create(like_btn);
+    lv_image_set_src(like_img, &heart_off);
+    lv_obj_center(like_img);
+    /* 位图烘的是纯白，颜色全靠 recolor（点亮 #FF3E4C / 未点亮暗色） */
+    lv_obj_set_style_image_recolor(like_img, UI_COLOR_FG_DIM, LV_PART_MAIN);
+    lv_obj_set_style_image_recolor_opa(like_img, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_remove_flag(like_img, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_t *like_spin = lv_spinner_create(like_btn);
+    lv_obj_set_size(like_spin, UI_PX_H(24), UI_PX_H(24));
+    lv_obj_set_style_arc_width(like_spin, UI_PX_H(3), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(like_spin, UI_PX_H(3), LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(like_spin, UI_COLOR_PILL, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(like_spin, UI_COLOR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_remove_flag(like_spin, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(like_spin, LV_OBJ_FLAG_HIDDEN);   /* 只在请求期间转 */
+    lv_obj_center(like_spin);
+
+    music_view_player_bind_like(like_btn, like_img, like_spin);
 
     lv_obj_t *times = lv_obj_create(right);
     lv_obj_remove_style_all(times);
@@ -346,6 +394,8 @@ lv_obj_t *music_view_player_build(void)
     lv_obj_add_event_cb(scr, music_view_player_page_delete_cb, LV_EVENT_DELETE, NULL);
 
     music_view_player_build_prepare();
+    /* 立刻把主题色贴上去（否则要等第一个 500 ms tick 才不"发琥珀色"） */
+    music_view_player_accent_apply();
 
     /*
      * 进播放器页时的封面：

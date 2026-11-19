@@ -45,8 +45,8 @@ bool os_song_from_json(const cJSON *song, online_song_t *out);
 /* 数组批量转换，返回实际条数（0 → ESP_ERR_NOT_FOUND） */
 esp_err_t os_fill_songs(const cJSON *arr, online_song_t *out, size_t max, size_t *out_n);
 
-/* 解析 meting 返回的 JSON 数组 → 歌曲数组（*out 由本模块分配，调用方 free） */
-esp_err_t os_parse_songs_json(const char *json, online_song_t **out, size_t *out_count);
+/* ⚠ 2026-11：原 os_parse_songs_json()（meting 的 JSON 数组）已删除 ——
+ * meting 代理下线，歌单/搜索全部返回网易云原生对象，统一走 os_song_from_json()。 */
 
 #ifdef __cplusplus
 }

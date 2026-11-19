@@ -174,6 +174,14 @@ static volatile uint32_t s_tl_base_ms;   /**< 时间轴基准（换曲 0；seek 
 static volatile audio_out_t s_route = AUDIO_OUT_SPEAKER;
 static volatile int      s_volume = 55;
 
+/*
+ * 可视化用的 PCM 监视回调（见 audio_service_set_pcm_monitor 的注释）。
+ * 只在写硬件**之后**被调用，跑在输出任务上下文 —— 回调必须立刻返回。
+ * s_pcm_cb 后写、s_pcm_user 先写：换订阅方时不会出现"新 user 配旧 cb"的组合。
+ */
+static audio_service_pcm_cb_t s_pcm_cb;
+static void                  *s_pcm_user;
+
 /* 重采样 */
 static esp_asrc_handle_t s_asrc;
 static uint32_t          s_src_rate;
@@ -416,10 +424,24 @@ static bool asrc_hw_rate_ok(uint32_t hz)
  * 内部 RAM 真不够时才退回 PSRAM —— 此时地址与长度都已按 align 对齐，
  * 组件的对齐检查仍然能过（是合法配置，只是多两次 cache 操作）。
  */
-static uint8_t *asrc_buf_alloc(size_t size, size_t align, const char *what)
+static uint8_t *asrc_buf_alloc(size_t size, size_t align, const char *what, bool want_dma)
 {
     if (align < 4) {
         align = 4;
+    }
+    if (!want_dma) {
+        /*
+         * ★ 软件重采样：CPU 直接读写这两块缓冲，**不需要 DMA 能力**，一律放 PSRAM。
+         *
+         * 为什么不是"内部 RAM 优先"（2026-11 改）：96k/24bit 这类高解析源必然走软件
+         * 路径，而它恰好在播放大文件（SD 读最频繁）的时候把内部 DMA 堆吃得只剩几
+         * 百字节 —— sdmmc 每读一块都要临时 `heap_caps_malloc(≥512, MALLOC_CAP_DMA)`，
+         * 申请不到就 `sdmmc_read_blocks failed (0x101)`，FATFS 的读直接失败
+         * （真机表现：封面/歌词解析出 0 行、FLAC 解码器 ABORTED）。
+         * 软件路径用 PSRAM 没有任何额外代价（本来就要 memcpy 一遍到 __ 里的 out 缓冲）。
+         */
+        return (uint8_t *)heap_caps_aligned_alloc(align, size,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     uint8_t *p = (uint8_t *)heap_caps_aligned_alloc(
         align, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
@@ -430,6 +452,32 @@ static uint8_t *asrc_buf_alloc(size_t size, size_t align, const char *what)
             align, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     return p;
+}
+
+/*
+ * 内部 DMA 池的（重新）预留。
+ *
+ * `audio_output_init()` 会在开机时先预留一次（那时内存最干净）；但软件路径的会话
+ * 会把它还回堆（见 asrc_open 里的长注释），所以**每次硬件会话开 ASRC 前都要确认一次**。
+ * 预留失败不致命：调用方会退回 asrc_buf_alloc() 的"内部 → PSRAM"两级降级。
+ */
+static bool asrc_pool_ensure(void)
+{
+    if (s_asrc_pool) {
+        return true;
+    }
+    s_asrc_pool = (uint8_t *)heap_caps_aligned_alloc(
+        64, ASRC_POOL_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    if (!s_asrc_pool) {
+        ESP_LOGW(TAG, "asrc buffer pool 预留失败（%u B，DMA 堆紧张）—— 退回按需分配",
+                 (unsigned)ASRC_POOL_BYTES);
+        s_asrc_pool_sz = 0;
+        return false;
+    }
+    s_asrc_pool_sz = ASRC_POOL_BYTES;
+    ESP_LOGI(TAG, "asrc buffer pool: %u B @ %p (internal RAM, 64B aligned)",
+             (unsigned)s_asrc_pool_sz, s_asrc_pool);
+    return true;
 }
 
 static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
@@ -588,7 +636,27 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
      * 池装不下才退回按需分配（会再走一次"内部 RAM → PSRAM"的两级降级）。
      */
     const size_t in_al = (s_in_cap + align - 1) & ~(align - 1);
-    if (s_asrc_pool && (in_al + cap_sz) <= s_asrc_pool_sz) {
+    /*
+     * ★★ 内部池只给**硬件路径**用（2026-11 改）。
+     *
+     * 池子是 14 KB `MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA`，`audio_output_init()` 里
+     * 一次性预留、之后一直占着 —— 占的正是 SD 驱动临时 DMA 缓冲要用的那一小撮内存。
+     * 真机现场（96k/24bit FLAC，软件重采样）：
+     *     play stats: ... | mem int 26 KB (max 26) dma 1 psram 13385 KB
+     *     E sdmmc_cmd: allocate_dma_buf: not enough mem, err=0x101
+     *     E diskio_sdmmc: sdmmc_read_blocks failed (0x101)
+     * 软件路径（esp_ae_rate_cvt）用 CPU 读写缓冲，**根本不需要 DMA** ——
+     * 所以一旦判定走软件路，就把这块池子还回堆，改从 PSRAM 切（见 asrc_buf_alloc）。
+     * 之后若又遇到需要硬件的会话，asrc_pool_ensure() 会重新预留。
+     */
+    if (!s_asrc_hw && s_asrc_pool) {
+        ESP_LOGI(TAG, "asrc: 软件路径不需要 DMA，释放 %u B 内部池（还给 SD/蓝牙的 DMA 堆）",
+                 (unsigned)s_asrc_pool_sz);
+        heap_caps_free(s_asrc_pool);
+        s_asrc_pool    = NULL;
+        s_asrc_pool_sz = 0;
+    }
+    if (s_asrc_hw && asrc_pool_ensure() && (in_al + cap_sz) <= s_asrc_pool_sz) {
         s_in_buf        = s_asrc_pool;
         s_out_buf       = s_asrc_pool + in_al;
         s_bufs_from_pool = true;
@@ -598,8 +666,8 @@ static bool asrc_open(uint32_t src_rate, uint8_t src_ch)
             ESP_LOGW(TAG, "asrc pool %u B too small for in %u + out %u — fallback to heap",
                      (unsigned)s_asrc_pool_sz, (unsigned)in_al, (unsigned)cap_sz);
         }
-        s_in_buf  = asrc_buf_alloc(s_in_cap, align, "asrc in");
-        s_out_buf = asrc_buf_alloc(cap_sz, align, "asrc out");
+        s_in_buf  = asrc_buf_alloc(s_in_cap, align, "asrc in", s_asrc_hw);
+        s_out_buf = asrc_buf_alloc(cap_sz, align, "asrc out", s_asrc_hw);
     }
     if (!s_in_buf || !s_out_buf) {
         ESP_LOGE(TAG, "asrc buffer alloc failed (in %u B / out %u B)",
@@ -749,6 +817,16 @@ static void write_out(const uint8_t *pcm, size_t bytes, audio_out_t route, int v
         }
     }
     s_stats_last_ms = now;
+
+    /*
+     * 可视化订阅（播放器页的频谱）。**放在最后**：先把时间轴/统计/出声标志写完整，
+     * 回调里就不会看到半更新的状态。这里已经在会话锁之外，回调只允许做
+     * memcpy 级的动作（见头文件里的三条纪律）。
+     * bytes/4 = 帧数（48k/16bit/2ch）；不足一帧的残块直接跳过。
+     */
+    if (s_pcm_cb && bytes >= 4) {
+        s_pcm_cb((const int16_t *)pcm, bytes / 4, s_pcm_user);
+    }
 }
 
 /**
@@ -796,11 +874,17 @@ static void stats_tick(void)
     const uint32_t mem_int    = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024u;
     const uint32_t mem_intmax = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024u;
     const uint32_t mem_dma    = heap_caps_get_free_size(MALLOC_CAP_DMA) / 1024u;
+    /*
+     * DMA 的**最大可分配块**：SD 驱动每读一块都要临时 `heap_caps_malloc(≥512, MALLOC_CAP_DMA)`
+     * （esp-idf/components/sdmmc/sdmmc_cmd.c 的 allocate_dma_buf，会一路折半到单块 512 B，
+     * 连 512 B 都拿不到才报 `not enough mem, err=0x101`）。所以这一列见底 = SD 读随时会失败。
+     */
+    const uint32_t mem_dmamax = heap_caps_get_largest_free_block(MALLOC_CAP_DMA) / 1024u;
     const uint32_t mem_psram  = heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024u;
     ESP_LOGI(TAG, "play stats: PCM %u KB/s | 产 %u ms / 墙 %u ms (%u.%u%%) | codec %llu ms, "
                   "asrc %llu ms (cpu %llu ms), wait %llu ms | gap max %u ms, calls %u, "
                   "ring free %u B, route %d, src %u Hz %uch/%ubit%s%s | mem int %u KB "
-                  "(max %u) dma %u psram %u KB",
+                  "(max %u) dma %u (max %u) psram %u KB",
              (unsigned)kbps, (unsigned)audio_ms, (unsigned)win,
              (unsigned)(permille / 10), (unsigned)(permille % 10),
              (unsigned long long)(s_stats_codec_us / 1000),
@@ -811,7 +895,8 @@ static void stats_tick(void)
              (int)s_route, (unsigned)s_src_rate, s_src_ch, (unsigned)s_src_bits,
              s_asrc ? (s_asrc_hw ? " (asrc-hw)" : " (asrc-sw)") : "",
              s_codec_err ? " [codec write errors!]" : "",
-             (unsigned)mem_int, (unsigned)mem_intmax, (unsigned)mem_dma, (unsigned)mem_psram);
+             (unsigned)mem_int, (unsigned)mem_intmax, (unsigned)mem_dma,
+             (unsigned)mem_dmamax, (unsigned)mem_psram);
 
     /*
      * 硬件路径的承诺是"ASRC 每 5 秒只花几百微秒"。若请求了硬件却仍占掉两成以上
@@ -1076,16 +1161,7 @@ esp_err_t audio_output_init(void)
      * 预分配失败也不致命：asrc_open() 会自动退回按需分配。
      */
     if (!s_asrc_pool) {
-        s_asrc_pool = (uint8_t *)heap_caps_aligned_alloc(
-            64, ASRC_POOL_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
-        if (s_asrc_pool) {
-            s_asrc_pool_sz = ASRC_POOL_BYTES;
-            ESP_LOGI(TAG, "asrc buffer pool: %u B @ %p (internal RAM, 64B aligned)",
-                     (unsigned)s_asrc_pool_sz, s_asrc_pool);
-        } else {
-            ESP_LOGW(TAG, "asrc buffer pool 预留失败（%u B）—— 将退回按需分配/PSRAM",
-                     (unsigned)ASRC_POOL_BYTES);
-        }
+        asrc_pool_ensure();     /* 失败不致命：asrc_open() 会退回按需分配 */
     }
 
     if (xTaskCreatePinnedToCore(out_task, "audio_out", OUT_TASK_STACK, NULL, OUT_TASK_PRIO,
@@ -1303,4 +1379,10 @@ uint64_t audio_output_played_bytes(void)
 void audio_output_pa(bool on)
 {
     bsp_audio_pa_enable(on);
+}
+
+void audio_output_set_pcm_monitor(audio_service_pcm_cb_t cb, void *user)
+{
+    s_pcm_user = user;
+    s_pcm_cb   = cb;
 }

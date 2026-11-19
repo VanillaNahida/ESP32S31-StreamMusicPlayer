@@ -8,6 +8,7 @@ idf_component_register(
          "mm_probe.cc"          # MP3/FLAC/WAV/ADTS 参数探测 + 魔数分派
          "mm_tags.cc"           # 文本标签：MP3(ID3v2) / FLAC(VORBIS_COMMENT) 的专辑·作曲家
          "mm_lyrics_file.cc"    # 歌词三级查找 + /lrc 落盘
+         "mm_mem.cc"            # 大块临时缓冲：PSRAM 优先（内部 RAM 只剩几十 KB）
          "gbk_table.c"
     INCLUDE_DIRS "include"
     # 封面解码：JPEG 用 esp_new_jpeg，PNG 用官方 libpng 组件（它自带 zlib）。

@@ -104,16 +104,36 @@ static void on_bt_media_ctrl(int cmd, void *user)
  * 蓝牙控制器 `orca_ems_env_init malloc pool failed` 之后在错误路径里 panic）
  * 根因是**内部 RAM 不够**，但没有数字就只能在改动之间猜。这行日志把
  * "内部 RAM 当前/历史最低 + PSRAM 当前"摊开，下一次任何内存相关的现象都能当场定位。
- *   内部 RAM 是关键：Wi-Fi / 蓝牙的协议栈与控制器的内存池**只能放内部 RAM**
- *   （只有 >16 KB 的普通 malloc 才会落 PSRAM，见 CONFIG_SPIRAM_USE_MALLOC 的
- *   ALWAYSINTERNAL 阈值）。
+ *   内部 RAM 是关键：Wi-Fi / 蓝牙的协议栈与控制器的内存池、DMA 缓冲**只能放内部 RAM**
+ *   （普通 malloc 只有 > CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL(4096) 才落 PSRAM，
+ *   小于它的块虽然优先内部、内部不够时也会回落到 PSRAM，见 CONFIG_SPIRAM_USE_MALLOC）。
+ *
+ *   largest（最大连续块）比 free 更能说明"还分不分得出东西"：碎片化时
+ *   free 看着还有几十 KB，largest 只有 1 KB，AES DMA 照样失败。
  */
 static void log_heap(const char *where)
 {
-    ESP_LOGI(TAG, "heap[%s]: internal free=%u min=%u | psram free=%u", where,
+    ESP_LOGI(TAG, "heap[%s]: internal free=%u min=%u largest=%u dma=%u | psram free=%u", where,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+}
+
+/*
+ * 运行期心跳（2026-11-16 加）。
+ *
+ * 用户的报障是"跑一阵子之后才崩"（233 s / 253 s 的 TLS 失败），开机那几个
+ * log_heap() 检查点看不到这种**运行期泄漏/碎片化**。这里每 60 s 打一行，
+ * 崩溃前最后一行就是现场的堆快照，不用再让用户重烧一版加日志。
+ */
+#define HEAP_BEAT_MS (60 * 1000)
+
+static void heap_beat_cb(void *arg)
+{
+    (void)arg;
+    log_heap("beat");
 }
 
 /* 起射频前要求的最低内部 RAM（实测 Wi-Fi 协议栈 + 蓝牙控制器池子要几十 KB） */
@@ -408,6 +428,19 @@ extern "C" void app_main(void)
      * 起不来（stdio 后端不支持等）只打一条警告，不影响其它功能。
      */
     (void)console_cmds_init();
+
+    /* 运行期堆心跳（见 heap_beat_cb）：崩之前的堆状态就靠它留证据 */
+    {
+        const esp_timer_create_args_t beat_args = {
+            .callback = heap_beat_cb,
+            .arg = NULL,
+            .name = "heap_beat",
+        };
+        esp_timer_handle_t beat = NULL;
+        if (esp_timer_create(&beat_args, &beat) == ESP_OK) {
+            esp_timer_start_periodic(beat, (uint64_t)HEAP_BEAT_MS * 1000ULL);
+        }
+    }
 
     /* 语音输入宿主层（WebSocket + 板载麦克风 + 识别期间自动暂停播放）。
      * 密钥来自 menuconfig（Component config → lvgl_pinyin_ime → Voice input）。*/

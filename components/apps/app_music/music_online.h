@@ -14,6 +14,7 @@
  */
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "online_service.h"
@@ -61,6 +62,14 @@ bool music_online_url_refresh(void);
  * **必须在 LVGL 任务上下文调用**。
  */
 void music_online_play(const online_song_t *songs, size_t count, size_t idx);
+
+/*
+ * 当前曲目是不是在线曲目；是的话把它的歌曲 id（十进制字符串）写进 out 并返回 true。
+ *
+ * 给"红心"用：本地曲目没有网易云 id，收藏按钮要据此隐藏。
+ * 纯查表，**任何任务都能调**（只读 music_state 与 on_songs）。
+ */
+bool music_online_current_id(char *out, size_t cap);
 
 /* 在线队列所有权交接（实现对外 API app_music_online_detach） */
 void music_online_detach(const online_song_t *songs);

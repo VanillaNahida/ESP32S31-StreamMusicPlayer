@@ -174,6 +174,14 @@ void music_view_lyric_spin_show(void)
     }
 }
 
+/* 缓冲转圈的弧色（默认 UI_COLOR_ACCENT）：播放器页主题色变化时改这里 */
+void music_view_lyric_set_accent(uint32_t rgb)
+{
+    if (s_buf_spin) {
+        lv_obj_set_style_arc_color(s_buf_spin, lv_color_hex(rgb), LV_PART_INDICATOR);
+    }
+}
+
 /* 按当前歌词缓冲重建歌词行；换曲与首次建页都要调 */
 void music_view_lyric_rebuild(void)
 {

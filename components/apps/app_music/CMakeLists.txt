@@ -6,6 +6,7 @@ idf_component_register(
         "music_player.cc"         # 播放控制：起播/换曲/播放暂停/事件/媒体键/seek 受理
         "music_tick.cc"           # 500 ms 常驻心跳：tick 主干拆成 13 段
         "music_online.cc"         # 在线队列所有权 / 异步准备 / 地址重刷 / 起播
+        "music_like.cc"           # 红心收藏（在线歌曲加/取消"我喜欢"，异步）
         "music_source_local.cc"   # 本地目录数据源（异步扫描线程 + SD 代次）
         "music_cover.cc"          # 封面解码线程 + 像素/描述符产权
         "music_view_player.cc"    # 播放器页：数值刷新/来源药丸/缓冲提示/seek 手势/封面贴图
@@ -14,6 +15,9 @@ idf_component_register(
         "music_view_local.cc"     # 本地音乐列表页
         "music_view_output.cc"    # 输出设备按钮 / 选择弹窗 / 音量键
         "music_info.cc"           # 歌曲信息弹窗（ⓘ 按钮：标签/参数/路径，可滑动）
+        "music_menu.cc"           # 播放器设置弹窗（FFT 开关 + 歌曲信息入口）
+        "music_theme.cc"          # 封面动态取色（HSV 色相直方图 -> 主题色）
+        "music_spectrum.cc"       # 音频可视化（esp-dsp FFT -> 对数频带 -> 频谱柱）
         "music_player_bg.cc"      # 播放器页背景图（assets/player_background.jpg，后台解码）
     INCLUDE_DIRS "include"
     REQUIRES
@@ -29,6 +33,8 @@ idf_component_register(
         online_service
         app_settings
         app_gallery        # 文件管理里点图片 -> gallery_open_path()（压栈打开图库）
+        espressif__esp-dsp # music_spectrum.cc: dsps_fft2r_fc32 / dsps_wind_hann_f32
+        nvs_flash          # music_spectrum.cc / music_like.cc：开关与 uid 落 NVS
 )
 
 # 内部头文件（music_*.h）放在组件根目录，同目录下用相对包含，不进 INCLUDE_DIRS

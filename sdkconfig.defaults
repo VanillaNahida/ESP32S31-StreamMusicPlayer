@@ -71,9 +71,11 @@ CONFIG_LV_THEME_DEFAULT_DARK=y
 #     python tools/gen_charset.py --gb2312-only && python tools/gen_font.py --no-large-bitmap
 CONFIG_LV_FONT_FMT_TXT_LARGE=y
 
-# 屏幕刷新周期：LVGL 默认 33 ms（30 FPS）。跟手动画的观感基本由帧率决定，
-# 15 ms ≈ 66 FPS 是 esp_lvgl_adapter README 与乐鑫 LVGL 性能 FAQ 共同的推荐值。
-CONFIG_LV_DEF_REFR_PERIOD=15
+# 屏幕刷新周期：与面板实际扫描率对齐。
+#   当前 RGB 时序 24 MHz → (800+40+20+1)×(480+10+5+1) ≈ 56 Hz，
+#   18 ms ≈ 55.6 FPS，刚好跟上；再快只会增加单 framebuffer 的总线争抢。
+#   （18 MHz 时面板只有 ≈42 Hz，对应 24 ms；换回 18 MHz 时记得同步改这里。）
+CONFIG_LV_DEF_REFR_PERIOD=18
 # 样式缓存：命中后省掉每次绘制时的样式链表查找，官方推荐的低风险提速项
 CONFIG_LV_OBJ_STYLE_CACHE=y
 
@@ -227,10 +229,10 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
 # 网易云 API 服务地址（二维码登录/账号歌单/每日推荐）—— 见 main/Kconfig.projbuild
-CONFIG_ONLINE_NETEASE_API_BASE="http://localhost:3000"
+# 默认值为 http://localhost:3000；按实际部署在 menuconfig 中修改，不要把私有地址提交进仓库。
 
-# 服务端访问鉴权 Token（Authorization: Bearer）—— 见 main/Kconfig.projbuild
-CONFIG_ONLINE_NETEASE_API_TOKEN="sk-kP0pF3yD4gF6aP2qW3lJ2wD8gV9zO"
+# 服务端访问鉴权：API Key（Authorization: Bearer ncm_…）—— 见 main/Kconfig.projbuild
+CONFIG_ONLINE_NETEASE_API_TOKEN=""
 
 # ---------------------------------------------------------------------------
 # 内置网易云 cookie（免扫码登录）—— 见 main/Kconfig.projbuild
@@ -283,13 +285,42 @@ CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
 # ---------------------------------------------------------------------------
 # TLS 接收缓冲 16 KB → 8 KB（2026-10-21）
 #
-# 内部 RAM 现在同时供着：LVGL、PCM ringbuf、**UAC 环形缓冲 19.2 KB**、
-# **ASRC 池 14 KB**、USB 三任务栈。MBEDTLS_INTERNAL_MEM_ALLOC=y 意味着 mbedTLS
-# 的 TLS 缓冲**只能从内部 RAM 拿**，16 KB 的 in-buffer 一旦拿不到就：
-#     E esp-aes: Failed to allocate memory
-#     E esp-tls-mbedtls: write error :-0x0084
-#     W online: GET failed (ESP_ERR_HTTP_WRITE_DATA)
 # 8 KB 仍大于绝大多数服务器的 TLS 记录（常见 ≤4 KB），风险很低、直接省 8 KB。
 # 不要降到 4 KB 以下：个别服务器会发 8/16 KB 记录，mbedTLS 会报 buffer_too_small。
 # ---------------------------------------------------------------------------
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+
+# ---------------------------------------------------------------------------
+# ★ mbedTLS 的内存改从 PSRAM 拿（2026-11-16，用户："重点优化内存占用，
+#   不要让 PSRAM 吃灰"）
+#
+# 旧配置 MBEDTLS_INTERNAL_MEM_ALLOC=y，每个 TLS 会话在**内部 RAM** 常驻
+# in 8 KB + out 4 KB + SSL ctx + X.509 解析 ≈ 十几 KB，而内部 RAM 只剩百来 KB。
+# 2026-11 真机就是这样崩的（233 s / 253 s 两个时间点，不是开机那一刻）：
+#     E esp-tls-mbedtls: mbedtls_ssl_setup returned -0x008D   <- PSA -141 内存不足
+#     E esp-aes: Failed to allocate memory                    <- AES DMA 对齐缓冲
+#     E esp-tls-mbedtls: write error :-0x0084
+#     W online: GET failed (ESP_ERR_HTTP_WRITE_DATA): 
+#
+# 改成 EXTERNAL_MEM_ALLOC 后 mbedTLS 的 calloc 走 heap_caps_calloc(SPIRAM)
+# （esp-idf/components/mbedtls/port/esp_mem.c:18），内部 RAM 只留硬件 AES/GCM
+# 每次操作临时要的那一小块 DMA 对齐缓冲（S31 上 AES_MAX_CHUNK_WRITE_SIZE=1600 B，
+# 见 components/mbedtls/port/aes/dma/esp_aes_dma_core.c:53-58）—— 比常驻 12 KB 划算。
+# ⚠ 依赖 SPIRAM_USE_MALLOC（本工程 y）。若哪天改成 CAPS_ALLOC 这条选项会消失。
+# ---------------------------------------------------------------------------
+# CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC is not set
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+
+# ---------------------------------------------------------------------------
+# ★ 16 KB 以下的 plain malloc 改用 PSRAM（2026-11-16）
+#
+# 默认 16384 意味着"小于 16 KB 的 malloc 一律落内部 RAM"，于是解码器缓冲、
+# LVGL 的图层/中块、JSON 小对象全挤在内部 RAM 里。降到 4096：4~16 KB 的块去
+# PSRAM，内部 RAM 留给只能内部的东西（Wi-Fi/蓝牙协议栈、DMA、任务栈、LVGL 小对象）。
+#
+# ⚠ 这两条必须一起看：
+#   - cJSON 不受这个阈值影响 —— 它的节点是几十字节的小对象，另有 hooks 显式走
+#     PSRAM（components/services/online_service/os_json_mem.cc）；
+#   - 任务栈、DMA 缓冲、Wi-Fi/LWIP 都由 IDF 用 heap_caps 显式指定 caps，不受影响。
+# ---------------------------------------------------------------------------
+CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096

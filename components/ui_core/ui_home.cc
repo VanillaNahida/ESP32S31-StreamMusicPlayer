@@ -113,21 +113,23 @@ static void clock_timer_cb(lv_timer_t *t)
     struct tm tmv;
     localtime_r(&now, &tmv);
 
-    /* 未校时（SNTP 前）显示占位，避免显示 1970 年 */
-    char hhmm[8];
+    /*
+     * 时钟文本统一由 ui_clock_text() 生成（状态栏用的是同一个函数）：
+     * 未校时给 `--:--`，校过时按"显示设置 → 时钟显秒"决定要不要带秒。
+     * 状态栏不用这里喂 —— 它自己的 500 ms 轮询会刷（见 ui_status_bar.cc）。
+     */
+    char txt[16];
+    ui_clock_text(txt, sizeof(txt));
     if (tmv.tm_year + 1900 < 2024) {
-        snprintf(hhmm, sizeof(hhmm), "--:--");
-        if (s_big_clock) lv_label_set_text(s_big_clock, "--:--");
+        if (s_big_clock) lv_label_set_text(s_big_clock, txt);
         if (s_date_row)  lv_label_set_text(s_date_row, "等待校时");
     } else {
-        snprintf(hhmm, sizeof(hhmm), "%02d:%02d", tmv.tm_hour, tmv.tm_min);
-        if (s_big_clock) lv_label_set_text_fmt(s_big_clock, "%02d:%02d", tmv.tm_hour, tmv.tm_min);
+        if (s_big_clock) lv_label_set_text(s_big_clock, txt);
         if (s_date_row) {
             lv_label_set_text_fmt(s_date_row, "%d月%d日 · %s",
                                   tmv.tm_mon + 1, tmv.tm_mday, weekday_cn(tmv.tm_wday));
         }
     }
-    ui_status_set_clock(hhmm, NULL);
 }
 
 /* ------------------------------------------------------------------ 首页 */

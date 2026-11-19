@@ -4,27 +4,34 @@ menu "Online music account (网易云账号)"
         string "网易云 API 服务地址 (NeteaseCloudMusicApi)"
         default "http://localhost:3000"
         help
-            自建 API 服务的根地址，二维码登录 / 账号歌单 / 每日推荐都发给它
-            （参考工程 D:\Codes\ESP32S31-StreamMusicPlayer\NeteaseCloudMusicApi，
-             即 @neteasecloudmusicapienhanced/api，默认监听 3000 端口）。
+            自建 API 服务的根地址，二维码登录 / 账号歌单 / 每日推荐 / 搜索 /
+            歌词 / 封面 / 播放直链都发给它（参考工程
+            @neteasecloudmusicapienhanced/api，默认监听 3000 端口）。
 
             ⚠ 注意：**ESP32 上的 localhost 指的是设备自己**，不是你的电脑。
-            服务跑在 PC 上时要填 PC 的局域网地址，例如 http://192.168.1.5:3000；
+            服务跑在 PC 上时要填 PC 的局域网地址，例如 http://192.168.1.100:3000；
             部署在公网就填公网地址（带端口）。
 
             这里的值只是**默认值**：运行期可以用 online_netease_api_base_set()
             （NVS 键 'online'/'nb'）临时覆盖，用于不重新烧固件就换地址。
 
     config ONLINE_NETEASE_API_TOKEN
-        string "API 访问令牌 (Authorization: Bearer)"
+        string "API Key (Authorization: Bearer ncm_…)"
         default ""
         help
-            服务端开启了访问鉴权时填这里（对应 NeteaseCloudMusicApi 的 .env 里
-            AUTH_TOKEN，调用方式是请求头 Authorization: Bearer <Token>）。
-            留空 = 不加鉴权头（服务端没开鉴权时用）。
+            **API Key** —— 2026-11 起的鉴权方式，由服务端管理面板签发，
+            形如 `ncm_` + 32 位字符（旧的 `.env` AUTH_TOKEN 服务端仍当 legacy key 认，
+            但新部署一律用 ncm_ key：它带独立的 rpm/rpd/并发配额与 IP 白名单）。
 
-            ⚠ Token 会编进固件（sdkconfig 里是明文），注意别把带敏感权限的
-            token 提交到公开仓库。
+            固件把它放进请求头 `Authorization: Bearer <key>`（服务端也认 `X-Api-Key`）。
+            留空 = 不加鉴权头（服务端没开鉴权时用；开了就是 401）。
+
+            ⚠ 账号 cookie 不再走查询串！2026-11 起服务端默认 cookie.allowQuery=false，
+            `?cookie=…` 会被 400 拒掉 —— 固件已改成 `X-Netease-Cookie` 头
+            （见 components/services/online_service/os_api.cc）。
+
+            ⚠ Key 会编进固件（sdkconfig 里是明文），注意别把带敏感权限的
+            key 提交到公开仓库。
 
     config ONLINE_NETEASE_CK_FILE
         string "内置网易云 cookie 文件 (相对工程根目录, 留空 = 不启用)"

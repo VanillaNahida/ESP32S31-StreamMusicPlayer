@@ -20,6 +20,7 @@
 #include "ui_metrics.h"      /* UI_PX_H：封面显示边长 */
 
 #include "music_state.h"
+#include "music_theme.h"     /* 封面主色：主题色跟随封面取色 */
 
 static const char *TAG = "app_music";
 
@@ -188,10 +189,19 @@ static void cover_task(void *arg)
         ESP_LOGD(TAG, "no cover for idx=%d (%s)", req->idx, esp_err_to_name(ret));
         px = NULL;
     }
+    /*
+     * 主题色：**在像素刚刚就绪时算**（同一块 RGB565，PSRAM 里现成的）。
+     * 放在这里而不是 LVGL 侧，是因为逐像素统计有几百微秒级开销，
+     * 解码线程里做完全不影响出声；放在 cover_ready 之前写，
+     * UI 贴新封面时就拿到配套的主题色，不会先亮一下旧颜色。
+     */
     st->cover_out     = px;
     st->cover_out_w   = w;
     st->cover_out_h   = h;
     st->cover_out_idx = req->idx;
+    st->cover_accent  = (px && w > 0 && h > 0)
+                            ? music_theme_rgb_from_cover((const uint16_t *)px, w, h)
+                            : 0;
     st->cover_ready   = true;
     st->cover_busy    = false;
     free(req);
@@ -247,6 +257,7 @@ void music_cover_place(uint8_t *px, int w, int h,
         lv_image_dsc_t *dsc = (lv_image_dsc_t *)calloc(1, sizeof(lv_image_dsc_t));
         if (!dsc) {
             media_meta_cover_free(px);
+            st->cover_accent = 0;       /* 贴不上图了：主题色跟着回落默认蔚蓝 */
             if (set_visible) {
                 set_visible(user, false);
             }
@@ -274,6 +285,8 @@ void music_cover_place(uint8_t *px, int w, int h,
     if (px) {
         media_meta_cover_free(px);      /* 页面/对象没了：没人要 */
     }
+    /* 没有封面了：主题色回落到默认蔚蓝（下一 tick 的 accent_apply 会重设样式） */
+    st->cover_accent = 0;
     if (set_visible) {
         set_visible(user, false);
     }

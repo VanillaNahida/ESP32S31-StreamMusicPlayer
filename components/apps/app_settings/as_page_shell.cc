@@ -114,6 +114,12 @@ const subpage_desc_t *as_sub_storage(void)
     return &SUB_STORAGE;
 }
 
+const subpage_desc_t *as_sub_display(void)
+{
+    static const subpage_desc_t SUB_DISPLAY = { page_display, "set_display" };
+    return &SUB_DISPLAY;
+}
+
 void as_push_subpage(const subpage_desc_t *sp)
 {
     if (!sp || !sp->create) {

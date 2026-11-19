@@ -10,6 +10,7 @@
  * **jpeg_free_align** —— 这一对必须成对，换掉任何一边就是堆损坏（蓝图 R2）。
  */
 #include "internal/mm_cover.h"
+#include "internal/mm_mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,7 +43,7 @@ static const char *TAG = "media_meta";
 esp_err_t mm_copy_image(uint8_t **out, size_t *out_len, bool *is_png,
                         const uint8_t *src, size_t len, bool png)
 {
-    uint8_t *buf = (uint8_t *)malloc(len);
+    uint8_t *buf = (uint8_t *)mm_alloc_big(len);
     if (!buf) {
         return ESP_ERR_NO_MEM;
     }
@@ -76,7 +77,7 @@ static esp_err_t flac_cover(FILE *f, uint8_t **out, size_t *out_len, bool *is_pn
         const size_t len = ((size_t)bh[1] << 16) | ((size_t)bh[2] << 8) | (size_t)bh[3];
 
         if (type == 6 && len > 32) {    /* PICTURE */
-            uint8_t *body = (uint8_t *)malloc(len);
+            uint8_t *body = (uint8_t *)mm_alloc_big(len);
             if (!body) {
                 return ESP_ERR_NO_MEM;
             }
@@ -222,7 +223,7 @@ esp_err_t mm_cover_from_file(const char *img_path, int max_dim,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    uint8_t *buf = (uint8_t *)malloc((size_t)sz);
+    uint8_t *buf = (uint8_t *)mm_alloc_big((size_t)sz);
     if (!buf) {
         return ESP_ERR_NO_MEM;
     }

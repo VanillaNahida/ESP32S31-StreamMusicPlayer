@@ -197,6 +197,16 @@ static bool get_err_retryable(esp_err_t e)
     case ESP_ERR_HTTP_FETCH_HEADER:       /* ← 上面那条 -0x0087 走的就是它 */
     case ESP_ERR_HTTP_INCOMPLETE_DATA:    /* 读到一半断流 / ret=-135 */
     case ESP_ERR_HTTP_EAGAIN:             /* 读数据超时（见 HTTP_TIMEOUT_MS 的注释） */
+    /*
+     * 2026-11 真机（用户报"歌曲拉取失败"）：TLS **写**请求失败，但根因在内存 ——
+     *     E esp-aes: Failed to allocate memory
+     *     E esp-tls-mbedtls: write error :-0x0084
+     *     E HTTP_CLIENT: Error write request
+     * 那会儿 Wi-Fi 刚连上、蓝牙正在连 A2DP，内部 RAM 见底，esp-aes 给 DMA 申请
+     * 16 字节对齐的内部缓冲失败（esp_aes_dma_core.c 的 heap_caps_aligned_alloc）。
+     * 这是瞬时压力而不是服务器表态，隔几百毫秒再来一次往往就过了 —— 值得重试。
+     */
+    case ESP_ERR_HTTP_WRITE_DATA:
     case ESP_ERR_TIMEOUT:
     case ESP_FAIL:                        /* esp_http_client_init/perfom 的笼统失败 */
         return true;
@@ -205,13 +215,23 @@ static bool get_err_retryable(esp_err_t e)
     }
 }
 
+/* 这条 URL 是不是指向**我们自己的 API 服务**（base 地址见 os_account.cc）。
+ * 只有对自家服务才发 Authorization / cookie —— 302 跳到 CDN 时绝不能带出去。 */
+static bool is_own_api(const char *url)
+{
+    const char *base = online_netease_api_base();
+    const size_t n = strlen(base);
+    return n > 0 && strncmp(url, base, n) == 0;
+}
+
 /*
  * 一次 GET = 最多四跳（自管 302，见文件头）。
  * `cur` 是**输入输出**：重试时可以从已经解析出来的最终地址继续，
- * 不必每次都从 http 重新跳一次 https（meting 就是这么 302 的）。
+ * 不必每次都从 http 重新跳一次 https（历史上 meting 就是这么 302 的）。
+ * `cookie` 非空时给**自家 base** 加 `X-Netease-Cookie` 头（语义见头文件）。
  */
-static esp_err_t http_get_hops(char *cur, size_t cur_cap, char **out, size_t *out_len,
-                               size_t max_len)
+static esp_err_t http_get_hops(char *cur, size_t cur_cap, const char *cookie,
+                               char **out, size_t *out_len, size_t max_len)
 {
     for (int hop = 0; hop < 4; hop++) {
         http_sink_t sink = {};
@@ -232,14 +252,18 @@ static esp_err_t http_get_hops(char *cur, size_t cur_cap, char **out, size_t *ou
          *   就超过 512 → 日志 `E HTTP_CLIENT: Out of buffer` + `GET failed (ESP_FAIL)`，
          *   表现为"扫码 803 成功了，但账号信息/歌单全拿不到"（2026-10 真机踩了两轮）。
          *   给到 4 KB，和 static url[NET_URL_MAX = 4096] 对齐。
+         *
+         * ★ 2026-11 服务端改策略后 cookie 从查询串搬到 `X-Netease-Cookie` 头
+         *   （最长 NET_COOKIE_SEND = 2 KB），请求头整段于是又长了一截 ——
+         *   再抬到 8 KB，别在"登录成功但所有账号接口都发不出去"上再踩第三次。
          */
-        cfg.buffer_size           = 4096;
+        cfg.buffer_size           = 8192;
         /*
          * ★★ 光是 buffer_size 不够！IDF 的 esp_http_client.c:1783 把**请求行**
          *   （method + path + "?" + query）拼进 `client->buffer_size_tx`，超了就报
          *   `E HTTP_CLIENT: Out of buffer` 并直接返回 -1 —— 而 **buffer_size_tx 是独立
-         *   字段**，默认只有 512，跟 buffer_size 无关。账号接口把整条 cookie 放在 query
-         *   里（~1 KB），必须显式把它也放大，否则请求根本发不出去（真机连踩两轮）。
+         *   字段**，默认只有 512，跟 buffer_size 无关。查询串长度现在回归正常
+         *   （cookie 不再拼在 URL 上），4 KB 绰绰有余。
          */
         cfg.buffer_size_tx        = 4096;
 
@@ -248,10 +272,25 @@ static esp_err_t http_get_hops(char *cur, size_t cur_cap, char **out, size_t *ou
             free(sink.buf);
             return ESP_FAIL;
         }
-        /* 访问鉴权：只对**我们自己的 API 基地址**加 Authorization 头（见 net_auth_hdr） */
-        const char *auth = net_auth_hdr();
-        if (auth[0] && strncmp(cur, online_netease_api_base(), strlen(online_netease_api_base())) == 0) {
-            esp_http_client_set_header(cli, "Authorization", auth);
+        /*
+         * 访问鉴权 + 账号 cookie：两者都**只对自家 API 基地址**发（见 net_auth_hdr /
+         * is_own_api）。重定向到 CDN 或第三方时，cookie 一分一毫都不能带出去。
+         */
+        if (is_own_api(cur)) {
+            const char *auth = net_auth_hdr();
+            if (auth[0]) {
+                esp_http_client_set_header(cli, "Authorization", auth);
+            }
+            /*
+             * ★ 2026-11 服务端新策略：cookie 只能走这个头。以前拼 `?cookie=<urlencoded>`
+             *   现在会被直接拒（HTTP 400 + {"code":400,"data":null,"msg":"Passing cookies
+             *   in the query string is disabled; send them in the X-Netease-Cookie header
+             *   or a POST body"}）。服务端会自己按 ';' 切成 name=value 对再拼回去，
+             *   所以这里发**压缩后的原始串**即可，不需要再做百分号编码。
+             */
+            if (cookie && cookie[0]) {
+                esp_http_client_set_header(cli, "X-Netease-Cookie", cookie);
+            }
         }
         esp_err_t ret = esp_http_client_perform(cli);
         const int status = esp_http_client_get_status_code(cli);
@@ -288,8 +327,18 @@ static esp_err_t http_get_hops(char *cur, size_t cur_cap, char **out, size_t *ou
                 snprintf(msg, sizeof(msg), "响应过大或内存不足(%u KB)", (unsigned)(sink.len / 1024));
                 os_state_set_last_error(msg);
             } else {
-                /* ⚠ url_for_log()：**不能**打整条 URL —— 账号接口的查询串里是登录 cookie */
-                ESP_LOGW(TAG, "GET failed (%s): %s", esp_err_to_name(ret), url_for_log(cur));
+                /*
+                 * ⚠ url_for_log()：**不能**打整条 URL —— 账号接口的查询串里是登录 cookie。
+                 * 顺手带上堆余量：TLS 的失败里有一半其实是"内部 RAM 没了"
+                 * （-0x0084 AES DMA 分不出缓冲 / -0x008D ssl_setup 内存不足），
+                 * 有这四列就能当场和网络错误区分开，不用再让用户重烧一遍加日志。
+                 */
+                ESP_LOGW(TAG, "GET failed (%s): %s | int free=%u max=%u dma max=%u psram=%u", 
+                         esp_err_to_name(ret), url_for_log(cur),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+                         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA),
+                         (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
                 char msg[64];
                 snprintf(msg, sizeof(msg), "网络错误 %s", esp_err_to_name(ret));
                 os_state_set_last_error(msg);
@@ -331,8 +380,8 @@ static esp_err_t http_get_hops(char *cur, size_t cur_cap, char **out, size_t *ou
  *   3) **慢失败不再重试**：`timeout_ms` 是"两次读之间"的上限，一次读超时就是 30 s，
  *      叠三次等于 90 s —— 而起播任务 / 歌单刷新都在这条线程上等着。
  */
-esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t max_len,
-                           int attempts)
+esp_err_t http_get_text_hdr_ex(const char *url, const char *cookie, char **out,
+                               size_t *out_len, size_t max_len, int attempts)
 {
     if (!url || !out || max_len == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -359,7 +408,7 @@ esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t 
             vTaskDelay(pdMS_TO_TICKS(wait_ms));
         }
         const int64_t t0 = esp_timer_get_time();
-        ret = http_get_hops(cur, sizeof(cur), out, out_len, max_len);
+        ret = http_get_hops(cur, sizeof(cur), cookie, out, out_len, max_len);
         if (ret == ESP_OK) {
             return ESP_OK;
         }
@@ -373,9 +422,21 @@ esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t 
     return ret;
 }
 
+esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t max_len,
+                           int attempts)
+{
+    return http_get_text_hdr_ex(url, NULL, out, out_len, max_len, attempts);
+}
+
+esp_err_t http_get_text_hdr(const char *url, const char *cookie, char **out, size_t *out_len,
+                            size_t max_len)
+{
+    return http_get_text_hdr_ex(url, cookie, out, out_len, max_len, HTTP_GET_ATTEMPTS);
+}
+
 esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max_len)
 {
-    return http_get_text_ex(url, out, out_len, max_len, HTTP_GET_ATTEMPTS);
+    return http_get_text_hdr_ex(url, NULL, out, out_len, max_len, HTTP_GET_ATTEMPTS);
 }
 
 esp_err_t http_download(const char *url, const char *dest, size_t min_size,

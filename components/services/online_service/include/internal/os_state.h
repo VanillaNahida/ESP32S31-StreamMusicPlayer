@@ -16,9 +16,11 @@
  *     cover/ 目录与 *.lrc 文件在 online_service_init() 时清掉。
  *
  *   HTTP 说明：
- *     - meting 的 API/歌词/封面都支持 **http**，走明文省掉 TLS 与时间同步依赖；
- *     - 音频是 302 到 https CDN，必须 TLS 校验（证书包已开），
- *       所以下载音频前要确认系统时间已经同步（SNTP 在 WiFi 拿到 IP 后启动）。
+ *     - 自建 API（CONFIG_ONLINE_NETEASE_API_BASE）可以是 http 或 https；
+ *       走 https 时证书校验需要正确时间（SNTP 在 WiFi 拿到 IP 后启动）。
+ *     - 音频是 https CDN，必须 TLS 校验（证书包已开）。
+ *     - ⚠ 2026-11 起 meting 已下线；封面仍保留"https 失败换同路径明文 http"
+ *       的降级（p*.music.126.net 两种协议都服务），见 os_media_cache.cc。
  *
  * 这里只放"多个 .cc 都要看"的常量与访问器；实现见 os_state.cc。
  * ⚠ 状态本身**无锁**（拆分前后一致）：所有 API 都是同步阻塞的，必须放在工作线程里
@@ -56,13 +58,34 @@ extern "C" {
 #define NVS_KEY_SH_FMT     "sh%d"      /* sh0..sh9 */
 /* 已登录账号昵称（重启后立刻能显示，不用等网络往返） */
 #define NVS_KEY_NICK       "nick"
+/* 已登录账号 uid（/likelist 必填；同上，省掉开机那次 /user/account 往返） */
+#define NVS_KEY_UID        "uid"
 
-/* ---------------------------------------------------------------- Meting 接口
- * 搜索接口在另一个路径上，而且关键词放在 id= 里：
- *   http://meting.xcnahida.cn/meting/api?server=netease&type=search&id=<关键词>
- * （/api?type=search&keywords=xxx 在该实例上会忽略关键词、返回固定列表，别用） */
-#define API_BASE           "http://meting.xcnahida.cn/api"
-#define API_SEARCH_BASE    "http://meting.xcnahida.cn/meting/api"
+/* ---------------------------------------------------------------- 在线接口一览
+ *
+ * ★ 2026-11：**meting 代理已被服务端删除**（/meting/api* 一律 404），
+ *   所有能力改走自建 NeteaseCloudMusicApiEnhanced（base = online_netease_api_base()）
+ *   的原生端点。基地址不在这里写死，见 os_account.h 的 NET_BASE_DEFAULT / NVS 'online'/'nb'。
+ *
+ *   搜索       /cloudsearch?keywords=&type=1&limit=   （首选，带 al.picUrl 封面）
+ *              /search?keywords=&type=1&limit=        （次选，老格式，album 里没有 picUrl）
+ *   歌单       /playlist/track/all?id=&limit=&offset= （分页，100 首/页）
+ *              /playlist/detail?id=                   （首屏兜底）
+ *   账号       /user/account、/user/playlist?uid=
+ *   推荐       /recommend/songs
+ *   播放直链   /song/url/v1?id=&level=
+ *   歌词       /lyric?id=                            （JSON：lrc.lyric 才是 LRC 文本）
+ *   封面       /song/detail?ids=                     （songs[0].al.picUrl；搜索命中常常没有）
+ *   红心       /like?id=&like=true|false             （加/取消"我喜欢"，必须登录）
+ *              /likelist?uid=                         （全量 id，游客返回空表）
+ *              /song/like/check?ids=                  （单曲是否已喜欢；本工程未用）
+ *   登录       /login/qr/key、/login/qr/create、/login/qr/check
+ *
+ *   鉴权：Authorization: Bearer <API Key>（ncm_ 前缀，CONFIG_ONLINE_NETEASE_API_TOKEN）
+ *        + X-Netease-Cookie: <压缩后的账号 cookie>（见 os_api.cc）。
+ */
+#define API_PATH_LYRIC       "/lyric?id=%u"
+#define API_PATH_SONG_DETAIL "/song/detail?ids=%u"
 
 /* ---------------------------------------------------------------- init 幂等标志 */
 bool os_state_ready(void);

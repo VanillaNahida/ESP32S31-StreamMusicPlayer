@@ -114,8 +114,9 @@ esp_err_t online_netease_account(online_account_t *out)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "account: 未登录或 cookie 已失效");
     } else {
-        /* 昵称落 NVS：重启后 UI 立刻能显示，不用等这次网络往返 */
+        /* 昵称 / uid 落 NVS：重启后 UI 立刻能显示，/likelist 也不用再等这次往返 */
         online_netease_nickname_set(out->nickname);
+        online_netease_uid_set(out->uid);
         ESP_LOGI(TAG, "account: %s (%s)", out->nickname, out->uid);
     }
     return ret;
@@ -370,12 +371,13 @@ esp_err_t online_netease_daily_songs(online_song_t *out, size_t max, size_t *out
 /*
  * 播放直链：**带当前登录 CK 请求自建中间件**（NeteaseCloudMusicApi 的 /song/url/v1）。
  *
- * ★ 这是本工程取"播放地址"的**唯一正路**（2026-10 用户要求）：
- *   meting 的 `type=url` 是**匿名**请求 —— 会员 / 数字专辑歌曲只会下发
+ * ★ 这是本工程取"播放地址"的**唯一正路**：
+ *   以前 meting 的 `type=url` 是**匿名**请求 —— 会员 / 数字专辑歌曲只会下发
  *   **30 秒试听片段**（真机实测 Content-Length 439 KB ≈ 128 kbps 的 27 秒，
  *   元数据时长却是整首 → 曾经把 seek 映射和进度条一起带偏，见 audio_engine_bitrate
- *   里那段说明）。带上账号 CK 之后，中间件返回的才是**完整**直链，会员歌能整首听。
- *   meting 退居"辅助"：歌词 / 封面 / 歌单列表照旧走它。
+ *   里那段说明）。带上账号 CK 之后才是**完整**直链，会员歌能整首听。
+ *   ⚠ 2026-11：meting 已下线，**连匿名兜底都没有了** —— 未登录时只能拿到
+ *   试听片段（freeTrialInfo 非空），界面会提示"没有完整版权"。
  *
  * 等级：先 `standard`（128 kbps，任何账号都拿得到），拿不到 URL 再试一次
  *   `exhigh`（320 kbps，VIP 有效）—— 有些歌只在更高等级下才有直链。
@@ -418,7 +420,16 @@ static esp_err_t song_url_try(const char *song_id, const char *level,
          */
         const cJSON *trial = cJSON_GetObjectItemCaseSensitive(first, "freeTrialInfo");
         if (trial && !cJSON_IsNull(trial)) {
-            *out_trial = true;
+            /*
+             * ⚠ 有些网关（含 2026-11 这套增强版的个别中间层）会把 JSON 的 null
+             *   序列化成**字符串 "null"**。cJSON_IsNull 只认真正的 null 字面量，
+             *   于是 "null" 会被当成"有试听信息" —— 每一首都会被误判成试听片段。
+             *   这里把字符串 "null" 也当成"没有"。
+             */
+            if (!(cJSON_IsString(trial) && trial->valuestring &&
+                  strcmp(trial->valuestring, "null") == 0)) {
+                *out_trial = true;
+            }
         }
         const cJSON *u = cJSON_GetObjectItemCaseSensitive(first, "url");
         if (cJSON_IsString(u) && u->valuestring && u->valuestring[0]) {

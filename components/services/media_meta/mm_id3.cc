@@ -19,6 +19,7 @@
 #include "esp_log.h"
 
 #include "internal/mm_bits.h"
+#include "internal/mm_mem.h"
 #include "internal/mm_cover.h"
 
 static const char *TAG = "media_meta";
@@ -73,7 +74,7 @@ esp_err_t mm_id3_cover(FILE *f, uint8_t **out, size_t *out_len, bool *is_png)
         }
 
         if (strcmp(id, "APIC") == 0 || strcmp(id, "PIC") == 0) {
-            uint8_t *body = (uint8_t *)malloc(fsz);
+            uint8_t *body = (uint8_t *)mm_alloc_big(fsz);
             if (!body) {
                 return ESP_ERR_NO_MEM;
             }
@@ -338,7 +339,7 @@ esp_err_t mm_id3_lyrics(FILE *f, char **out)
         const bool is_uslt = (strcmp(id, "USLT") == 0);
         const bool is_sylt = (strcmp(id, "SYLT") == 0);
         if ((is_uslt || is_sylt) && fsz >= 6 && fsz <= 128u * 1024u) {
-            uint8_t *body = (uint8_t *)malloc(fsz);
+            uint8_t *body = (uint8_t *)mm_alloc_big(fsz);
             if (!body) {
                 free(sylt);
                 return ESP_ERR_NO_MEM;

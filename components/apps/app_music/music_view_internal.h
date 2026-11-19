@@ -33,8 +33,13 @@ typedef struct {
     lv_obj_t *mode_btn;      /* 模式按钮里的图标 label */
     lv_obj_t *mode_badge;    /* 单曲循环的 "1" 角标 */
     lv_obj_t *btn_spinner;   /* 加载态：播放按钮里的转圈（懒建，与按钮同生共死） */
+    lv_obj_t *like_btn;      /* 红心按钮（进度条右上方，无背景，仅在线曲目可见） */
+    lv_obj_t *like_img;      /* 红心图标：点亮 heart_on / 未点亮 heart_off */
+    lv_obj_t *like_spin;     /* 请求进行中的转圈（与图标互斥显示） */
+    int       like_drawn;    /* 上次画的状态位（-1 = 强制重画） */
     bool      btn_busy;      /* 播放按钮当前是不是"加载中"（已禁用 + 转圈） */
     bool      seeking;       /* 手指正在拖进度条：期间别让 tick 覆盖它 */
+    uint32_t  accent_rgb;    /* 上次应用到控件上的主题色（0 = 还没画过，强制重画一次） */
 } music_player_ctrls_t;
 
 /* 播放器页控件表（页面不在时全部为 NULL）。

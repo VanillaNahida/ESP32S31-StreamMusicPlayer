@@ -9,6 +9,7 @@
  *   落盘失败只告警，不影响返回；目录不存在时 mkdir（已存在返回 EEXIST，忽略）。
  */
 #include "internal/mm_lyrics_file.h"
+#include "internal/mm_mem.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,7 +156,7 @@ esp_err_t mm_lyrics_load_file(const char *lrc_path, lrc_t *out)
         fclose(f);
         return ESP_ERR_INVALID_SIZE;
     }
-    char *buf = (char *)malloc((size_t)sz + 1);
+    char *buf = (char *)mm_alloc_big((size_t)sz + 1);
     if (!buf) {
         fclose(f);
         return ESP_ERR_NO_MEM;
