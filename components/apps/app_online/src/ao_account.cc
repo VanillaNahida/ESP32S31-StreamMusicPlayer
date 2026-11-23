@@ -13,6 +13,7 @@
  */
 #include "ao_account.h"
 
+#include "ao_provider.h"
 #include "ao_work.h"
 
 static const char *TAG = AO_TAG;
@@ -20,7 +21,8 @@ static const char *TAG = AO_TAG;
 /* ---- 第 0 页详情状态 ---- */
 static int       s_acct_page;        /* 账号歌单详情当前页号（0 起） */
 static bool      s_acct_detail;      /* true = 正在看某个账号歌单的歌曲列表 */
-static bool      s_acct_daily;       /* 详情来源：true = 每日推荐 */
+static bool      s_acct_daily;       /* 详情来源：true = 一次性推荐列表 */
+static int       s_acct_feed;        /* 推荐来源（AO_FEED_*，只影响标题） */
 static int       s_acct_sel = -1;    /* 详情对应的歌单下标 */
 static online_acct_playlist_t *s_acct_pls;   /* 账号歌单列表（本模块持有，LVGL 侧只读） */
 static size_t    s_acct_pls_n;
@@ -73,12 +75,28 @@ void ao_acct_detail_exit(void)
     s_acct_page   = 0;
 }
 
-void ao_acct_daily_enter(void)
+void ao_acct_feed_enter(int kind)
 {
     s_acct_daily  = true;
+    s_acct_feed   = kind;
     s_acct_sel    = -1;
     s_acct_detail = true;
     s_acct_page   = 0;
+}
+
+void ao_acct_daily_enter(void)
+{
+    ao_acct_feed_enter(AO_FEED_NETEASE_DAILY);
+}
+
+int ao_acct_feed(void)
+{
+    return s_acct_feed;
+}
+
+void ao_acct_feed_set(int kind)
+{
+    s_acct_feed = kind;
 }
 
 void ao_acct_pl_enter(int idx)
@@ -102,7 +120,7 @@ void ao_acct_detail_mark_closed(void)
 
 void ao_daily_loaded(void)
 {
-    /* 每日推荐是一整份（33 首左右），不需要懒加载 */
+    /* 一次性推荐列表是一整份（每日推荐 33 首 / QQ 两个源各 30 首），不需要懒加载 */
     s_acct_daily  = true;
     s_acct_detail = true;
     s_acct_page   = 0;
@@ -132,9 +150,17 @@ void ao_login_name_sync(void)
     if (s_login_name[0]) {
         return;
     }
-    const char *n = online_netease_nickname();
+    const char *n = ao_nickname();
     if (n && n[0]) {
         snprintf(s_login_name, sizeof(s_login_name), "%s", n);
+    }
+}
+
+/* 直接写昵称（QQ 的昵称是抓歌单时才知道的，见 ao_result.cc 的 OREQ_ACCT_PLS） */
+void ao_login_name_set(const char *name)
+{
+    if (name && name[0]) {
+        snprintf(s_login_name, sizeof(s_login_name), "%s", name);
     }
 }
 
@@ -279,7 +305,7 @@ void ao_login_success_forget(uint32_t now)
     /* 上个账号的昵称（NVS 里那份）不能留给新账号看：清掉，
      * 等下面那次 /user/account 回来再填 */
     s_login_name[0] = '\0';
-    online_netease_nickname_set(NULL);
+    ao_nickname_clear();
 }
 
 void ao_login_success_pull_account(void)

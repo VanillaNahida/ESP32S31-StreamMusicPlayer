@@ -9,6 +9,8 @@
  *
  * 时间一律由本文件取好再传给模型（模型不 include LVGL）：`lv_tick_get()`。
  */
+#include <string.h>
+
 #include "lvgl.h"
 
 #include "online_service.h"
@@ -20,6 +22,7 @@
 #include "ao_model.h"
 #include "ao_pages.h"
 #include "ao_overlay.h"
+#include "ao_provider.h"
 #include "ao_work.h"
 
 /* 控件（页面容器由 ao_pages 持有；返回行挂在页容器上，故这里也持有） */
@@ -44,18 +47,23 @@ lv_obj_t *ao_acct_list(void)
 static void acct_back_clicked(lv_event_t *e)
 {
     (void)e;
+    ao_collect_ctx_clear();
     ao_acct_detail_exit();
     ao_acct_rebuild();
 }
 
-static void acct_daily_clicked(lv_event_t *e)
+/* 一次性推荐列表（每日推荐 / QQ 每日30首 / 私人雷达）：kind 见 ao_account.h 的 AO_FEED_* */
+static void acct_feed_clicked(lv_event_t *e)
 {
-    (void)e;
-    ao_acct_daily_enter();
+    const int kind = (int)(intptr_t)lv_event_get_user_data(e);
+    ao_collect_ctx_clear();       /* 推荐列表不是可编辑歌单 */
+    ao_acct_feed_enter(kind);
     ao_detail_mark_request(lv_tick_get());   /* 超时兜底计时（见 ao_detail_wait_rows） */
     ao_acct_rebuild();                       /* 先把"载入中"铺上，再发请求 */
     ao_list_scroll_top(s_acct_list);
-    ao_work_submit(OREQ_DAILY, NULL);        /* 每日推荐只有一份（33 首），不做懒加载 */
+    /* 一次一整份（30~33 首），不做懒加载 */
+    ao_work_submit(OREQ_DAILY, kind == AO_FEED_QQ_DAILY ? "guess"
+                            : kind == AO_FEED_QQ_RADAR ? "radar" : NULL);
 }
 
 static void acct_pl_clicked(lv_event_t *e)
@@ -65,6 +73,14 @@ static void acct_pl_clicked(lv_event_t *e)
         return;
     }
     const online_acct_playlist_t *p = ao_acct_playlists(NULL) + idx;
+    /* 记住"当前列表是哪个歌单"：长按 → 收藏浮层里的「删除」要用它的 dirid */
+    ao_collect_ctx_set(p->dirid, p->name);
+    if (p->track_count == 0) {
+        /* 空歌单（QQ 的「我喜欢的音乐」在没收藏时就是 0 首）：
+         * 不要进详情 —— 懒加载会按 0 首分配缓冲、再去要一页，然后一直转圈。 */
+        ui_toast("这个歌单还没有歌", 1600);
+        return;
+    }
     ao_acct_pl_enter(idx);
     ao_detail_mark_request(lv_tick_get());   /* 超时兜底计时（见 ao_detail_wait_rows） */
     /*
@@ -122,6 +138,31 @@ static void acct_reload_clicked(lv_event_t *e)
     ao_lazy_fetch_if_needed(lv_tick_get());
 }
 
+/*
+ * 重新拉当前账号歌单详情的**第一页**（删除成功后用）。
+ *
+ * 直接复用"点开歌单"那条路：ao_lazy_begin 会把队列换成空壳（旧的交给播放器接管，
+ * 见 ao_model.cc 的 ao_queue_drop_stale），所以正在播的那首不会被打断。
+ */
+void ao_acct_detail_refresh(void)
+{
+    if (!ao_acct_detail() || !s_acct_list) {
+        return;
+    }
+    const int sel = ao_acct_sel();
+    const size_t n = ao_acct_pls_count();
+    if (sel < 0 || (size_t)sel >= n) {
+        return;                     /* 每日推荐没有懒加载缓冲 */
+    }
+    const online_acct_playlist_t *p = ao_acct_playlists(NULL) + sel;
+    if (!ao_lazy_begin(p->id, (size_t)p->track_count)) {
+        return;
+    }
+    ao_acct_page_set(0);
+    ao_acct_rebuild();
+    ao_lazy_fetch_if_needed(lv_tick_get());
+}
+
 void ao_acct_rebuild(void)
 {
     if (!s_acct_list || !s_acct_hint) {
@@ -137,10 +178,10 @@ void ao_acct_rebuild(void)
      *   那一次读不到并不代表没登录过（见 online_netease_cookie_reload 的说明）。
      *   不这么做，重启后进这一页会一直停在"登录后显示你的歌单"，歌单自然也拉不出来。
      */
-    if (!online_netease_logged_in()) {
-        online_netease_cookie_reload();
+    if (!ao_logged_in()) {
+        ao_login_state_reload();
     }
-    const bool in = online_netease_logged_in();
+    const bool in = ao_logged_in();
     ao_login_name_sync();
     if (!in) {
         ao_acct_logged_out_view();
@@ -160,7 +201,13 @@ void ao_acct_rebuild(void)
          * 第几页" —— 用户看到"已载入 100/637 首"就知道后面还能翻。
          */
         if (ao_acct_daily()) {
-            lv_label_set_text(s_acct_hint, "每日推荐");
+            static const char *const kFeedName[] = { "每日推荐", "每日30首", "私人雷达" };
+            int kind = ao_acct_feed();
+            if (kind < 0 || kind > AO_FEED_QQ_RADAR) {
+                kind = AO_FEED_NETEASE_DAILY;
+            }
+            lv_label_set_text_fmt(s_acct_hint, "%s · %u 首", kFeedName[kind],
+                                  (unsigned)ao_queue_count());
         } else if (sel >= 0 && (size_t)sel < pls_n) {
             const online_acct_playlist_t *p = ao_acct_playlists(NULL) + sel;
             if (ao_acct_lazy()) {
@@ -247,7 +294,7 @@ void ao_acct_rebuild(void)
 
     /* ---------------- 未登录：提示 + 扫码登录 ---------------- */
     if (!in) {
-        lv_label_set_text(s_acct_hint, "网易云账号");
+        lv_label_set_text_fmt(s_acct_hint, "%s账号", ao_provider_account_name());
         lv_obj_t *box = lv_obj_create(s_acct_list);
         lv_obj_remove_style_all(box);
         lv_obj_set_size(box, LV_PCT(100), LV_SIZE_CONTENT);
@@ -267,7 +314,10 @@ void ao_acct_rebuild(void)
         lv_obj_set_style_text_font(t2, UI_FONT_SMALL, LV_PART_MAIN);
         lv_obj_set_style_text_color(t2, UI_COLOR_FG_DIM, LV_PART_MAIN);
         lv_obj_set_style_text_align(t2, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_label_set_text(t2, "用网易云音乐 App 扫码，\n即可获取你的账号歌单与每日推荐");
+        /* 两家能拿到的东西不一样：QQ 没有"每日推荐"入口，换成「我喜欢」 */
+        lv_label_set_text(t2, ao_is_qq()
+                                  ? "用手机 QQ 扫码，\n即可获取你的歌单与「我喜欢」"
+                                  : "用网易云音乐 App 扫码，\n即可获取你的账号歌单与每日推荐");
 
         lv_obj_t *btn = lv_button_create(box);
         lv_obj_set_style_bg_color(btn, UI_COLOR_ACCENT, LV_PART_MAIN);
@@ -276,7 +326,7 @@ void ao_acct_rebuild(void)
         lv_obj_t *bl = lv_label_create(btn);
         lv_obj_set_style_text_font(bl, UI_FONT_TEXT, LV_PART_MAIN);
         lv_obj_set_style_text_color(bl, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-        lv_label_set_text(bl, "扫码登录网易云");
+        lv_label_set_text(bl, ao_is_qq() ? "扫码登录 QQ 音乐" : "扫码登录网易云");
         lv_obj_center(bl);
         lv_obj_add_event_cb(btn, acct_login_clicked, LV_EVENT_CLICKED, NULL);
         return;
@@ -289,12 +339,12 @@ void ao_acct_rebuild(void)
     const char *name = ao_login_name();
     const size_t pls_n = ao_acct_pls_count();
     /* 头部一行：昵称（NVS 里那份先用着）+ 已经拿到几个歌单 */
+    const char *fallback = ao_is_qq() ? "QQ 音乐账号" : "网易云账号";
     if (ao_acct_pls_busy() && pls_n == 0) {
-        lv_label_set_text_fmt(s_acct_hint, "%s · 正在加载歌单…",
-                              name[0] ? name : "网易云账号");
+        lv_label_set_text_fmt(s_acct_hint, "%s · 正在加载歌单…", name[0] ? name : fallback);
     } else {
-        lv_label_set_text_fmt(s_acct_hint, "%s · 歌单 %u 个",
-                              name[0] ? name : "网易云账号", (unsigned)pls_n);
+        lv_label_set_text_fmt(s_acct_hint, "%s · 歌单 %u 个", name[0] ? name : fallback,
+                              (unsigned)pls_n);
     }
 
     /* 网络没通时给一句明确的话（不是"正在加载"转到天荒地老） */
@@ -308,18 +358,42 @@ void ao_acct_rebuild(void)
         return;
     }
 
-    lv_obj_t *dr = ao_make_row(s_acct_list, LV_SYMBOL_BELL, 0xE8A33D, "每日推荐",
-                               "根据你的口味每天更新");
-    lv_obj_add_event_cb(dr, acct_daily_clicked, LV_EVENT_CLICKED, NULL);
+    /*
+     * 一次性推荐列表：
+     *   网易云 → 每日推荐（/recommend/songs）
+     *   QQ    → 每日30首（猜你喜欢连拿 6 次）+ 私人雷达（雷达 3 页）
+     * 两家都是一次请求拿整份，点进去走同一条"OWner=ACCT + DETAIL_KEY_DAILY"的路径。
+     */
+    if (!ao_is_qq()) {
+        lv_obj_t *dr = ao_make_row(s_acct_list, LV_SYMBOL_BELL, 0xE8A33D, "每日推荐",
+                                   "根据你的口味每天更新");
+        lv_obj_add_event_cb(dr, acct_feed_clicked, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)AO_FEED_NETEASE_DAILY);
+    } else {
+        lv_obj_t *daily = ao_make_row(s_acct_list, LV_SYMBOL_BELL, 0xE8A33D, "每日30首",
+                                      "每天为你挑 30 首");
+        lv_obj_add_event_cb(daily, acct_feed_clicked, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)AO_FEED_QQ_DAILY);
+        lv_obj_t *radar = ao_make_row(s_acct_list, LV_SYMBOL_GPS, 0x6C5CE7, "私人雷达",
+                                      "按你的口味滚动推荐");
+        lv_obj_add_event_cb(radar, acct_feed_clicked, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)AO_FEED_QQ_RADAR);
+    }
 
     const online_acct_playlist_t *pls = ao_acct_playlists(NULL);
     for (size_t i = 0; i < pls_n; i++) {
         char sub[64];
-        snprintf(sub, sizeof(sub), "%s · %d 首",
-                 pls[i].self_created ? "我创建的" : "收藏",
-                 pls[i].track_count);
-        lv_obj_t *row = ao_make_row(s_acct_list, LV_SYMBOL_LIST, 0x3E9E86,
-                                    pls[i].name, sub);
+        /* QQ 的「我喜欢的音乐」是服务层插进来的第一条（dirid=201） */
+        const bool fav = ao_is_qq() && strcmp(pls[i].id, ONLINE_QQ_FAV_KEY) == 0;
+        if (fav) {
+            snprintf(sub, sizeof(sub), "%d 首", pls[i].track_count);
+        } else {
+            snprintf(sub, sizeof(sub), "%s · %d 首",
+                     pls[i].self_created ? "我创建的" : "收藏", pls[i].track_count);
+        }
+        lv_obj_t *row = ao_make_row(s_acct_list,
+                                    fav ? LV_SYMBOL_AUDIO : LV_SYMBOL_LIST,
+                                    fav ? 0xE8475C : 0x3E9E86, pls[i].name, sub);
         lv_obj_add_event_cb(row, acct_pl_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
     }
     /* 列表还没到：转圈（用户要求："加载歌单这里也要转圈 + 加载出来再显示"） */

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ao_pages.cc —— **通用 LVGL 层**：页面骨架（三页 tab + 左右滑动切页）+ 控件工厂
  *
  * 网易云音乐是**三页左右滑动**：第 0 页"我的歌单"（网易云账号）、第 1 页"我添加的
@@ -29,6 +29,7 @@
 #include "ao_account.h"
 #include "ao_overlay.h"
 #include "ao_model.h"
+#include "ao_provider.h"
 
 #define PAGE_ANIM_MS  220        /* 三页左右滑动的动画时长（与 ui_router 同节奏） */
 
@@ -80,6 +81,11 @@ static void slide_exec_cb(void *var, int32_t v)
     if (w <= 0) {
         w = lv_display_get_horizontal_resolution(NULL);
     }
+    /*
+     * 三页必须每帧都摆正：只挪"当前 + 目标"两页时，被跳过的那页会停在
+     * 边界 x=±w；它的子对象/阴影/动画一旦越界，就可能和可见页叠在一起。
+     * （2026-11 用户报"点卡片切换元素重叠"，这里回退为全量摆位。）
+     */
     lv_obj_set_x(s_page_acct, -v);
     lv_obj_set_x(s_page_pl, w - v);
     lv_obj_set_x(s_page_srch, 2 * w - v);
@@ -274,15 +280,71 @@ lv_obj_t *ao_make_row(lv_obj_t *parent, const char *sym, uint32_t accent,
     return row;
 }
 
+/*
+ * 长按歌曲行 → 「收藏到歌单」（只有 QQ 音乐有：那边提供了 add_songs）。
+ *
+ * 为什么挂在长按而不是再加一个按钮：歌曲行本来就很窄，多一个按钮会挤掉歌名；
+ * 而"点一下起播"是主操作，不能动。LVGL 在派发过 LONG_PRESSED 之后**不会再补
+ * CLICKED**，所以长按不会顺手把歌点开。
+ */
+static int  s_collect_idx = -1;
+static bool s_collect_pending;
+
+/* 还按着就下一轮再看（同 ao_page_pl.cc 的长按菜单：按压期间建遮罩会被同一次松手关掉） */
+static void collect_deferred(void *arg)
+{
+    (void)arg;
+    if (!s_collect_pending) {
+        return;
+    }
+    const lv_indev_t *indev = lv_indev_active();
+    if (indev && lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
+        lv_async_call(collect_deferred, NULL);
+        return;
+    }
+    const int idx = s_collect_idx;
+    s_collect_pending = false;
+    s_collect_idx = -1;
+    if (idx >= 0 && (size_t)idx < ao_queue_count()) {
+        /* 当前列表属于哪个歌单（「删除」要用它的 dirid）；搜索结果/按 ID 的歌单是空串 */
+        ao_collect_open(idx, ao_collect_ctx_dirid());
+    }
+}
+
+static void song_row_long_pressed(lv_event_t *e)
+{
+    const int idx = (int)(intptr_t)lv_event_get_user_data(e);
+    if (!ao_is_qq()) {
+        return;                      /* 网易云侧没有这个能力（服务端没开放加歌） */
+    }
+    if (idx < 0 || (size_t)idx >= ao_queue_count() || s_collect_pending) {
+        return;
+    }
+    /* ★ 只记录目标 + 排一个异步调用：浮层等手指抬起来再建（见 collect_deferred） */
+    s_collect_idx     = idx;
+    s_collect_pending = true;
+    lv_async_call(collect_deferred, NULL);
+}
+
 /* 歌曲列表（歌单详情 / 搜索结果 / 账号歌单共用）：画 s_songs[first .. first+count) */
 void ao_fill_song_rows_range(lv_obj_t *list, size_t first, size_t count)
 {
     online_song_t *songs = ao_queue_songs();
     for (size_t i = 0; i < count; i++) {
         const size_t idx = first + i;
-        lv_obj_t *row = ao_make_row(list, LV_SYMBOL_AUDIO, 0x3E9E86,
+        /* 音源色：保持网易云原来的绿不放，QQ 用自己图标上的绿（略深一点） */
+        const uint32_t accent = (songs[idx].src == ONLINE_SRC_QQ) ? 0x2BB673 : 0x3E9E86;
+        lv_obj_t *row = ao_make_row(list, LV_SYMBOL_AUDIO, accent,
                                     songs[idx].title, songs[idx].artist);
-        lv_obj_add_event_cb(row, ao_online_row_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)idx);
+        /*
+         * ★ 点歌用 **SHORT_CLICKED** 而不是 CLICKED：LVGL 松手时会**无条件**补发 CLICKED
+         *   （长按之后也补），那样"长按收藏"会顺手把这首歌放起来。SHORT_CLICKED 只在
+         *   没长按的短点里发 —— 与「我添加的歌单」那页的列表行同一套处理。
+         */
+        lv_obj_add_event_cb(row, ao_online_row_clicked, LV_EVENT_SHORT_CLICKED,
+                            (void *)(intptr_t)idx);
+        lv_obj_add_event_cb(row, song_row_long_pressed, LV_EVENT_LONG_PRESSED,
+                            (void *)(intptr_t)idx);
     }
 }
 

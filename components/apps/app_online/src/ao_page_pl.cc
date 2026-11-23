@@ -23,6 +23,7 @@
 #include "ao_model.h"
 #include "ao_overlay.h"
 #include "ao_pages.h"
+#include "ao_provider.h"
 #include "ao_work.h"
 
 static lv_obj_t *s_pl_list;      /* 行容器（歌单行 / 歌曲行） */
@@ -96,6 +97,9 @@ static void pl_row_clicked(lv_event_t *e)
     if (!id) {
         return;
     }
+    /* 按 ID 添加的歌单没有 dirid（加/删歌要用目录 ID）→ 清掉收藏上下文，
+     * 长按浮层里的「删除」会提示"当前列表不是你的歌单" */
+    ao_collect_ctx_clear();
     ao_pl_detail_enter(idx);       /* sel=idx, detail=true, page=0（新歌单从第 1 页看起） */
     if (s_pl_hint) {
         lv_label_set_text(s_pl_hint, "载入中…");
@@ -372,17 +376,24 @@ void ao_pl_rebuild(void)
         lv_obj_set_style_text_color(h, UI_COLOR_FG_DIM, LV_PART_MAIN);
         lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
         lv_obj_set_width(h, LV_PCT(100));
-        lv_label_set_text(h, online_has_network()
-                                ? "还没有歌单：点右上角「+」添加网易云歌单 ID\n（也可以切到「歌曲搜索」直接找歌）"
-                                : "Wi-Fi 未连接：进「设置」连上网络再添加歌单");
+        char buf2[160];
+        snprintf(buf2, sizeof(buf2),
+                 online_has_network()
+                     ? "还没有歌单：点右上角「+」添加%s歌单 ID\n（也可以切到「歌曲搜索」直接找歌）"
+                     : "Wi-Fi 未连接：进「设置」连上网络再添加歌单",
+                 ao_provider_account_name());
+        lv_label_set_text(h, buf2);
         return;
     }
     for (size_t i = 0; i < n; i++) {
         const char *id = online_playlist_id(i);
         const char *nm = online_playlist_name(i);
+        /* QQ 的歌单键带 'q' 前缀（与网易云同号不同单，见 online_playlist_add_qq），
+         * 显示时把前缀藏掉 */
+        const char *shown_id = (id && id[0] == 'q' && id[1] >= '0' && id[1] <= '9') ? id + 1 : id;
         lv_obj_t *row = ao_make_row(s_pl_list, LV_SYMBOL_LIST, 0x5B6FB5,
-                                    (nm && nm[0]) ? nm : (id ? id : "歌单"),
-                                    (nm && nm[0]) ? id : NULL);
+                                    (nm && nm[0]) ? nm : (shown_id ? shown_id : "歌单"),
+                                    (nm && nm[0]) ? shown_id : NULL);
         lv_obj_add_event_cb(row, pl_row_clicked, LV_EVENT_SHORT_CLICKED, (void *)(intptr_t)i);
         /* 长按 = 重命名/更新/删除（需求："长按歌单项可重命名、更新、删除歌单"） */
         lv_obj_add_event_cb(row, pl_row_long_pressed, LV_EVENT_LONG_PRESSED, (void *)(intptr_t)i);

@@ -41,6 +41,8 @@ void music_view_player_build_prepare(void);
 
 void music_view_player_bind_cover(lv_obj_t *box, lv_obj_t *img);
 void music_view_player_bind_src_badge(lv_obj_t *badge);
+/* 渠道药丸（"网易云音乐" / "QQ音乐"，品牌色底）：本地曲目时自动隐藏 */
+void music_view_player_bind_provider_badge(lv_obj_t *badge);
 /* 标题 / 歌手。★ 必须绑：set_now_playing() 靠这两个指针换曲时刷新，
  *   漏绑的表现是"首次进页面正常、之后换曲标题不动"（2026-10 修过这个 bug）。 */
 void music_view_player_bind_now_playing(lv_obj_t *title, lv_obj_t *artist);

@@ -95,18 +95,26 @@ typedef enum {
     OREQ_LOAD,       /* arg = 歌单 ID */
     OREQ_SEARCH,     /* arg = 关键词 */
     OREQ_REMOVE,     /* arg = 歌单 ID */
-    OREQ_QR_KEY,     /* 网易云扫码：取 unikey + 二维码 PNG（无参数） */
-    OREQ_QR_POLL,    /* 网易云扫码：轮询，arg = unikey */
-    OREQ_LOGOUT,     /* 退出网易云登录 */
+    OREQ_QR_KEY,     /* 扫码：取 identifier + 二维码 PNG（无参数；网易云/QQ 由音源决定） */
+    OREQ_QR_POLL,    /* 扫码：轮询，arg = identifier（网易云是 unikey） */
+    OREQ_LOGOUT,     /* 退出登录 */
     OREQ_ACCOUNT,    /* 取账号信息（昵称） */
     OREQ_ACCT_PLS,   /* 账号歌单列表（worker 内部先取 uid） */
     OREQ_ACCT_SONGS, /* arg = 歌单 ID（账号歌单的歌曲） */
-    OREQ_DAILY,      /* 每日推荐歌曲 */
+    OREQ_DAILY,      /* 每日推荐 / 猜你喜欢 */
+    OREQ_COLLECT,    /* 收藏到歌单：arg = dirid，arg2 = 歌曲 id，arg3 = 歌单 dissid */
+    OREQ_UNCOLLECT,  /* 从当前歌单删除：arg = 当前歌单 dirid，arg2 = 歌曲 id */
 } oreq_kind_t;
 
 typedef struct {
     int  kind;
-    char arg[64];
+    /*
+     * arg 给到 192：QQ 的二维码 identifier 实测 128 字符（网易云的 unikey 只有
+     * 三四十），用 64 会把它截断，轮询就对不上了。
+     */
+    char arg[192];
+    char arg2[32];   /* OREQ_COLLECT/UNCOLLECT：歌曲 id */
+    char arg3[24];   /* OREQ_COLLECT：目标歌单的 dissid（判重用；可不填） */
     int  off;        /* OREQ_ACCT_SONGS：从歌单第几首开始取（懒加载分页用） */
     int  cnt;        /* OREQ_ACCT_SONGS：这次要取多少首 */
 } oreq_t;

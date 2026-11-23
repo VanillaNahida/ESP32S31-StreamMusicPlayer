@@ -20,6 +20,7 @@
 #include "esp_log.h"
 
 #include "audio_service.h"   /* 缓冲提示要取 速度/百分比（纯查询，取值给绘制用） */
+#include "online_service.h"  /* online_song_t / ONLINE_SRC_QQ：渠道药丸按来源着色 */
 #include "ui_core.h"
 #include "ui_icons.h"        /* heart_on / heart_off */
 #include "ui_metrics.h"
@@ -108,8 +109,54 @@ lv_obj_t *music_view_make_round_btn(lv_obj_t *parent, const char *sym, lv_event_
  * 为什么单独一行而不是挤进标题行：标题是整宽的 LONG_SCROLL_CIRCULAR label，
  * 同一行放别的对象会把它的滚动宽度吃掉。
  */
+/*
+ * 渠道药丸：紧挨着「在线播放」的品牌标签。
+ *
+ *   网易云音乐 → 品牌红 #C20C0C + 白字
+ *   QQ音乐     → 品牌绿 #31C27C + 深墨绿字（白字在这个绿上对比度太低，看不清）
+ *
+ * 只在在线曲目时出现；本地文件隐藏（本地没有"渠道"可言）。
+ * 它必须**独立**判断：切歌时"在线播放"可能不变，但来源会从网易云换到 QQ。
+ */
+static void apply_provider_badge(void)
+{
+    const music_state_t *st = music_state();
+    if (!s_c.provider_badge) {
+        return;
+    }
+    int provider = 0;                 /* 0=隐藏 1=网易云 2=QQ */
+    if (st->on_mode && st->on_songs && st->index >= 0 &&
+        (size_t)st->index < st->on_count) {
+        const online_song_t *song = &((const online_song_t *)st->on_songs)[st->index];
+        provider = (song->src == ONLINE_SRC_QQ) ? 2 : 1;
+    }
+    if (s_c.provider_badge_state == provider) {
+        return;                       /* 没变就别每 tick 重设样式 */
+    }
+    s_c.provider_badge_state = provider;
+    if (provider == 0) {
+        lv_obj_add_flag(s_c.provider_badge, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_remove_flag(s_c.provider_badge, LV_OBJ_FLAG_HIDDEN);
+    if (provider == 2) {
+        lv_label_set_text(s_c.provider_badge, "QQ音乐");
+        lv_obj_set_style_bg_color(s_c.provider_badge, lv_color_hex(0x31C27C), LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_c.provider_badge, lv_color_hex(0x06301C), LV_PART_MAIN);
+    } else {
+        lv_label_set_text(s_c.provider_badge, "网易云音乐");
+        lv_obj_set_style_bg_color(s_c.provider_badge, lv_color_hex(0xC20C0C), LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_c.provider_badge, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    }
+}
+
 void music_view_player_apply_src_badge(void)
 {
+    /*
+     * 渠道药丸先判：切歌时"在线/本地"可能没变（都是在线），但来源可能从网易云
+     * 换到 QQ —— 而下面那段会在状态没变时提前 return。
+     */
+    apply_provider_badge();
     const music_state_t *st = music_state();
     if (!s_c.src_badge) {
         return;
@@ -788,6 +835,13 @@ void music_view_player_bind_src_badge(lv_obj_t *badge)
     s_c.src_badge = badge;
     s_c.src_badge_state = -1;       /* 页面刚建：强制重画一次 */
     music_view_player_apply_src_badge();
+}
+
+void music_view_player_bind_provider_badge(lv_obj_t *badge)
+{
+    s_c.provider_badge = badge;
+    s_c.provider_badge_state = -1;  /* 页面刚建：强制重画一次 */
+    apply_provider_badge();
 }
 
 void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek)

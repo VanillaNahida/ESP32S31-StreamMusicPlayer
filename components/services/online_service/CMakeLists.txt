@@ -19,6 +19,9 @@ idf_component_register(
         "os_login.cc"
         "os_account.cc"
         "os_like.cc"
+        "os_qq.cc"
+        "os_qq_json.cc"
+        "os_qq_data.cc"
     INCLUDE_DIRS "include"
     REQUIRES
         esp_http_client

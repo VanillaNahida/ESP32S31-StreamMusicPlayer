@@ -5,8 +5,9 @@
  *
  * 做法与首页背景（ui_core/ui_home_bg.cc）保持一致，理由也一样：
  *   1. 图当 screen 的 bg_image（原尺寸居中 = 满屏），不额外建铺满屏幕的对象；
- *   2. 压暗一层（bg_image_recolor + opa）：播放器页左封面、右歌词/标题都是浅色，
- *      背景太亮会看不清；
+ *   2. 压暗烘进像素：播放器页左封面、右歌词/标题都是浅色，背景太亮会看不清。
+ *      解码完在 PSRAM 里一次性乘上暗化系数，之后只做普通 RGB565 贴图，
+ *      不再用 bg_image_recolor_opa（那会让 LVGL 每帧走 recolor_only()）；
  *   3. 800x480 JPEG 软解要几百毫秒 → 后台任务（core 0）解，解完持 LVGL 锁贴；
  *      像素缓冲常驻 PSRAM（约 770 KB），进页面不再重解。
  *
@@ -35,10 +36,35 @@ extern "C" const uint8_t _binary_player_bg_jpg_end[];
 /*
  * 压暗程度：0 = 原图，255 = 全黑。
  * 120（约 47%）与首页壁纸同一档 —— 再亮歌词/标题会糊，再暗就看不出图了。
+ * 这个值只在解码后一次性使用，不再参与每帧绘制。
  */
 #define PLAYER_BG_DIM_OPA   120
 #define PLAYER_BG_STACK     (8 * 1024)
 #define PLAYER_BG_LOCK_MS   2000
+
+/* 把压暗一次性烘进 RGB565 像素（等价于按 opa 叠一层黑）。只在解码任务里跑一次。 */
+static void dim_rgb565_in_place(uint8_t *px, int w, int h, int opa)
+{
+    if (!px || w <= 0 || h <= 0 || opa <= 0) {
+        return;
+    }
+    if (opa > 255) {
+        opa = 255;
+    }
+    const uint32_t keep = 255u - (uint32_t)opa;
+    uint16_t *p = (uint16_t *)px;
+    const size_t n = (size_t)w * (size_t)h;
+    for (size_t i = 0; i < n; i++) {
+        const uint16_t v = p[i];
+        uint32_t r = (v >> 11) & 0x1F;
+        uint32_t g = (v >> 5) & 0x3F;
+        uint32_t b = v & 0x1F;
+        r = (r * keep + 127u) / 255u;
+        g = (g * keep + 127u) / 255u;
+        b = (b * keep + 127u) / 255u;
+        p[i] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+}
 
 static uint8_t        *s_px;
 static lv_image_dsc_t *s_dsc;
@@ -54,8 +80,7 @@ static void player_bg_apply(void)
     lv_obj_set_style_bg_image_src(s_scr, s_dsc, LV_PART_MAIN);
     lv_obj_set_style_bg_image_opa(s_scr, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_image_tiled(s_scr, false, LV_PART_MAIN);   /* 原尺寸居中 = 满屏 */
-    lv_obj_set_style_bg_image_recolor(s_scr, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_recolor_opa(s_scr, PLAYER_BG_DIM_OPA, LV_PART_MAIN);
+    /* 压暗已经烘进像素（见 dim_rgb565_in_place），这里不再设 recolor。 */
 }
 
 /* 页面销毁时把指针清掉，否则解码任务会往已释放的 screen 上贴图（use-after-free） */
@@ -83,6 +108,9 @@ static void player_bg_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+    /* 一次性压暗：之后每帧只做普通 RGB565 贴图，不再走 LVGL 的 recolor_only()。 */
+    dim_rgb565_in_place(px, w, h, PLAYER_BG_DIM_OPA);
+
     s_px = px;
     s_dsc = (lv_image_dsc_t *)calloc(1, sizeof(lv_image_dsc_t));
     if (!s_dsc) {

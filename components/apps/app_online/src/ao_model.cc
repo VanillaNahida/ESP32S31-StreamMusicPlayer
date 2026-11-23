@@ -389,10 +389,38 @@ ao_page_outcome_t ao_lazy_handle_page(int off_i, int want, esp_err_t err, const 
     return AO_PAGE_FAILED;
 }
 
+/* ================================================================ 收藏上下文 */
+
+static char s_col_dirid[20];
+static char s_col_name[ONLINE_NAME_MAX];
+
+void ao_collect_ctx_set(const char *dirid, const char *name)
+{
+    snprintf(s_col_dirid, sizeof(s_col_dirid), "%s", (dirid && dirid[0]) ? dirid : "");
+    snprintf(s_col_name, sizeof(s_col_name), "%s", (name && name[0]) ? name : "");
+}
+
+void ao_collect_ctx_clear(void)
+{
+    s_col_dirid[0] = '\0';
+    s_col_name[0] = '\0';
+}
+
+const char *ao_collect_ctx_dirid(void)
+{
+    return s_col_dirid;
+}
+
+const char *ao_collect_ctx_name(void)
+{
+    return s_col_name;
+}
+
 /* ================================================================ 页面生命周期 */
 
 void ao_session_begin(uint32_t now)
 {
+    ao_collect_ctx_clear();              /* 新开的页面：还不知道在哪个歌单里 */
     ao_detail_mark_request(now);         /* 详情超时兜底的起点（别沿用上一轮页面的旧时刻） */
     ao_backoff_reset();                  /* 重新进 APP：重试节奏从头算（失败过也立刻再试） */
     /* 分页/懒加载：页码从第 1 页开始（静态变量跨页面实例存活，必须显式复位） */

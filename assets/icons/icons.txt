@@ -23,6 +23,8 @@
 assets/icons/netease.png            netease_logo        96
 assets/MomoTalk.png                 momotalk_logo       96
 assets/icons/gallery.png            gallery_logo        96     # 图库 App 桌面图标
+# QQ 音乐（与网易云并排放在桌面；源图 240x240 调色板 PNG，缩到 96）
+assets/icons/qqmusic.png            qqmusic_logo        96
 # 文件管理里「图片文件」那一行的小图标（24 px，与 16 px 字形图标视觉同档）
 assets/icons/gallery.svg            gallery_file        24
 

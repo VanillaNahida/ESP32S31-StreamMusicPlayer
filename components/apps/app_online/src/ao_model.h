@@ -105,6 +105,17 @@ typedef enum {
 ao_page_outcome_t ao_lazy_handle_page(int off, int want, esp_err_t err, const char *key,
                                       const online_song_t *page, size_t n);
 
+/* ---------------------------------------------------------------- 收藏上下文
+ *
+ * 「长按歌曲 → 收藏到歌单」浮层里的**删除**按钮要从"当前这首歌所在的歌单"里删歌，
+ * 所以进入某个歌单详情时要把它的 **dirid**（加/删歌要的是目录 ID，不是歌单 ID）记下来。
+ * 搜索页、按 ID 添加的歌单（没有 dirid）一律清空 —— 那时删除按钮只提示"无法删除"。
+ */
+void        ao_collect_ctx_set(const char *dirid, const char *name);
+void        ao_collect_ctx_clear(void);
+const char *ao_collect_ctx_dirid(void);   /* 空串 = 当前列表不属于可编辑歌单 */
+const char *ao_collect_ctx_name(void);
+
 /* ---------------------------------------------------------------- 页面生命周期 */
 
 /* page_online() 开头的一次性复位（详情计时起点 / 退避 / 页码 / 在途标志） */

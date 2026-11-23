@@ -63,6 +63,17 @@ bool music_online_current_id(char *out, size_t cap)
     return true;
 }
 
+/* 当前在线曲目的音源（见 music_online.h） */
+uint8_t music_online_current_src(void)
+{
+    const music_state_t *st = music_state();
+    const online_song_t *songs = on_songs();
+    if (!st->on_mode || !songs || st->index < 0 || (size_t)st->index >= st->on_count) {
+        return ONLINE_SRC_NETEASE;
+    }
+    return songs[st->index].src;
+}
+
 /* 本首已经"重刷过几次播放地址"。
  *
  * 网易云给的播放地址是**带时间戳 + 签名**的（`.../20261010132238/...mp3?vuutv=...`），
@@ -214,10 +225,24 @@ static void online_prepare_task(void *arg)
         ret = online_song_prepare(&req->song, path, sizeof(path));
         local_only = 1;
     } else if (ret != ESP_OK) {
-        /* 2) 流式地址拿不到（版权/网络）→ 退回"先下载再播" */
-        ESP_LOGW(TAG, "stream url failed (%s), fallback to download", esp_err_to_name(ret));
-        ret = online_song_prepare(&req->song, path, sizeof(path));
-        local_only = 1;
+        /*
+         * 2) 流式地址拿不到 → 退回"先下载再播"。
+         *
+         * ★ QQ 音乐例外（2026-11）：它的"下载兜底"走的是**同一条**取流接口
+         *   （online_song_prepare → online_song_stream_url → 又是 /qq/.../play_url），
+         *   所以"无权限 / 未登录"时再下也是白跑一趟（日志里那两条
+         *   "QQ 取流 …没有地址" 就是这么来的），只会多花 1~2 秒并让用户以为在加载。
+         *   所以 QQ 的取流失败（无权限 / 未登录 / 服务端 4xx / 网络）一律不重来，
+         *   直接把原因交给 tick 里的 Toast；用户再点一次就是一次干净的重试。
+         */
+        const bool qq_no_source = (req->song.src == ONLINE_SRC_QQ);
+        if (qq_no_source) {
+            ESP_LOGW(TAG, "QQ 歌曲没有可用音源 (%s)，不再尝试下载兜底", esp_err_to_name(ret));
+        } else {
+            ESP_LOGW(TAG, "stream url failed (%s), fallback to download", esp_err_to_name(ret));
+            ret = online_song_prepare(&req->song, path, sizeof(path));
+            local_only = 1;
+        }
     }
     /*
      * ⚠ 原来这里还有一个 "流式地址拿得到" 的 else 分支，只调一句

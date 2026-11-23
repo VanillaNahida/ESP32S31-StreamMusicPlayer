@@ -20,6 +20,8 @@
 
 #include "ui_core.h"
 
+#include "ao_provider.h"
+
 static const char *TAG = AO_TAG;
 
 static QueueHandle_t s_req_q;
@@ -48,6 +50,7 @@ static size_t        s_res_img_len;
 static volatile int  s_res_qr;         /* 800/801/802/803 */
 static online_acct_playlist_t *s_res_pls;   /* 账号歌单列表（调用方 free） */
 static size_t        s_res_pls_n;
+static char          s_res_id[192];         /* 扫码 identifier（QQ 128 字符） */
 
 static void work_publish(int kind, esp_err_t err, online_song_t *songs, size_t count, const char *msg)
 {
@@ -94,8 +97,12 @@ static void online_work_task(void *arg)
         }
         switch (req.kind) {
         case OREQ_ADD: {
-            ESP_LOGI(TAG, "fetch playlist %s ...", req.arg);
-            esp_err_t err = online_playlist_add(req.arg);
+            ESP_LOGI(TAG, "fetch playlist %s ... (%s)", req.arg,
+                     ao_is_qq() ? "QQ" : "netease");
+            /* 「我添加的歌单」按 ID 抓取：两家各走各的接口，落盘格式是同一份
+             * （记录里带 src/mid，见 os_pl_format.cc 的 rsv 扩展）。 */
+            esp_err_t err = ao_is_qq() ? online_playlist_add_qq(req.arg)
+                                       : online_playlist_add(req.arg);
             work_publish(OREQ_ADD, err, NULL, 0, req.arg);
             break;
         }
@@ -109,7 +116,8 @@ static void online_work_task(void *arg)
         case OREQ_SEARCH: {
             online_song_t *arr = NULL;
             size_t n = 0;
-            esp_err_t err = online_search(req.arg, &arr, &n, SEARCH_MAX);
+            esp_err_t err = ao_is_qq() ? online_qq_search(req.arg, &arr, &n, SEARCH_MAX)
+                                       : online_search(req.arg, &arr, &n, SEARCH_MAX);
             work_publish(OREQ_SEARCH, err, arr, n, req.arg);
             break;
         }
@@ -119,53 +127,117 @@ static void online_work_task(void *arg)
             break;
         }
         case OREQ_QR_KEY: {
-            /* 取 unikey + 二维码 PNG 合并成一次工作线程往返（服务端两步都是普通 GET） */
-            char key[64] = {0};
+            /*
+             * 取 identifier + 二维码 PNG，合并成一次工作线程往返。
+             *   网易云：/login/qr/key → unikey，再 /login/qr/create?qrimg=true
+             *   QQ    ：/qq/login/qrcode/qq 一次就给了 identifier + base64 PNG
+             * 两边的 identifier 都统一放进 s_res_id（QQ 的有 128 字符）。
+             */
+            static char ident[192];
+            ident[0] = '\0';
             uint8_t *img = NULL;
             size_t img_len = 0;
-            esp_err_t err = online_netease_qr_key(key, sizeof(key));
-            if (err == ESP_OK) {
-                err = online_netease_qr_create(key, NULL, 0, &img, &img_len);
+            esp_err_t err;
+            if (ao_is_qq()) {
+                err = online_qq_qr_create(ident, sizeof(ident), &img, &img_len);
+            } else {
+                err = online_netease_qr_key(ident, sizeof(ident));
+                if (err == ESP_OK) {
+                    err = online_netease_qr_create(ident, NULL, 0, &img, &img_len);
+                }
             }
             s_res_img     = img;          /* 必须在 work_publish 之前赋值（kind 是发布标志） */
             s_res_img_len = img_len;
-            work_publish(OREQ_QR_KEY, err, NULL, 0, key);
+            snprintf(s_res_id, sizeof(s_res_id), "%s", ident);
+            work_publish(OREQ_QR_KEY, err, NULL, 0, ident);
             break;
         }
         case OREQ_QR_POLL: {
+            /*
+             * 两家的状态码统一成网易云那套（ao_result.cc 的状态机只认一套）：
+             *   QQ_QR_DONE → NET_QR_OK(803)      QQ_QR_WAIT    → NET_QR_WAIT(801)
+             *   QQ_QR_CONFIRM → NET_QR_SCAN(802) QQ_QR_EXPIRED/REFUSED → NET_QR_EXPIRE(800)
+             */
             int code = 0;
-            esp_err_t err = online_netease_qr_poll(req.arg, &code);
+            esp_err_t err;
+            if (ao_is_qq()) {
+                int ev = -1;
+                err = online_qq_qr_poll(req.arg, &ev);
+                switch (ev) {
+                case QQ_QR_DONE:    code = NET_QR_OK;     break;
+                case QQ_QR_WAIT:    code = NET_QR_WAIT;   break;
+                case QQ_QR_CONFIRM: code = NET_QR_SCAN;   break;
+                case QQ_QR_EXPIRED: code = NET_QR_EXPIRE; break;
+                case QQ_QR_REFUSED: code = NET_QR_EXPIRE; break;
+                default:            code = 0;             break;
+                }
+            } else {
+                err = online_netease_qr_poll(req.arg, &code);
+            }
             s_res_qr = code;
             work_publish(OREQ_QR_POLL, err, NULL, 0, NULL);
             break;
         }
         case OREQ_LOGOUT: {
-            esp_err_t err = online_netease_logout();
+            esp_err_t err = ao_is_qq() ? online_qq_logout() : online_netease_logout();
             work_publish(OREQ_LOGOUT, err, NULL, 0, NULL);
             break;
         }
         case OREQ_ACCOUNT: {
             online_account_t acct = {};
-            esp_err_t err = online_netease_account(&acct);
+            esp_err_t err;
+            if (ao_is_qq()) {
+                /*
+                 * QQ 没有"账号信息"接口：昵称是抓歌单时顺手捡的（见 os_qq_data.cc），
+                 * 这里只做一次"是否还登录着"的判断 —— 凭证在就按成功处理。
+                 */
+                if (online_qq_logged_in()) {
+                    snprintf(acct.nickname, sizeof(acct.nickname), "%s", online_qq_nickname());
+                    err = ESP_OK;
+                } else {
+                    err = ESP_ERR_INVALID_STATE;
+                }
+            } else {
+                err = online_netease_account(&acct);
+            }
             work_publish(OREQ_ACCOUNT, err, NULL, 0, (err == ESP_OK) ? acct.nickname : NULL);
             break;
         }
         case OREQ_ACCT_PLS: {
-            /* 先拿 uid（顺带验证 cookie 还有效），再拉歌单列表 */
             online_account_t acct = {};
-            esp_err_t err = online_netease_account(&acct);
             online_acct_playlist_t *pls = NULL;
             size_t n = 0;
-            if (err == ESP_OK) {
-                pls = (online_acct_playlist_t *)calloc(ACCT_PL_MAX, sizeof(*pls));
-                if (pls) {
-                    err = online_netease_account_playlists(acct.uid, pls, ACCT_PL_MAX, &n);
-                } else {
-                    err = ESP_ERR_NO_MEM;
+            esp_err_t err;
+            if (ao_is_qq()) {
+                /* QQ：musicid / encryptUin 都在凭证里，不需要先问一次账号接口 */
+                err = online_qq_logged_in() ? ESP_OK : ESP_ERR_INVALID_STATE;
+                if (err == ESP_OK) {
+                    pls = (online_acct_playlist_t *)calloc(ACCT_PL_MAX, sizeof(*pls));
+                    if (pls) {
+                        err = online_qq_account_playlists(pls, ACCT_PL_MAX, &n);
+                    } else {
+                        err = ESP_ERR_NO_MEM;
+                    }
+                }
+            } else {
+                /* 先拿 uid（顺带验证 cookie 还有效），再拉歌单列表 */
+                err = online_netease_account(&acct);
+                if (err == ESP_OK) {
+                    pls = (online_acct_playlist_t *)calloc(ACCT_PL_MAX, sizeof(*pls));
+                    if (pls) {
+                        err = online_netease_account_playlists(acct.uid, pls, ACCT_PL_MAX, &n);
+                    } else {
+                        err = ESP_ERR_NO_MEM;
+                    }
                 }
             }
             s_res_pls   = pls;            /* 同样要在 work_publish 之前赋值 */
             s_res_pls_n = n;
+            /* QQ 的昵称是 online_qq_account_playlists() 在解析歌单时顺手存进 NVS 的，
+             * 所以要在**它之后**再读一次（上面那次读到的多半还是空的）。 */
+            if (ao_is_qq()) {
+                snprintf(acct.nickname, sizeof(acct.nickname), "%s", online_qq_nickname());
+            }
             work_publish(OREQ_ACCT_PLS, err, NULL, 0, acct.nickname);
             break;
         }
@@ -180,20 +252,59 @@ static void online_work_task(void *arg)
             const size_t want = (req.cnt > 0) ? (size_t)req.cnt : ACCT_FETCH_MAX;
             online_song_t *arr = (online_song_t *)calloc(want, sizeof(*arr));
             size_t n = 0;
-            esp_err_t err = arr ? online_netease_playlist_page(req.arg, (size_t)req.off,
-                                                               arr, want, &n)
-                                : ESP_ERR_NO_MEM;
+            esp_err_t err;
+            if (!arr) {
+                err = ESP_ERR_NO_MEM;
+            } else if (!ao_is_qq()) {
+                err = online_netease_playlist_page(req.arg, (size_t)req.off, arr, want, &n);
+            } else if (strcmp(req.arg, ONLINE_QQ_FAV_KEY) == 0) {
+                /* 「我喜欢的音乐」（dirid=201）不是歌单，走 fav/songs */
+                err = online_qq_fav_songs((size_t)req.off, arr, want, &n);
+            } else {
+                err = online_qq_playlist_page(req.arg, (size_t)req.off, arr, want, &n);
+            }
             s_res_off  = req.off;           /* 必须在 work_publish 之前写好 */
             s_res_want = (int)want;
             work_publish(OREQ_ACCT_SONGS, err, arr, n, req.arg);
             break;
         }
         case OREQ_DAILY: {
+            /*
+             * 一次性推荐列表，arg 区分来源：
+             *   ""       网易云 / 每日推荐
+             *   "guess"  QQ 每日30首（服务端把"猜你喜欢"连拿 6 次拼 30 首）
+             *   "radar"  QQ 私人雷达（服务端取 3 页拼 30 首）
+             */
             online_song_t *arr = (online_song_t *)calloc(ACCT_SONGS_MAX, sizeof(*arr));
             size_t n = 0;
-            esp_err_t err = arr ? online_netease_daily_songs(arr, ACCT_SONGS_MAX, &n)
-                                : ESP_ERR_NO_MEM;
-            work_publish(OREQ_DAILY, err, arr, n, "");
+            esp_err_t err;
+            if (!arr) {
+                err = ESP_ERR_NO_MEM;
+            } else if (ao_is_qq() && strcmp(req.arg, "radar") == 0) {
+                err = online_qq_radar_songs(arr, ACCT_SONGS_MAX, &n);
+            } else if (ao_is_qq() && strcmp(req.arg, "guess") == 0) {
+                err = online_qq_daily_songs(arr, ACCT_SONGS_MAX, &n);
+            } else {
+                err = online_netease_daily_songs(arr, ACCT_SONGS_MAX, &n);
+            }
+            work_publish(OREQ_DAILY, err, arr, n, req.arg);
+            break;
+        }
+        case OREQ_COLLECT: {
+            /*
+             * 收藏到歌单：arg = dirid（"我喜欢" 是 201），arg2 = 歌曲 id，
+             * arg3 = 目标歌单 dissid（服务端拿它判"是不是已经收藏过"）。
+             * 结果用 msg 区分：already / added —— 界面据此给不同提示。
+             */
+            bool already = false;
+            esp_err_t err = online_qq_song_add(req.arg, req.arg2, req.arg3, &already);
+            work_publish(OREQ_COLLECT, err, NULL, 0, already ? "already" : "added");
+            break;
+        }
+        case OREQ_UNCOLLECT: {
+            /* 从当前歌单删除：arg = 当前歌单 dirid，arg2 = 歌曲 id */
+            esp_err_t err = online_qq_song_del(req.arg, req.arg2);
+            work_publish(OREQ_UNCOLLECT, err, NULL, 0, req.arg);
             break;
         }
         default:
@@ -223,6 +334,33 @@ void ao_work_submit_ex(int kind, const char *arg, int off, int cnt)
 void ao_work_submit(int kind, const char *arg)
 {
     ao_work_submit_ex(kind, arg, 0, 0);
+}
+
+void ao_work_submit2(int kind, const char *arg, const char *arg2)
+{
+    ao_work_submit3(kind, arg, arg2, NULL);
+}
+
+void ao_work_submit3(int kind, const char *arg, const char *arg2, const char *arg3)
+{
+    if (!s_req_q) {
+        ui_toast("在线服务未就绪", 1500);
+        return;
+    }
+    oreq_t req = {};
+    req.kind = kind;
+    if (arg) {
+        snprintf(req.arg, sizeof(req.arg), "%s", arg);
+    }
+    if (arg2) {
+        snprintf(req.arg2, sizeof(req.arg2), "%s", arg2);
+    }
+    if (arg3) {
+        snprintf(req.arg3, sizeof(req.arg3), "%s", arg3);
+    }
+    if (xQueueSend(s_req_q, &req, 0) != pdTRUE) {
+        ui_toast("上一个操作还没做完", 1500);
+    }
 }
 
 void ao_work_set_page_alive(bool alive)
@@ -256,6 +394,7 @@ void ao_work_take(ao_result_t *out)
     out->qr      = s_res_qr;
     out->pls     = s_res_pls;
     out->pls_n   = s_res_pls_n;
+    snprintf(out->id, sizeof(out->id), "%s", s_res_id);
 
     s_res_songs = NULL;
     s_res_count = 0;
@@ -265,6 +404,7 @@ void ao_work_take(ao_result_t *out)
     s_res_img_len = 0;
     s_res_pls   = NULL;
     s_res_pls_n = 0;
+    s_res_id[0] = '\0';
 }
 
 void ao_work_discard_pending(void)

@@ -17,6 +17,7 @@
 
 #include "audio_service.h"
 #include "bsp.h"
+#include "online_service.h"    /* online_last_error()：失败时把服务侧的具体原因显示出来 */
 #include "play_state.h"
 #include "storage_service.h"
 #include "ui_core.h"
@@ -60,7 +61,13 @@ static void tick_online_ready(void)
         music_online_prepare_kick();
     } else if (st->on_failed) {
         st->on_failed = false;
-        ui_toast("在线歌曲获取失败（网络/版权限制？）", 2200);
+        /*
+         * 把服务侧的具体原因显示出来（"这首需要会员，且没有试听片段" /
+         * "请先登录 QQ 音乐（匿名只能放免费歌）" / "服务器返回 HTTP 401"）。
+         * 只报一句"获取失败"，用户根本不知道该登录、该开会员还是该重连 Wi-Fi。
+         */
+        const char *why = online_last_error();
+        ui_toast(why ? why : "在线歌曲获取失败（网络/版权限制？）", 2600);
         /* 缓冲提示不能留在屏上：把歌词区恢复成 歌词 / 暂无歌词
          * （buf_show 也要清掉，否则下一个 tick 又把"缓冲中…"写回去） */
         st->buf_show = false;
@@ -545,6 +552,19 @@ static void tick_adopt_stream_duration(void)
     music_state_t *st = music_state();
     if (!st->on_mode || st->on_stream_local || st->index < 0) {
         return;
+    }
+    /*
+     * ★ QQ 音乐例外（2026-11）：它的时长来自上游元数据（`interval`），是**准确值**；
+     *   而引擎那套"平均码率 × 文件大小"在 VBR 的 M500 文件上会明显偏小
+     *   —— 真机日志：`online duration: 192000 -> 138172 ms (stream-derived)`，
+     *   进度条与 seek 映射都会跟着错。
+     *   试听片段不在此列（那时 dur_ms 是 0，正好需要引擎给出的片段长度）。
+     */
+    if (st->dur_ms > 1000 && st->on_songs && (size_t)st->index < st->on_count) {
+        const online_song_t *s = &((const online_song_t *)st->on_songs)[st->index];
+        if (s->src == ONLINE_SRC_QQ) {
+            return;
+        }
     }
     audio_info_t info;
     if (!audio_service_get_info(&info) || info.duration_ms < 1000) {

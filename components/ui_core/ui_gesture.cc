@@ -57,21 +57,22 @@ static bool should_commit(int32_t dist, int32_t vel, int32_t span)
 
 /* ------------------------------------------------------------------ 返回过渡
  *
- * 两个常驻弹簧分别驱动两层 screen 的 translate_x：
+ * 只驱动顶层 screen 的 translate_x：
  *   s_spr_back_top   顶层页：0（在位） → UI_W（滑出屏幕）
- *   s_spr_back_under 底层页：-(UI_W/4)（视差起点） → 0
+ *
+ * 底层页**不再做视差平移**：它在滑动期间保持静止，LVGL 就不必每帧把下面
+ * 那一整屏也重绘一遍。800×480 下这是实打实的一整屏面积，返回手势的跟手感
+ * 主要来自顶层页，视觉上几乎看不出差别。
  *
  * **退栈被推迟到弹簧到位回调**（back_settle_cb），这一点是"可打断"的关键：
  * 在退栈真正发生之前，任何新触摸都能把 target 改回去，页面原路返回。
  */
 
 static ui_spring_t  s_spr_back_top;
-static ui_spring_t  s_spr_back_under;
-static lv_obj_t    *s_back_top;      /* 本次手势锁定的两层 screen */
-static lv_obj_t    *s_back_under;
+static lv_obj_t    *s_back_top;      /* 本次手势锁定的顶层 screen */
+static lv_obj_t    *s_back_under;    /* 只用于收尾时把可能残留的位移清零 */
 static back_phase_t s_back_phase = BACK_IDLE;
 static float        s_back_grab_top;    /* 手指按下瞬间顶层页的位移 */
-static float        s_back_grab_under;  /* 手指按下瞬间底层页的位移 */
 static bool         s_back_spr_ready;
 
 static void back_finish(bool commit);   /* 前向声明：on_press_lost 需要它收尾 */
@@ -128,14 +129,6 @@ static void back_top_apply(float v, void *user)
     }
 }
 
-static void back_under_apply(float v, void *user)
-{
-    (void)user;
-    if (s_back_under) {
-        lv_obj_set_style_translate_x(s_back_under, (int32_t)v, LV_PART_MAIN);
-    }
-}
-
 /* 统一的收尾动作：复位阶段与对象引用，必要时退栈。
  * 由"弹簧到位回调"和"起止点重合因而无需运动"两条路径共用。 */
 static void back_settle_apply(bool commit)
@@ -145,8 +138,7 @@ static void back_settle_apply(bool commit)
     }
     s_back_phase = BACK_IDLE;
 
-    /* 底层页行程（≤UI_W/4）始终短于顶层页（≤UI_W），必然先到位；
-     * 这里再兜一次底，保证它不会停在残余位移上 */
+    /* 底层页现在不参与平移；这里只兜一次底，保证它不会停在历史残留位移上。 */
     if (s_back_under) {
         lv_obj_set_style_translate_x(s_back_under, 0, LV_PART_MAIN);
     }
@@ -182,10 +174,8 @@ static void back_spr_ensure(void)
         return;
     }
     s_back_spr_ready = true;
-    /* init 会立刻 apply 一次，此时两层引用都还是 NULL，正好不会误写 */
+    /* init 会立刻 apply 一次，此时引用还是 NULL，正好不会误写 */
     ui_spring_init(&s_spr_back_top, 0.0f, 0.0f, (float)UI_W, back_top_apply, NULL);
-    ui_spring_init(&s_spr_back_under, 0.0f, -(float)(UI_W / 4), 0.0f,
-                   back_under_apply, NULL);
     ui_spring_set_done_cb(&s_spr_back_top, back_settle_cb, NULL);
 }
 
@@ -201,18 +191,14 @@ static void back_drag_begin(void)
     s_back_under = ui_router_under_screen();
 
     ui_spring_hold(&s_spr_back_top);
-    ui_spring_hold(&s_spr_back_under);
 
     if (resuming) {
         /* 动画没跑完就被抓住：从当前位置继续，位置/速度都连续 */
-        s_back_grab_top   = ui_spring_value(&s_spr_back_top);
-        s_back_grab_under = ui_spring_value(&s_spr_back_under);
+        s_back_grab_top = ui_spring_value(&s_spr_back_top);
     } else {
-        /* 新一次手势：顶层页回到 0，底层页摆到视差起点 */
-        s_back_grab_top   = 0.0f;
-        s_back_grab_under = -(float)(UI_W / 4);
+        /* 新一次手势：顶层页回到 0 */
+        s_back_grab_top = 0.0f;
         ui_spring_set_value(&s_spr_back_top, s_back_grab_top);
-        ui_spring_set_value(&s_spr_back_under, s_back_grab_under);
     }
     s_back_phase = BACK_DRAG;
 }
@@ -231,7 +217,6 @@ static void back_drag(int32_t dx)
         dx = 0;
     }
     ui_spring_set_value(&s_spr_back_top, s_back_grab_top + (float)dx);
-    ui_spring_set_value(&s_spr_back_under, s_back_grab_under + (float)dx / 4.0f);
 }
 
 /*
@@ -252,7 +237,6 @@ static void back_finish(bool commit)
     }
     s_back_phase = commit ? BACK_SETTLE_COMMIT : BACK_SETTLE_CANCEL;
     ui_spring_release(&s_spr_back_top, commit ? (float)UI_W : 0.0f);
-    ui_spring_release(&s_spr_back_under, 0.0f);
     ESP_LOGD(TAG, "back %s (from %.0f)", commit ? "commit" : "cancel",
              (double)ui_spring_value(&s_spr_back_top));
 

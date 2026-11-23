@@ -26,6 +26,7 @@
 
 #include "internal/os_fs.h"        /* online_has_network() / os_psram_alloc() */
 #include "internal/os_pl_format.h"
+#include "internal/os_qq.h"
 #include "internal/os_state.h"
 #include "internal/os_util.h"
 
@@ -152,6 +153,62 @@ esp_err_t online_playlist_add(const char *id)
     return ESP_OK;
 }
 
+/*
+ * 添加 QQ 音乐的歌单（与上面同一条"抓取 → 二进制落盘 → 记 NVS"路径）。
+ *
+ * 为什么单独一份而不是给 online_playlist_add() 加个 provider 参数：
+ * 服务层不知道界面当前在看哪家（同一个歌单 ID 是纯数字，两家都可能存在），
+ * 由调用方（app_online 的工作线程）按音源显式选择更清楚，也不会误抓。
+ */
+esp_err_t online_playlist_add_qq(const char *id)
+{
+    if (!id || !id[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!online_has_network()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    /*
+     * ★ 网易云与 QQ 的歌单 ID 都是纯数字，**同一个数字可能是两个平台的歌单**。
+     *   所以 QQ 的在 NVS / SD 上统一加前缀 'q'（"q123" → pl_q123.bin），
+     *   两边各自增删改查互不影响。调用方传进来的是原始数字（首次添加）或
+     *   已带前缀的键（长按"更新"），这里统一剥掉再拼回去。
+     */
+    const char *raw = (id[0] == 'q' && id[1] >= '0' && id[1] <= '9') ? (id + 1) : id;
+    char key[ONLINE_ID_MAX];
+    snprintf(key, sizeof(key), "q%.*s", ONLINE_ID_MAX - 2, raw);
+
+    online_song_t *songs =
+        (online_song_t *)os_psram_alloc(ONLINE_PL_FETCH_MAX * sizeof(online_song_t));
+    if (!songs) {
+        return ESP_ERR_NO_MEM;
+    }
+    size_t count = 0;
+    esp_err_t ret = online_qq_playlist_page(raw, 0, songs, ONLINE_PL_FETCH_MAX, &count);
+    if (ret != ESP_OK) {
+        free(songs);
+        os_state_set_last_error("QQ 歌单抓取失败（空歌单 / 歌单不存在？）");
+        return ret;
+    }
+    if (count >= ONLINE_PL_FETCH_MAX) {
+        ESP_LOGW(TAG, "QQ playlist %s: 只取前 %u 首（上限）", raw, (unsigned)count);
+    }
+    ret = os_pl_save(key, songs, count);
+    free(songs);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (os_state_playlist_index(key) < 0) {
+        if (os_state_playlist_count() >= ONLINE_MAX_PLAYLISTS) {
+            return ESP_ERR_NO_MEM;
+        }
+        os_state_playlist_append(key);
+        os_playlists_nvs_save();
+    }
+    ESP_LOGI(TAG, "QQ playlist %s (key %s): %u songs", raw, key, (unsigned)count);
+    return ESP_OK;
+}
+
 esp_err_t online_playlist_remove(const char *id)
 {
     if (!id) {
@@ -175,8 +232,10 @@ esp_err_t online_playlist_load(const char *id, online_song_t **songs, size_t *co
     }
     esp_err_t ret = os_pl_load(id, songs, count);
     if (ret == ESP_ERR_NOT_FOUND) {
-        /* 本地没有：抓一次再读（顺带落盘） */
-        ret = online_playlist_add(id);
+        /* 本地没有：抓一次再读（顺带落盘）。
+         * "q<数字>" 是 QQ 的键（见 online_playlist_add_qq），别拿它去问网易云。 */
+        const bool is_qq_key = (id[0] == 'q' && id[1] >= '0' && id[1] <= '9');
+        ret = is_qq_key ? online_playlist_add_qq(id) : online_playlist_add(id);
         if (ret == ESP_OK) {
             ret = os_pl_load(id, songs, count);
         }

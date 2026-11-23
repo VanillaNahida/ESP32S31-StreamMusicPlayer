@@ -230,7 +230,9 @@ static bool is_own_api(const char *url)
  * 不必每次都从 http 重新跳一次 https（历史上 meting 就是这么 302 的）。
  * `cookie` 非空时给**自家 base** 加 `X-Netease-Cookie` 头（语义见头文件）。
  */
-static esp_err_t http_get_hops(char *cur, size_t cur_cap, const char *cookie,
+static esp_err_t http_get_hops(char *cur, size_t cur_cap, http_verb_t verb,
+                               const char *hdr1_name, const char *hdr1_val,
+                               const char *hdr2_name, const char *hdr2_val,
                                char **out, size_t *out_len, size_t max_len)
 {
     for (int hop = 0; hop < 4; hop++) {
@@ -281,17 +283,24 @@ static esp_err_t http_get_hops(char *cur, size_t cur_cap, const char *cookie,
             if (auth[0]) {
                 esp_http_client_set_header(cli, "Authorization", auth);
             }
-            /*
-             * ★ 2026-11 服务端新策略：cookie 只能走这个头。以前拼 `?cookie=<urlencoded>`
-             *   现在会被直接拒（HTTP 400 + {"code":400,"data":null,"msg":"Passing cookies
-             *   in the query string is disabled; send them in the X-Netease-Cookie header
-             *   or a POST body"}）。服务端会自己按 ';' 切成 name=value 对再拼回去，
-             *   所以这里发**压缩后的原始串**即可，不需要再做百分号编码。
-             */
-            if (cookie && cookie[0]) {
-                esp_http_client_set_header(cli, "X-Netease-Cookie", cookie);
+            /* 调用方指定的头（QQ 音乐凭证是两个；网易云只有一个 cookie 头） */
+            if (hdr1_name && hdr1_name[0] && hdr1_val && hdr1_val[0]) {
+                esp_http_client_set_header(cli, hdr1_name, hdr1_val);
+            }
+            if (hdr2_name && hdr2_name[0] && hdr2_val && hdr2_val[0]) {
+                esp_http_client_set_header(cli, hdr2_name, hdr2_val);
+            }
+            /* POST：参数全在查询串里，body 为空（服务端 /qq 就是这个契约） */
+            if (verb == HTTP_VERB_POST) {
+                esp_http_client_set_method(cli, HTTP_METHOD_POST);
             }
         }
+        /*
+         * ★ 2026-11 服务端新策略：cookie 只能走 header（以前拼 `?cookie=<urlencoded>`
+         *   会被 400 拒掉）。调用方通过 hdr_name/hdr_val 传入 —— 网易云是
+         *   `X-Netease-Cookie: <压缩后的原始串>`，QQ 音乐是
+         *   `X-QQMusic-Credential: base64(JSON)`，两者共用同一条发送路径。
+         */
         esp_err_t ret = esp_http_client_perform(cli);
         const int status = esp_http_client_get_status_code(cli);
         if (status == 401 || status == 403) {
@@ -380,8 +389,10 @@ static esp_err_t http_get_hops(char *cur, size_t cur_cap, const char *cookie,
  *   3) **慢失败不再重试**：`timeout_ms` 是"两次读之间"的上限，一次读超时就是 30 s，
  *      叠三次等于 90 s —— 而起播任务 / 歌单刷新都在这条线程上等着。
  */
-esp_err_t http_get_text_hdr_ex(const char *url, const char *cookie, char **out,
-                               size_t *out_len, size_t max_len, int attempts)
+static esp_err_t http_request_retry(http_verb_t verb, const char *url,
+                                    const char *hdr1_name, const char *hdr1_val,
+                                    const char *hdr2_name, const char *hdr2_val,
+                                    char **out, size_t *out_len, size_t max_len, int attempts)
 {
     if (!url || !out || max_len == 0) {
         return ESP_ERR_INVALID_ARG;
@@ -408,7 +419,8 @@ esp_err_t http_get_text_hdr_ex(const char *url, const char *cookie, char **out,
             vTaskDelay(pdMS_TO_TICKS(wait_ms));
         }
         const int64_t t0 = esp_timer_get_time();
-        ret = http_get_hops(cur, sizeof(cur), cookie, out, out_len, max_len);
+        ret = http_get_hops(cur, sizeof(cur), verb, hdr1_name, hdr1_val, hdr2_name, hdr2_val,
+                            out, out_len, max_len);
         if (ret == ESP_OK) {
             return ESP_OK;
         }
@@ -420,6 +432,22 @@ esp_err_t http_get_text_hdr_ex(const char *url, const char *cookie, char **out,
         }
     }
     return ret;
+}
+
+esp_err_t http_get_text_hdr_ex(const char *url, const char *cookie, char **out,
+                               size_t *out_len, size_t max_len, int attempts)
+{
+    return http_request_retry(HTTP_VERB_GET, url, "X-Netease-Cookie", cookie, NULL, NULL,
+                              out, out_len, max_len, attempts);
+}
+
+esp_err_t http_request_ext(http_verb_t verb, const char *url,
+                           const char *hdr1_name, const char *hdr1_val,
+                           const char *hdr2_name, const char *hdr2_val,
+                           char **out, size_t *out_len, size_t max_len)
+{
+    return http_request_retry(verb, url, hdr1_name, hdr1_val, hdr2_name, hdr2_val,
+                              out, out_len, max_len, HTTP_GET_ATTEMPTS);
 }
 
 esp_err_t http_get_text_ex(const char *url, char **out, size_t *out_len, size_t max_len,

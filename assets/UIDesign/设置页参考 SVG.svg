@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" width="800" height="480" font-family="-apple-system, BlinkMacSystemFont, &#39;PingFang SC&#39;, &#39;Microsoft YaHei&#39;, sans-serif">
+  <defs>
+    <linearGradient id="bgSet" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#132536" />
+      <stop offset="55%" stop-color="#0E1722" />
+      <stop offset="100%" stop-color="#0A0F16" />
+    </linearGradient>
+    <radialGradient id="glowSet" cx="80%" cy="15%" r="55%">
+      <stop offset="0%" stop-color="#2878A8" stop-opacity="0.22" />
+      <stop offset="100%" stop-color="#0E1722" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  
+  <rect width="800" height="480" fill="url(#bgSet)" />
+  <rect width="800" height="480" fill="url(#glowSet)" />
+
+  
+  <g fill="#FFFFFF" fill-opacity="0.65" font-size="13">
+    <text x="28" y="26">23:00</text>
+    <g transform="translate(696, 14)" stroke="#FFFFFF" stroke-opacity="0.7" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 12 V4 L12 2 V10" />
+      <circle cx="3.5" cy="12" r="1.6" />
+      <circle cx="10.5" cy="10" r="1.6" />
+      <path d="M26 2 L32 7 L26 12 V1 L32 6 L26 11" stroke="#63C5FF" />
+      <path d="M46 10 A9 9 0 0 1 58 10" />
+      <path d="M49 12.5 A5 5 0 0 1 55 12.5" />
+      <circle cx="52" cy="14.5" r="1" fill="#FFFFFF" stroke="none" />
+    </g>
+  </g>
+
+  
+  <g transform="translate(0, 44)">
+    <path d="M36 12 L27 20 L36 28" fill="none" stroke="#FFFFFF" stroke-opacity="0.85" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+    <text x="54" y="26" fill="#FFFFFF" font-size="20" font-weight="700">设置</text>
+  </g>
+
+  
+  <rect x="54" y="92" width="692" height="156" rx="16" fill="#FFFFFF" fill-opacity="0.06" />
+
+  
+  <g transform="translate(76, 108)">
+    <text x="0" y="16" fill="#FFFFFF" font-size="16" font-weight="600">Wi-Fi</text>
+    <text x="0" y="36" fill="#63C5FF" font-size="12">已连接 4B103-蒲公英X1-Pro-2.4G</text>
+    
+    <rect x="604" y="8" width="44" height="24" rx="12" fill="#63C5FF" fill-opacity="0.85" />
+    <circle cx="636" cy="20" r="9" fill="#0B131D" />
+    <line x1="0" y1="50" x2="648" y2="50" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1" />
+  </g>
+
+  
+  <g transform="translate(76, 160)">
+    <text x="0" y="16" fill="#FFFFFF" font-size="16" font-weight="600">蓝牙</text>
+    <text x="0" y="36" fill="#FFFFFF" fill-opacity="0.5" font-size="12">已配对 2 台</text>
+    <rect x="604" y="8" width="44" height="24" rx="12" fill="#63C5FF" fill-opacity="0.85" />
+    <circle cx="636" cy="20" r="9" fill="#0B131D" />
+    <line x1="0" y1="50" x2="648" y2="50" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1" />
+  </g>
+
+  
+  <g transform="translate(76, 212)">
+    <text x="0" y="16" fill="#FFFFFF" font-size="16" font-weight="600">声音与输出</text>
+    <text x="636" y="16" fill="#FFFFFF" fill-opacity="0.55" font-size="13" text-anchor="end">扬声器 · 85%</text>
+    <path d="M644 10 L649 15 L644 20" fill="none" stroke="#FFFFFF" stroke-opacity="0.4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+
+  
+  <rect x="54" y="266" width="692" height="156" rx="16" fill="#FFFFFF" fill-opacity="0.06" />
+
+  
+  <g transform="translate(76, 282)">
+    <text x="0" y="16" fill="#FFFFFF" font-size="16" font-weight="600">显示设置</text>
+    <text x="636" y="16" fill="#FFFFFF" fill-opacity="0.55" font-size="13" text-anchor="end">时钟显秒 · 未校时</text>
+    <path d="M644 10 L649 15 L644 20" fill="none" stroke="#FFFFFF" stroke-opacity="0.4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    <line x1="0" y1="50" x2="648" y2="50" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1" />
+  </g>
+
+  
+  <g transform="translate(76, 334)">
+    <text x="0" y="16" fill="#FFFFFF" font-size="16" font-weight="600">存储</text>
+    <text x="636" y="16" fill="#FFFFFF" fill-opacity="0.55" font-size="13" text-anchor="end">已用 61% · 可用 11.5 GB</text>
+    <path d="M644 10 L649 15 L644 20" fill="none" stroke="#FFFFFF" stroke-opacity="0.4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+    <line x1="0" y1="50" x2="648" y2="50" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="1" />
+  </g>
+
+  
+  <g transform="translate(76, 386)">
+    <text x="0" y="16" fill="#FFFFFF" font-size="16" font-weight="600">关于本机</text>
+    <text x="636" y="16" fill="#FFFFFF" fill-opacity="0.55" font-size="13" text-anchor="end">ESP32-S31</text>
+    <path d="M644 10 L649 15 L644 20" fill="none" stroke="#FFFFFF" stroke-opacity="0.4" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" />
+  </g>
+</svg>

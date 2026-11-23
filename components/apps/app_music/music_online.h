@@ -71,6 +71,13 @@ void music_online_play(const online_song_t *songs, size_t count, size_t idx);
  */
 bool music_online_current_id(char *out, size_t cap);
 
+/*
+ * 当前在线曲目属于哪个音源（ONLINE_SRC_NETEASE / ONLINE_SRC_QQ）。
+ * 红心要按它选接口：网易云 /like，QQ 是 songlist/add_songs?dirid=201。
+ * 不在线曲目时返回 ONLINE_SRC_NETEASE（调用方本来就会先问 current_id）。
+ */
+uint8_t music_online_current_src(void);
+
 /* 在线队列所有权交接（实现对外 API app_music_online_detach） */
 void music_online_detach(const online_song_t *songs);
 

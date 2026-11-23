@@ -1,7 +1,7 @@
 # AGENTS.md —— ESP32-S31-Korvo-1 流媒体音乐播放器
 
 ESP32-S31 单芯片触摸音乐播放器：4.3" 800×480 屏 + LVGL 9，支持本地 SD 曲库、
-在线音乐（网易云）、蓝牙音频、USB 声卡、图库、设置、拼音搜索与语音输入。
+在线音乐（网易云 + QQ 音乐）、蓝牙音频、USB 声卡、图库、设置、拼音搜索与语音输入。
 
 ## 1. 技术栈与版本
 
@@ -26,13 +26,13 @@ components/
                          APP 注册表（ui_app_registry）
   apps/
     app_music/           音乐：首页网格、本地/在线列表、播放器、歌词、频谱
-    app_online/          在线音乐：歌单 / 搜索 / 账号
+    app_online/          在线音乐：歌单 / 搜索 / 账号（网易云与 QQ 音乐共用一套页面）
     app_settings/        设置：网络、蓝牙、输出、显示、麦克风、存储、关于
     app_gallery/         图库
     app_momotalk/        MomoTalk
   services/
     audio_service/       播放门面 + 解码会话 + 输出级 + HTTP 传输 + seek
-    online_service/      网易云接口（自建中间件 + meting 兜底）、缓存、歌单
+    online_service/      在线接口（网易云 + QQ 音乐）、凭证、缓存、歌单
     media_meta/          ID3 / LRC / 封面 / 图片解码
     storage_service/     本地曲库扫描、SD 卡热插拔
     wifi_service/        Wi-Fi 连接与设置
@@ -109,4 +109,5 @@ tools/                   idf.ps1、字体/图标生成、代码检查
 - 串口诊断命令：[docs/serial-commands.md](docs/serial-commands.md)
 - USB 声卡：[docs/uac-audio.md](docs/uac-audio.md)
 - 图库：[docs/gallery.md](docs/gallery.md)
+- QQ 音乐：[docs/qq-music.md](docs/qq-music.md)
 - 开发指南：[docs/方屏流媒体音乐播放器 开发指南.md](docs/方屏流媒体音乐播放器%20开发指南.md)

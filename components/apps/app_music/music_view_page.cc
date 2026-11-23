@@ -196,9 +196,23 @@ lv_obj_t *music_view_player_build(void)
      * ui_core 的全局返回键自动叠在顶层，这里不再自己画。标题行仍按
      * UI_HEADER_TEXT_X 起排，给左侧按钮留位。 */
 
-    /* 播放来源徽标：在线播放 / 本地播放（需求：播放器页要显式说明来源）。
-     * 单独一行放在标题上方 —— 标题是整宽滚动 label，同行会挤掉它的滚动宽度。 */
-    lv_obj_t *badge = lv_label_create(right);
+    /*
+     * 播放来源徽标：在线播放 / 本地播放（需求：播放器页要显式说明来源），
+     * 右边紧挨一个**渠道药丸**（网易云音乐 / QQ音乐，各用品牌色）。
+     *
+     * 单独一行放在标题上方 —— 标题是整宽滚动 label，同行会挤掉它的滚动宽度。
+     * 两个药丸放在一个横排容器里：右栏本身是纵向 flex，直接并排会上下叠。
+     */
+    lv_obj_t *badge_row = lv_obj_create(right);
+    lv_obj_remove_style_all(badge_row);
+    lv_obj_set_size(badge_row, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(badge_row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(badge_row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(badge_row, UI_PX_W(6), LV_PART_MAIN);
+    lv_obj_remove_flag(badge_row, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *badge = lv_label_create(badge_row);
     lv_obj_set_style_text_font(badge, UI_FONT_SMALL, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(badge, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_color(badge, UI_COLOR_PILL, LV_PART_MAIN);
@@ -206,6 +220,18 @@ lv_obj_t *music_view_player_build(void)
     lv_obj_set_style_pad_hor(badge, UI_PX_W(10), LV_PART_MAIN);
     lv_obj_set_style_pad_ver(badge, UI_PX_H(3), LV_PART_MAIN);
     music_view_player_bind_src_badge(badge);
+
+    /* 渠道药丸：初始隐藏（本地曲目没有渠道），由 tick 按当前曲目切出来 */
+    lv_obj_t *provider = lv_label_create(badge_row);
+    lv_obj_set_style_text_font(provider, UI_FONT_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(provider, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(provider, lv_color_hex(0x31C27C), LV_PART_MAIN);
+    lv_obj_set_style_text_color(provider, lv_color_hex(0x06301C), LV_PART_MAIN);
+    lv_obj_set_style_radius(provider, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_pad_hor(provider, UI_PX_W(10), LV_PART_MAIN);
+    lv_obj_set_style_pad_ver(provider, UI_PX_H(3), LV_PART_MAIN);
+    lv_obj_add_flag(provider, LV_OBJ_FLAG_HIDDEN);
+    music_view_player_bind_provider_badge(provider);
 
     /* 标题与副标题用独立的 block 元素，不要塞进同一个 label 的 inline span */
     lv_obj_t *title = lv_label_create(right);

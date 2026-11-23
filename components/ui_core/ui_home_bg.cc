@@ -10,10 +10,11 @@
  *    区域上（见 lv_draw_rect.c 的 `draw_bg_img`），图正好 800x480 = 整屏，于是天然
  *    满屏；也就不用操心 screen 的 pad_top 会让子对象坐标偏移那件事。
  *
- * 2. **压暗一层**：这张壁纸是亮色天空，而首页的时钟/图标名都是浅色（0xEDE6D8 /
- *    UI_COLOR_FG），直接压上去看不清。用 `bg_image_recolor` = 黑 + 一定 opa 做一层
- *    暗色滤镜（同一段源码里 recolor 是传给图片绘制的），一个常量就能调浓淡，
- *    比再叠一个半透明对象省一层绘制。
+ * 2. **压暗烘进像素**：这张壁纸是亮色天空，而首页的时钟/图标名都是浅色（0xEDE6D8 /
+ *    UI_COLOR_FG），直接压上去看不清。解码完在 PSRAM 里一次性把像素乘上暗化系数，
+ *    之后只做普通 RGB565 贴图；**不要**再用 `bg_image_recolor_opa` ——
+ *    LVGL 对 recolor_opa>0 的图会走 `recolor_only()`（每 4 行一块 malloc + CPU
+ *    重着色），每次重绘都重来，是转场/返回动画的主要开销之一。
  *
  * 3. **后台解码**：800x480 的 JPEG 软解要几百毫秒（与启动图同一套 media_meta 解码器）。
  *    解码任务钉 core 0（core 1 是 LVGL），解完按 AGENTS §6 用 `esp_lv_adapter_lock()`
@@ -43,10 +44,35 @@ extern "C" const uint8_t _binary_home_bg_jpg_end[];
 /*
  * 壁纸压暗程度：0 = 原图（亮色天空，浅色文字看不清），255 = 全黑。
  * ≈47% 是我按"壁纸还看得出、时钟和图标名读得清"取的中间值；嫌暗/嫌亮改这一个数。
+ * 这个值现在只在**解码后一次性**使用，不再参与每帧绘制。
  */
 #define HOME_BG_DIM_OPA     120
 #define HOME_BG_TASK_STACK  (8 * 1024)   /* 与 app_music 的封面解码任务同量级 */
 #define HOME_BG_LOCK_MS     2000         /* 等 LVGL 锁的上限（等不到就放弃这次贴图） */
+
+/* 把压暗一次性烘进 RGB565 像素（等价于按 opa 叠一层黑）。只在解码任务里跑一次。 */
+static void dim_rgb565_in_place(uint8_t *px, int w, int h, int opa)
+{
+    if (!px || w <= 0 || h <= 0 || opa <= 0) {
+        return;
+    }
+    if (opa > 255) {
+        opa = 255;
+    }
+    const uint32_t keep = 255u - (uint32_t)opa;
+    uint16_t *p = (uint16_t *)px;
+    const size_t n = (size_t)w * (size_t)h;
+    for (size_t i = 0; i < n; i++) {
+        const uint16_t v = p[i];
+        uint32_t r = (v >> 11) & 0x1F;
+        uint32_t g = (v >> 5) & 0x3F;
+        uint32_t b = v & 0x1F;
+        r = (r * keep + 127u) / 255u;
+        g = (g * keep + 127u) / 255u;
+        b = (b * keep + 127u) / 255u;
+        p[i] = (uint16_t)((r << 11) | (g << 5) | b);
+    }
+}
 
 static uint8_t        *s_px;
 static int             s_px_w;
@@ -64,9 +90,7 @@ static void home_bg_apply(void)
     lv_obj_set_style_bg_image_src(s_scr, s_dsc, LV_PART_MAIN);
     lv_obj_set_style_bg_image_opa(s_scr, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_image_tiled(s_scr, false, LV_PART_MAIN);   /* 原尺寸居中 = 满屏 */
-    /* 亮色壁纸压暗一层，保证浅色时钟/图标名的可读性 */
-    lv_obj_set_style_bg_image_recolor(s_scr, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_set_style_bg_image_recolor_opa(s_scr, HOME_BG_DIM_OPA, LV_PART_MAIN);
+    /* 压暗已经烘进像素（见 dim_rgb565_in_place），这里不再设 recolor。 */
 }
 
 static void home_bg_task(void *arg)
@@ -86,6 +110,9 @@ static void home_bg_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
+
+    /* 一次性压暗：之后每帧只做普通 RGB565 贴图，不再走 LVGL 的 recolor_only()。 */
+    dim_rgb565_in_place(px, w, h, HOME_BG_DIM_OPA);
 
     s_px   = px;
     s_px_w = w;

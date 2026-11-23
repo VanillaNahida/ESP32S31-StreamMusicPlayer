@@ -125,6 +125,33 @@ const char *url_for_log(const char *url);
 esp_err_t http_get_text(const char *url, char **out, size_t *out_len, size_t max_len);
 
 /*
+ * ★ 2026-11 新增：**带任意一个请求头**的 GET / POST（QQ 音乐用）。
+ *
+ * QQ 音乐的凭证走 `X-QQMusic-Credential: base64(JSON)`（见 docs/qq-provider.md §3.1），
+ * 和网易云的 cookie 头是同一个位置、同样的"只对自家 base 发"纪律 —— 所以这里不复制
+ * 一套新的 302/重试/收发逻辑，而是把 http_get_text_hdr 里那条路径参数化：
+ *   hdr_name/hdr_val 为空 = 不加头（等价于 http_get_text）；
+ *   verb = HTTP_VERB_POST 时发 POST（无 body，参数全在查询串里，服务端就是这个契约）。
+ *
+ * 返回语义与 http_get_text 完全一致（*out 为调用方 free 的缓冲，含重试）。
+ */
+typedef enum {
+    HTTP_VERB_GET  = 0,
+    HTTP_VERB_POST = 1,
+} http_verb_t;
+
+/*
+ * 最多两个自定义头：QQ 音乐的凭证要成对发
+ *   X-QQMusic-Credential: base64(JSON)
+ *   X-QQMusic-Credential-Encoding: base64      ← 少了它服务端不会解码
+ * 两个都为空名时等价于"不加头"。
+ */
+esp_err_t http_request_ext(http_verb_t verb, const char *url,
+                           const char *hdr1_name, const char *hdr1_val,
+                           const char *hdr2_name, const char *hdr2_val,
+                           char **out, size_t *out_len, size_t max_len);
+
+/*
  * 同 http_get_text，但显式指定**最多发几次**（attempts >= 1）。
  * 封面那种"两种协议方案各试一次"的调用点用它把总请求数压住
  * （默认 3 次 × 2 种方案 = 6 次，会把起播拖慢好几秒）。

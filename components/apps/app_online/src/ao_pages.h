@@ -49,6 +49,8 @@ lv_obj_t *ao_acct_build(lv_obj_t *parent);
 void      ao_acct_rebuild(void);
 void      ao_acct_clear(void);
 lv_obj_t *ao_acct_list(void);
+/* 重新载入当前歌单详情的第 1 页（删除歌曲成功后用；每日推荐/无详情时什么都不做） */
+void      ao_acct_detail_refresh(void);
 
 /* ---------------------------------------------------------------- 第 1 页：我添加的歌单 */
 

@@ -1,0 +1,143 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" width="800" height="480" font-family="-apple-system, BlinkMacSystemFont, &#39;PingFang SC&#39;, &#39;Microsoft YaHei&#39;, sans-serif">
+  <defs>
+    
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#132536" />
+      <stop offset="50%" stop-color="#0E1722" />
+      <stop offset="100%" stop-color="#0A0F16" />
+    </linearGradient>
+
+    
+    <radialGradient id="ambientGlow" cx="25%" cy="45%" r="55%">
+      <stop offset="0%" stop-color="#2878A8" stop-opacity="0.38" />
+      <stop offset="100%" stop-color="#0E1722" stop-opacity="0" />
+    </radialGradient>
+
+    
+    <linearGradient id="coverGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38A3DF" />
+      <stop offset="55%" stop-color="#1D5C8A" />
+      <stop offset="100%" stop-color="#102C46" />
+    </linearGradient>
+
+    
+    <filter id="coverShadow" x="-15%" y="-15%" width="130%" height="135%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000000" flood-opacity="0.45" />
+    </filter>
+  </defs>
+
+  
+  <rect width="800" height="480" fill="url(#bgGrad)" />
+  <rect width="800" height="480" fill="url(#ambientGlow)" />
+
+  
+  <g id="top-bar">
+    
+    <path d="M40 28 L30 36 L40 44" fill="none" stroke="#FFFFFF" stroke-opacity="0.75" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+    
+    <text x="64" y="41" fill="#FFFFFF" fill-opacity="0.7" font-size="14" font-weight="500">22:30</text>
+    
+    
+    <g transform="translate(690, 27)" stroke="#FFFFFF" stroke-opacity="0.7" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      
+      <path d="M6 14 V4 L14 2 V12" />
+      <circle cx="4" cy="14" r="2" />
+      <circle cx="12" cy="12" r="2" />
+      
+      <g stroke="#63C5FF" stroke-opacity="0.95">
+        <path d="M31 3 L37 8 L31 13 V2 L37 7 L31 12" />
+      </g>
+      
+      <path d="M52 12 A10 10 0 0 1 66 12" />
+      <path d="M55 15 A6 6 0 0 1 63 15" />
+      <circle cx="59" cy="17.5" r="1" fill="#FFFFFF" stroke="none" />
+    </g>
+  </g>
+
+  
+  
+  <g id="left-panel">
+    <rect x="64" y="76" width="210" height="210" rx="18" fill="url(#coverGrad)" filter="url(#coverShadow)" />
+    <circle cx="220" cy="125" r="36" fill="#FFFFFF" fill-opacity="0.12" />
+    <path d="M64 235 Q140 195 274 225 L274 268 A18 18 0 0 1 256 286 L82 286 A18 18 0 0 1 64 268 Z" fill="#0B1E30" fill-opacity="0.45" />
+    <text x="84" y="254" fill="#FFFFFF" fill-opacity="0.9" font-size="16" font-weight="600">Everything's Alright</text>
+    <text x="84" y="272" fill="#A5D8FF" fill-opacity="0.75" font-size="11">ALBUM ARTWORK</text>
+
+    <text x="64" y="324" fill="#FFFFFF" font-size="22" font-weight="700">Everything's Alright</text>
+    <text x="64" y="348" fill="#FFFFFF" fill-opacity="0.58" font-size="14">塞壬唱片-MSR / DJ OKAWARI / 津田かおり</text>
+  </g>
+
+  
+  <g id="right-lyrics" text-anchor="start">
+    <text x="336" y="118" fill="#FFFFFF" fill-opacity="0.28" font-size="16">But no more than I have done</text>
+    <text x="336" y="156" fill="#FFFFFF" fill-opacity="0.45" font-size="17">I've lost count of it</text>
+    
+    <text x="336" y="202" fill="#FFFFFF" font-size="23" font-weight="700">Trying to laugh with my own</text>
+    
+    <text x="336" y="246" fill="#FFFFFF" fill-opacity="0.45" font-size="17">Sad and little broken heart</text>
+    <text x="336" y="284" fill="#FFFFFF" fill-opacity="0.30" font-size="16">On the road</text>
+    <text x="336" y="322" fill="#FFFFFF" fill-opacity="0.18" font-size="15">But then finally found I want</text>
+  </g>
+
+  
+  <g id="bottom-controls">
+    
+    <rect x="64" y="384" width="672" height="5" rx="2.5" fill="#FFFFFF" fill-opacity="0.16" />
+    <rect x="64" y="384" width="268" height="5" rx="2.5" fill="#FFFFFF" />
+    <circle cx="332" cy="386.5" r="6" fill="#FFFFFF" />
+
+    
+    <text x="64" y="407" fill="#FFFFFF" fill-opacity="0.55" font-size="12">01:36</text>
+    <text x="736" y="407" fill="#FFFFFF" fill-opacity="0.55" font-size="12" text-anchor="end">04:09</text>
+
+    
+    <g transform="translate(0, 434)" stroke="#FFFFFF" stroke-linecap="round" stroke-linejoin="round" fill="none">
+      
+      <g transform="translate(132, -9)" stroke-opacity="0.65" stroke-width="2">
+        <line x1="0" y1="3" x2="18" y2="3" />
+        <line x1="0" y1="9" x2="18" y2="9" />
+        <line x1="0" y1="15" x2="12" y2="15" />
+      </g>
+
+      
+      <g transform="translate(226, -9)" stroke-opacity="0.65" stroke-width="2">
+        <path d="M2 6 H16 L13 3 M16 12 H2 L5 15" />
+      </g>
+
+      
+      <g transform="translate(318, -9)" fill="#FFFFFF" fill-opacity="0.9" stroke="none">
+        <rect x="0" y="1" width="2.5" height="16" rx="1" />
+        <polygon points="15,1 4,9 15,17" />
+      </g>
+
+      
+      <g transform="translate(400, 0)">
+        <circle cx="0" cy="0" r="24" fill="#FFFFFF" fill-opacity="0.16" stroke="none" />
+        <rect x="-6.5" y="-8" width="4.2" height="16" rx="1.5" fill="#FFFFFF" stroke="none" />
+        <rect x="2.3" y="-8" width="4.2" height="16" rx="1.5" fill="#FFFFFF" stroke="none" />
+      </g>
+
+      
+      <g transform="translate(465, -9)" fill="#FFFFFF" fill-opacity="0.9" stroke="none">
+        <polygon points="0,1 11,9 0,17" />
+        <rect x="12.5" y="1" width="2.5" height="16" rx="1" />
+      </g>
+
+      
+      <g transform="translate(552, -9)" stroke-opacity="0.65" stroke-width="2">
+        <path d="M9 16.5 C9 16.5 1 11.2 1 5.5 A4.2 4.2 0 0 1 9 3.8 A4.2 4.2 0 0 1 17 5.5 C17 11.2 9 16.5 9 16.5 Z" />
+      </g>
+
+      
+      <g transform="translate(632, -9)" stroke-opacity="0.65" stroke-width="2">
+        <polygon points="0,6 4,6 9,2 9,16 4,12 0,12" fill="#FFFFFF" fill-opacity="0.65" stroke="none" />
+        <path d="M13 5 A6 6 0 0 1 13 13" />
+      </g>
+
+      
+      <g transform="translate(676, -12) scale(0.6)" stroke="none">
+        <path d="M28.89,36.67H11.11q-1.15,0-1.96-0.82T8.33,33.89V6.11q0-1.15 0.82-1.96t1.96-0.82H28.89q1.15,0 1.96,0.82t0.82,1.96V33.89q0,1.15-0.82,1.96t-1.96,0.82Zm0-2.78V6.11H11.11V33.89H28.89ZM22.31,13.95q0.94-0.94 0.94-2.28T22.31,9.38T20.03,8.44T17.74,9.38t-0.94,2.28t0.94,2.28t2.28,0.94t2.28-0.94Zm2.49,15.85q1.97-1.97 1.97-4.81t-1.97-4.81T20,18.22t-4.81,1.97T13.22,25t1.97,4.81T20,31.78t4.81-1.97Zm-7.63-1.98Q16,26.65 16,25t1.18-2.82T20,21t2.82,1.18T24,25t-1.18,2.82T20,29t-2.82-1.18ZM11.11,6.11V33.89V6.11Z" fill="#FFFFFF" fill-opacity="0.72" />
+      </g>
+    </g>
+  </g>
+</svg>

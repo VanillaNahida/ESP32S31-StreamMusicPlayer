@@ -30,6 +30,10 @@ typedef struct {
     lv_obj_t *cover_img;     /* 真封面（没解出来时隐藏） */
     lv_obj_t *src_badge;     /* 来源药丸（在线播放 / 本地播放） */
     int       src_badge_state;   /* 上次画的状态（-1 = 还没画过） */
+    /* 渠道药丸（「在线播放」右边的品牌色标签：网易云音乐 / QQ音乐）：
+     * 只在在线曲目时出现，本地文件隐藏。 */
+    lv_obj_t *provider_badge;
+    int       provider_badge_state;  /* 0=隐藏 1=网易云 2=QQ（-1 = 还没画过） */
     lv_obj_t *mode_btn;      /* 模式按钮里的图标 label */
     lv_obj_t *mode_badge;    /* 单曲循环的 "1" 角标 */
     lv_obj_t *btn_spinner;   /* 加载态：播放按钮里的转圈（懒建，与按钮同生共死） */

@@ -44,6 +44,8 @@ static void            *s_evt_user;
 /** 起播请求序号：网络等待期间若来了新的点歌请求，旧的那次就自己放弃 */
 static volatile uint32_t s_req_seq;
 
+
+
 /* ===========================================================================
  * 事件上报
  * =========================================================================*/
@@ -233,6 +235,40 @@ esp_err_t audio_service_play_path(const char *vfs_abs_path)
     return err;
 }
 
+/*
+ * 建连 + 嗅探容器（**不含**解码会话）。网络动作，调用方不持锁。
+ * 失败时保证传输已经停下 —— 这样上层可以直接重试另一条 URL。
+ */
+static esp_err_t stream_open(const char *uri, uint32_t seq, int wait_ms)
+{
+    esp_err_t err = audio_http_prepare(uri);
+    if (err != ESP_OK) {
+        audio_http_stop();
+        return err;
+    }
+    err = audio_http_start(0);
+    if (err != ESP_OK) {
+        audio_http_stop();
+        return err;
+    }
+    if (!audio_http_wait_ready(wait_ms)) {
+        ESP_LOGW(TAG, "stream connect failed: %s", uri);
+        audio_http_stop();
+        return ESP_ERR_TIMEOUT;
+    }
+    if (seq != s_req_seq) {
+        audio_http_stop();
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!audio_http_streamable()) {
+        ESP_LOGW(TAG, "容器 fmt=%d 不能边下边解（Vorbis/Opus/M4A 需可 seek 的源）",
+                 audio_http_format());
+        audio_http_stop();
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+    return ESP_OK;
+}
+
 esp_err_t audio_service_play_uri(const char *uri)
 {
     if (!uri || !uri[0]) {
@@ -251,29 +287,57 @@ esp_err_t audio_service_play_uri(const char *uri)
     audio_engine_stop();
     audio_core_unlock();
 
-    /* 2) 建连 + 嗅探容器（网络动作，**不持锁**：慢网络下不能卡住 LVGL 任务） */
-    esp_err_t err = audio_http_prepare(uri);
+    /*
+     * 2) 建连 + 嗅探容器（网络动作，**不持锁**：慢网络下不能卡住 LVGL 任务）。
+     *
+     * ★★ 2026-11：HTTPS 流失败就**换明文重试一次**。
+     *
+     * 真机日志（QQ 音乐、网易云封面都撞过同一个地方）：
+     *     I esp-x509-crt-bundle: Certificate validated
+     *     E esp-tls-mbedtls: read error :-0x0087
+     *     E HTTP_CLIENT: esp_transport_read returned:-135 and errno:5
+     *     W audio_svc: stream connect failed: https://aqqmusic.tc.qq.com/...
+     * -0x0087 = -135 = PSA_ERROR_INVALID_ARGUMENT，失败点在 mbedtls 解 TLS record
+     * → PSA → 硬件 AES/GCM 那一段（不是网络、不是 URL；同一地址在主机上 curl 正常）。
+     * 它**偶发**出现，重开连接多半就好；而音频这条路（audio_http）没有 HTTP 层那套
+     * 三重试，一失败就直接报"这首放不了"。
+     *
+     * 两家 CDN（music.126.net / qqmusic.qq.com）都同时服务明文，而且音频不是机密
+     * 数据（vkey 只是短效取流令牌）—— 封面早就这么降级了（见 os_media_cache.cc 的
+     * cover_download），这里保持一致：https 挂了就用同主机同路径的 http 再来一遍。
+     */
+    const bool is_https = (strncmp(uri, "https://", 8) == 0);
+    /* static 而不是栈上：本函数只在 LVGL 任务里跑，而那个栈不宽裕 */
+    static char plain[768];
+    bool have_plain = false;
+    if (is_https) {
+        const int n = snprintf(plain, sizeof(plain), "http://%.*s",
+                               (int)(sizeof(plain) - 8), uri + 8);
+        have_plain = (n > 0 && n < (int)sizeof(plain));
+    }
+    /*
+     * ★★ 2026-11 用户要求：**音频流以明文 HTTP 优先**。
+     *
+     * 本板 TLS 在"证书校验通过之后的第一次读"会偶发失败（-0x0087 =
+     * PSA_ERROR_INVALID_ARGUMENT，落在 mbedtls→PSA→硬件 AES/GCM 那一段）。API 请求有
+     * 三重试兜着，而音频这条传输（audio_http）**没有** —— 一次失败就是"这首放不了"，
+     * 真机上每几首就中一次。
+     *
+     * 两家 CDN（music.126.net / qqmusic.com）都同时服务明文：实测
+     * aqqmusic.tc.qq.com 的 http 直接 206、与 https 同一文件；音频也不是机密数据
+     * （vkey 只是短效取流令牌）。因此这里**先从 http 起**，http 不通再回 https 兜底。
+     */
+    const char *first = have_plain ? plain : uri;
+    if (first == plain) {
+        ESP_LOGI(TAG, "音频流走明文 http: %s", plain);
+    }
+    esp_err_t err = stream_open(first, seq, 8000);
+    if (err != ESP_OK && err != ESP_ERR_NOT_SUPPORTED && seq == s_req_seq && first == plain) {
+        ESP_LOGW(TAG, "明文 http 建连失败(%s)，改走 https 重试一次", esp_err_to_name(err));
+        err = stream_open(uri, seq, 6000);
+    }
     if (err != ESP_OK) {
         return err;
-    }
-    err = audio_http_start(0);
-    if (err != ESP_OK) {
-        return err;
-    }
-    if (!audio_http_wait_ready(8000)) {
-        ESP_LOGW(TAG, "stream connect failed: %s", uri);
-        audio_http_stop();
-        return ESP_ERR_TIMEOUT;
-    }
-    if (seq != s_req_seq) {
-        audio_http_stop();
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (!audio_http_streamable()) {
-        ESP_LOGW(TAG, "容器 fmt=%d 不能边下边解（Vorbis/Opus/M4A 需可 seek 的源）",
-                 audio_http_format());
-        audio_http_stop();
-        return ESP_ERR_NOT_SUPPORTED;
     }
 
     /* 3) 起解码会话（进锁前再确认一次没有更新的请求，比如用户按了停止） */

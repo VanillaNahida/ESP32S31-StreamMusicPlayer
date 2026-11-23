@@ -32,7 +32,12 @@ typedef struct {
     esp_err_t err;
     online_song_t *songs;         /* 所有权转给消费方（free） */
     size_t    count;
-    char      msg[64];            /* 歌单 ID / 昵称 / unikey */
+    char      msg[64];            /* 歌单 ID / 昵称 */
+    /*
+     * 扫码 identifier（网易云叫 unikey）：QQ 的实测 128 字符，60 多字节的 msg 装不下，
+     * 单独给一格。空串 = 这次结果没带 identifier。
+     */
+    char      id[192];
     int       off;                /* OREQ_ACCT_SONGS：这一页从第几首开始 */
     int       want;               /* OREQ_ACCT_SONGS：本来要取多少首 */
     uint8_t  *img;                /* 二维码 PNG（所有权转给消费方，free） */
@@ -52,6 +57,10 @@ void ao_work_set_page_alive(bool alive);
 void ao_work_submit(int kind, const char *arg);
 /* 带分页参数（off/cnt）的版本：账号歌单懒加载用。 */
 void ao_work_submit_ex(int kind, const char *arg, int off, int cnt);
+/* 带第二个字符串参数的版本：OREQ_UNCOLLECT（dirid + 歌曲 id）。 */
+void ao_work_submit2(int kind, const char *arg, const char *arg2);
+/* 三个字符串：OREQ_COLLECT（dirid + 歌曲 id + 目标歌单 dissid）。 */
+void ao_work_submit3(int kind, const char *arg, const char *arg2, const char *arg3);
 
 /*
  * 取一份结果：**先把负载全拷到 out，再把槽位置空**（顺序不能反 —— 清了才轮到工作

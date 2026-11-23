@@ -1,0 +1,201 @@
+# 生成两个 SVG 文件：
+# 1. 在线音乐主界面.svg（歌单主界面，在“搜索”右侧新增“账号”Tab）
+# 2. 账号页面.svg（“账号”Tab 高亮，展示用户头像、昵称、账号状态以及退出登录/登录按钮）
+
+svg_playlist_main = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" width="800" height="480" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <defs>
+    <linearGradient id="bgA" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#132536"/>
+      <stop offset="55%" stop-color="#0E1722"/>
+      <stop offset="100%" stop-color="#0A0F16"/>
+    </linearGradient>
+    <radialGradient id="glowA" cx="80%" cy="15%" r="55%">
+      <stop offset="0%" stop-color="#2878A8" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#0E1722" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="800" height="480" fill="url(#bgA)"/>
+  <rect width="800" height="480" fill="url(#glowA)"/>
+
+  <!-- 顶部系统状态栏 -->
+  <g fill="#FFFFFF" fill-opacity="0.65" font-size="13">
+    <text x="28" y="26">22:51</text>
+    <g transform="translate(696, 14)" stroke="#FFFFFF" stroke-opacity="0.7" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 12 V4 L12 2 V10"/>
+      <circle cx="3.5" cy="12" r="1.6"/>
+      <circle cx="10.5" cy="10" r="1.6"/>
+      <path d="M26 2 L32 7 L26 12 V1 L32 6 L26 11" stroke="#63C5FF"/>
+      <path d="M46 10 A9 9 0 0 1 58 10"/>
+      <path d="M49 12.5 A5 5 0 0 1 55 12.5"/>
+      <circle cx="52" cy="14.5" r="1" fill="#FFFFFF" stroke="none"/>
+    </g>
+  </g>
+
+  <!-- 头部导航与 Tab (在“搜索”旁新增“账号”) -->
+  <g transform="translate(0, 44)">
+    <!-- 返回箭头 + 源名称 -->
+    <path d="M36 12 L27 20 L36 28" fill="none" stroke="#FFFFFF" stroke-opacity="0.85" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="54" y="26" fill="#FFFFFF" font-size="20" font-weight="700">网易云音乐</text>
+
+    <!-- 右侧极简操作 (+) -->
+    <g transform="translate(716, 8)">
+      <rect x="0" y="0" width="24" height="24" rx="12" fill="#FFFFFF" fill-opacity="0.10"/>
+      <line x1="12" y1="6" x2="12" y2="18" stroke="#FFFFFF" stroke-opacity="0.8" stroke-width="1.8" stroke-linecap="round"/>
+      <line x1="6" y1="12" x2="18" y2="12" stroke="#FFFFFF" stroke-opacity="0.8" stroke-width="1.8" stroke-linecap="round"/>
+    </g>
+
+    <!-- 扁平 Tab 切换栏 + 底部高亮指示线 -->
+    <g transform="translate(54, 54)" font-size="15">
+      <text x="0" y="0" fill="#FFFFFF" font-weight="700">我的歌单</text>
+      <rect x="8" y="8" width="44" height="3" rx="1.5" fill="#63C5FF"/>
+
+      <text x="92" y="0" fill="#FFFFFF" fill-opacity="0.5">我添加的歌单</text>
+      <text x="210" y="0" fill="#FFFFFF" fill-opacity="0.5">搜索</text>
+      <text x="272" y="0" fill="#FFFFFF" fill-opacity="0.5">账号</text>
+    </g>
+
+    <!-- 歌单概览小字 -->
+    <text x="54" y="102" fill="#FFFFFF" fill-opacity="0.45" font-size="12">歌单 · 14 个</text>
+  </g>
+
+  <!-- 列表区 (无重框、靠行距与微弱分割线区分) -->
+  <g transform="translate(54, 162)">
+    <!-- 第1项 (高亮示例) -->
+    <rect x="-12" y="-22" width="704" height="52" rx="10" fill="#FFFFFF" fill-opacity="0.06"/>
+    <circle cx="8" cy="4" r="4" fill="#63C5FF"/>
+    <text x="24" y="9" fill="#FFFFFF" font-size="16" font-weight="600">每日推荐</text>
+    <text x="680" y="9" fill="#FFFFFF" fill-opacity="0.5" font-size="13" text-anchor="end">根据你的口味每天更新</text>
+
+    <!-- 第2项 -->
+    <g transform="translate(0, 56)">
+      <text x="24" y="9" fill="#FFFFFF" fill-opacity="0.9" font-size="16">香草味的纳西妲喵喜欢的音乐</text>
+      <text x="680" y="9" fill="#FFFFFF" fill-opacity="0.45" font-size="13" text-anchor="end">645 首</text>
+      <line x1="24" y1="24" x2="680" y2="24" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="1"/>
+    </g>
+
+    <!-- 第3项 -->
+    <g transform="translate(0, 112)">
+      <text x="24" y="9" fill="#FFFFFF" fill-opacity="0.9" font-size="16">我喜欢</text>
+      <text x="680" y="9" fill="#FFFFFF" fill-opacity="0.45" font-size="13" text-anchor="end">594 首</text>
+      <line x1="24" y1="24" x2="680" y2="24" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="1"/>
+    </g>
+
+    <!-- 第4项 -->
+    <g transform="translate(0, 168)">
+      <text x="24" y="9" fill="#FFFFFF" fill-opacity="0.9" font-size="16">我喜欢的歌</text>
+      <text x="680" y="9" fill="#FFFFFF" fill-opacity="0.45" font-size="13" text-anchor="end">205 首</text>
+      <line x1="24" y1="24" x2="680" y2="24" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="1"/>
+    </g>
+
+    <!-- 第5项 -->
+    <g transform="translate(0, 224)">
+      <text x="24" y="9" fill="#FFFFFF" fill-opacity="0.7" font-size="16">晚安歌单</text>
+      <text x="680" y="9" fill="#FFFFFF" fill-opacity="0.4" font-size="13" text-anchor="end">128 首</text>
+    </g>
+  </g>
+</svg>
+'''
+
+svg_account_page = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" width="800" height="480" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif">
+  <defs>
+    <linearGradient id="bgAcc" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#132536"/>
+      <stop offset="55%" stop-color="#0E1722"/>
+      <stop offset="100%" stop-color="#0A0F16"/>
+    </linearGradient>
+    <radialGradient id="glowAcc" cx="78%" cy="18%" r="55%">
+      <stop offset="0%" stop-color="#2878A8" stop-opacity="0.25"/>
+      <stop offset="100%" stop-color="#0E1722" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="avatarGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#A0B664"/>
+      <stop offset="100%" stop-color="#5B8C5A"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 背景 -->
+  <rect width="800" height="480" fill="url(#bgAcc)"/>
+  <rect width="800" height="480" fill="url(#glowAcc)"/>
+
+  <!-- 顶部系统状态栏 -->
+  <g fill="#FFFFFF" fill-opacity="0.65" font-size="13">
+    <text x="28" y="26">22:51</text>
+    <g transform="translate(696, 14)" stroke="#FFFFFF" stroke-opacity="0.7" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M5 12 V4 L12 2 V10"/>
+      <circle cx="3.5" cy="12" r="1.6"/>
+      <circle cx="10.5" cy="10" r="1.6"/>
+      <path d="M26 2 L32 7 L26 12 V1 L32 6 L26 11" stroke="#63C5FF"/>
+      <path d="M46 10 A9 9 0 0 1 58 10"/>
+      <path d="M49 12.5 A5 5 0 0 1 55 12.5"/>
+      <circle cx="52" cy="14.5" r="1" fill="#FFFFFF" stroke="none"/>
+    </g>
+  </g>
+
+  <!-- 头部导航与 Tab (当前高亮“账号”) -->
+  <g transform="translate(0, 44)">
+    <path d="M36 12 L27 20 L36 28" fill="none" stroke="#FFFFFF" stroke-opacity="0.85" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="54" y="26" fill="#FFFFFF" font-size="20" font-weight="700">网易云音乐</text>
+
+    <g transform="translate(54, 54)" font-size="15">
+      <text x="0" y="0" fill="#FFFFFF" fill-opacity="0.5">我的歌单</text>
+      <text x="92" y="0" fill="#FFFFFF" fill-opacity="0.5">我添加的歌单</text>
+      <text x="210" y="0" fill="#FFFFFF" fill-opacity="0.5">搜索</text>
+      <text x="272" y="0" fill="#FFFFFF" font-weight="700">账号</text>
+      <rect x="270" y="8" width="34" height="3" rx="1.5" fill="#63C5FF"/>
+    </g>
+  </g>
+
+  <!-- 账号信息主卡片 -->
+  <g transform="translate(54, 134)">
+    <rect x="0" y="0" width="692" height="148" rx="16" fill="#FFFFFF" fill-opacity="0.06"/>
+
+    <!-- 用户头像 (圆形 84x84 + 柔和边框) -->
+    <g transform="translate(32, 32)">
+      <circle cx="42" cy="42" r="42" fill="url(#avatarGrad)"/>
+      <circle cx="42" cy="42" r="42" fill="none" stroke="#FFFFFF" stroke-opacity="0.22" stroke-width="2"/>
+      <!-- 极简默认头像轮廓示意 -->
+      <circle cx="42" cy="33" r="14" fill="#FFFFFF" fill-opacity="0.9"/>
+      <path d="M18 69 C21 55 31 50 42 50 C53 50 63 55 66 69" fill="#FFFFFF" fill-opacity="0.9"/>
+    </g>
+
+    <!-- 用户昵称与状态信息 -->
+    <g transform="translate(142, 48)">
+      <text x="0" y="18" fill="#FFFFFF" font-size="22" font-weight="700">香草味的纳西妲喵</text>
+      <!-- 已登录状态胶囊 -->
+      <rect x="0" y="34" width="64" height="22" rx="11" fill="#63C5FF" fill-opacity="0.16"/>
+      <circle cx="14" cy="45" r="3.5" fill="#63C5FF"/>
+      <text x="24" y="49" fill="#63C5FF" font-size="11" font-weight="600">已登录</text>
+
+      <text x="76" y="49" fill="#FFFFFF" fill-opacity="0.5" font-size="13">UID: 10270000 · 歌单 14 个</text>
+    </g>
+  </g>
+
+  <!-- 账号操作区 (登录 / 退出登录按钮) -->
+  <g transform="translate(54, 306)">
+    <!-- 切换/重新登录按钮 (次操作胶囊) -->
+    <g transform="translate(0, 0)">
+      <rect x="0" y="0" width="334" height="48" rx="14" fill="#FFFFFF" fill-opacity="0.08"/>
+      <text x="167" y="29" fill="#FFFFFF" fill-opacity="0.9" font-size="15" font-weight="600" text-anchor="middle">切换账号 / 重新登录</text>
+    </g>
+
+    <!-- 退出登录按钮 (警示珊瑚红底) -->
+    <g transform="translate(358, 0)">
+      <rect x="0" y="0" width="334" height="48" rx="14" fill="#E5535B" fill-opacity="0.18" stroke="#E5535B" stroke-opacity="0.45" stroke-width="1"/>
+      <text x="167" y="29" fill="#FF7A82" font-size="15" font-weight="600" text-anchor="middle">退出登录</text>
+    </g>
+
+    <!-- 底部辅助提示 -->
+    <text x="346" y="76" fill="#FFFFFF" fill-opacity="0.38" font-size="12" text-anchor="middle">未登录状态下点击「登录」可通过扫码或 Cookie 同步个人歌单</text>
+  </g>
+</svg>
+'''
+
+with open('在线音乐主界面.svg', 'w', encoding='utf-8') as f:
+    f.write(svg_playlist_main)
+
+with open('账号页面.svg', 'w', encoding='utf-8') as f:
+    f.write(svg_account_page)
+
+print("Generated both SVG files successfully.")

@@ -4,6 +4,7 @@ idf_component_register(
     SRCS
         "src/app_online.cc"      # 注册 + 页面外壳（控件树）+ 页面销毁收尾
         "src/ao_work.cc"         # 工作线程 + 请求/结果协议（唯一跨任务通道）
+        "src/ao_provider.cc"     # 音源选择（网易云 / QQ 音乐）+ 两家的文案
         "src/ao_model.cc"        # ★纯逻辑：歌单队列所有权/分页/懒加载/详情 Key（不依赖 LVGL）
         "src/ao_account.cc"      # ★纯逻辑：网易云账号与登录状态机/退避节流（不依赖 LVGL）
         "src/ao_pages.cc"        # 通用 LVGL 层：页面骨架（tab/宿主/滑动切页）+ 控件工厂

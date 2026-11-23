@@ -1,5 +1,9 @@
 /*
- * online_service.h —— 在线音乐（网易云歌单，走自建网易云 API）
+ * online_service.h —— 在线音乐（网易云 + QQ 音乐，都走同一个自建聚合 API）
+ *
+ * ⚠ 2026-11 增补：QQ 音乐（docs/qq-music.md）。同一份 online_song_t 用 `src` 区分音源，
+ *   播放/封面/歌词/红心都按它分派；QQ 的实现在 os_qq*.cc，对外接口见文件末尾那一节。
+ *   下面这段"网易云"的契约依旧是主体，两家共用鉴权（Bearer API Key）与服务地址。
  *
  * ⚠ 2026-11 服务端换代：**meting 代理已被删除**（/meting/api* 一律 404），
  *   现在全部走 @neteasecloudmusicapienhanced/api 的**原生接口**
@@ -57,14 +61,36 @@ extern "C" {
 #define ONLINE_ARTIST_MAX      96
 #define ONLINE_URL_MAX         320
 
+/* ------------------------------------------------------------------ 音源
+ *
+ * 同一份 online_song_t 现在承载**两家**在线音乐：网易云与 QQ 音乐。
+ * 播放链路（取直链 / 封面 / 歌词 / 红心）都按这个字段分派，
+ * 其余 UI 代码不需要知道歌是哪家的。
+ */
+typedef enum {
+    ONLINE_SRC_NETEASE = 0,   /* 网易云（默认值：旧歌单文件里没有这个字段） */
+    ONLINE_SRC_QQ      = 1,   /* QQ 音乐 */
+} online_src_t;
+
 /* 一首在线歌曲（内存态；落盘时用等长的定长记录） */
 typedef struct {
-    uint32_t id;                          /* 网易云歌曲 ID（接口直接给；旧歌单从 url 抠） */
+    uint32_t id;                          /* 网易云歌曲 ID / QQ 的 songid（接口直接给） */
     char     title[ONLINE_TITLE_MAX];
     char     artist[ONLINE_ARTIST_MAX];
-    char     cover_url[ONLINE_URL_MAX];   /* al.picUrl；缺了会现场用 /song/detail 补 */
+    char     cover_url[ONLINE_URL_MAX];   /* 封面地址；网易云缺了会现场用 /song/detail 补 */
     char     audio_url[ONLINE_URL_MAX];   /* ⚠ 历史字段：旧歌单里的 meting 地址（已不再新填） */
-    char     lrc_url[ONLINE_URL_MAX];     /* ⚠ 历史字段：歌词现在按 id 现取 /lyric，不用它 */
+    char     lrc_url[ONLINE_URL_MAX];     /* ⚠ 历史字段：歌词现在按 id 现取，不用它 */
+    /*
+     * ★ 2026-11 新增（QQ 音乐）：
+     *   src  —— 这首歌属于哪个平台（决定取直链 / 歌词 / 红心走哪条接口）；
+     *   dur_sec —— 元数据时长（秒；QQ 的 interval、网易云的 dt÷1000），
+     *              有它在线播放不用再读 4 KB 前缀估时长；
+     *   mid  —— QQ 的歌曲 mid（取流/歌词的必填参数），网易云留空。
+     * 三个字段都追加在末尾：os_pl_format 用定长记录的 rsv 区落盘（格式不升版本）。
+     */
+    uint8_t  src;
+    uint16_t dur_sec;
+    char     mid[48];
 } online_song_t;
 
 /* 初始化：建目录、读 NVS 里保存的歌单 ID 列表、清掉历史遗留的 SD 封面/歌词。
@@ -116,6 +142,12 @@ esp_err_t online_playlist_add(const char *id);
 
 /* 删除歌单：清 NVS + 删二进制文件 */
 esp_err_t online_playlist_remove(const char *id);
+
+/*
+ * 同上，但按 **QQ 音乐**的歌单 ID 抓取（两家编号独立，由调用方选择）。
+ * 落盘格式与网易云一样，记录里带 src/mid，读回来能正常播放。
+ */
+esp_err_t online_playlist_add_qq(const char *id);
 
 /*
  * 把某个歌单读进内存（优先读本地二进制；本地没有就抓一次再落盘）。
@@ -251,6 +283,12 @@ typedef struct {
     char cover_url[ONLINE_URL_MAX];
     int  track_count;
     bool self_created;        /* true = 自己创建，false = 收藏的歌单 */
+    /*
+     * QQ 音乐的「目录 ID」：往歌单里加歌（online_qq_song_add）要的是它，**不是**
+     * id。"我喜欢" 固定是 201（见 online_service.h 末尾的 QQ 一节）。
+     * 网易云歌单没有这个概念，恒为空串。
+     */
+    char dirid[16];
 } online_acct_playlist_t;
 
 /* 账号里的歌单（GET /user/playlist?uid=<uid>&limit=…） */
@@ -331,6 +369,136 @@ esp_err_t online_song_lyrics_data(const online_song_t *song, char **out, size_t 
 
 /* 清掉下载缓存（音频 SD 文件 + PSRAM 封面/歌词缓存），歌单二进制保留 */
 esp_err_t online_cache_clear(void);
+
+/* ================================================================ QQ 音乐
+ *
+ * 走的是同一个服务端（base 见 online_netease_api_base()），只是挂在 `/qq` 前缀下：
+ *
+ *   鉴权   Authorization: Bearer <同一个 API Key>（os_http_client 里统一加）
+ *   登录态 **X-QQMusic-Credential: base64(credential JSON)**   ← 与网易云的 cookie 并列
+ *   外壳   {"code":200,"msg":"ok","data":…}（服务端已把 sidecar 的 code:0 归一）
+ *
+ * 登录 = QQ / 微信扫码：
+ *   GET  /qq/login/qrcode/qq             → data.data（base64 PNG）、data.identifier
+ *   GET  /qq/login/qrcode/qq/status?identifier=  → data.event（0 完成 / 1 待扫 / 2 待确认
+ *                                                  3 过期 / 4 拒绝）、data.credential
+ *   POST /qq/login/refresh               → data.credential（服务端顺手做 L2 密文托管）
+ *   POST /qq/login/recover               → 设备换板/重刷后按 musicid 取回托管凭证
+ *
+ * 凭证**整份 JSON 存 NVS**（一个 blob），重启后不用重新扫码；服务端文档建议的
+ * 刷新策略见 docs/qq-provider.md §3.2（本模块实现：临期 10% 才刷、串行、成功先落盘）。
+ *
+ * 与网易云一样，本节所有 API 都是**同步阻塞**的，必须放在工作线程里调。
+ */
+#define QQ_QR_DONE     0   /* 登录成功（响应里带 credential） */
+#define QQ_QR_WAIT     1   /* 等待扫码 */
+#define QQ_QR_CONFIRM  2   /* 已扫码，等待手机确认 */
+#define QQ_QR_EXPIRED  3   /* 二维码过期 */
+#define QQ_QR_REFUSED  4   /* 手机上点了拒绝 */
+
+/* 「我喜欢」的目录 ID（QQ 上游固定值）：往这里加歌 = 喜欢，删歌 = 取消喜欢 */
+#define QQ_LIKE_DIRID  "201"
+/* 「我喜欢」详情页在 app 里用的详情 Key（不是歌单 ID） */
+#define ONLINE_QQ_FAV_KEY  "\x02" "qqfav"
+
+/* 已登录（NVS 里有可用凭证） */
+bool online_qq_logged_in(void);
+/* 账号昵称（NVS 持久化；没取到 / 未登录 = 空串） */
+const char *online_qq_nickname(void);
+/* 写昵称（传 NULL/空串 = 清掉）；退出登录 / 换账号时用 */
+esp_err_t online_qq_nickname_set(const char *name);
+/* QQ 号 / 微信长数字 ID（未登录 = 空串）；服务端部分接口要它 */
+const char *online_qq_musicid(void);
+/* 退出登录：清内存 + NVS + 上游托管副本（不可逆，要重新扫码） */
+esp_err_t online_qq_logout(void);
+/* 重新从 NVS 读一次凭证（与 online_netease_cookie_reload 对称；NVS 无需等 SD） */
+esp_err_t online_qq_cred_reload(void);
+
+/* 取二维码：identifier（≤128 字节）+ **PNG 原始字节**（调用方 free） */
+esp_err_t online_qq_qr_create(char *identifier, size_t id_cap, uint8_t **png, size_t *png_len);
+/* 轮询扫码结果：*out_event = QQ_QR_*；成功（QQ_QR_DONE）时自动保存凭证到 NVS */
+esp_err_t online_qq_qr_poll(const char *identifier, int *out_event);
+
+/*
+ * 账号歌单：先按 musicid 拉**自建歌单**，再按 encryptUin 拉**收藏歌单**，
+ * 合并写进 out（self_created 区分）。一个列表失败不影响另一个。
+ * 成功时 *out_n 是条数；两个都失败才返回错误。
+ */
+esp_err_t online_qq_account_playlists(online_acct_playlist_t *out, size_t max, size_t *out_n);
+
+/*
+ * 歌单曲目分页：**offset 必须是 100 的倍数**（服务端一页 100 首，见 .cc 的说明）。
+ * 只填元数据（id/mid/title/artist/cover_url/dur_sec/src）。
+ * *out_n < max 表示到歌单末尾。
+ */
+#define ONLINE_QQ_PAGE_SONGS  100
+esp_err_t online_qq_playlist_page(const char *pl_id, size_t offset, online_song_t *out,
+                                  size_t max, size_t *out_n);
+
+/* 「我喜欢」的歌曲分页（dirid=201），语义同上 */
+esp_err_t online_qq_fav_songs(size_t offset, online_song_t *out, size_t max, size_t *out_n);
+
+/*
+ * 「我喜欢」的全量 id（升序去重，用于播放器页的红心状态）。
+ * 内部按 100 首一页翻，最多 QQ_LIKE_MAX_PAGES 页（够用且不至于把工作线程占太久）。
+ * *out_ids 由调用方 free。
+ */
+#define QQ_LIKE_PAGE_SONGS  100
+/*
+ * 红心状态表最多翻几页（100 首/页）。原来 5 页 = 500 首，而真机账号实测有
+ * **719 首**收藏 —— 后 219 首的心形会亮错。8 页 = 800 首，够个人账号用；
+ * 代价只是"登录后第一次查收藏状态"多几个回环（之后在 RAM 里缓存）。
+ */
+#define QQ_LIKE_MAX_PAGES   8
+esp_err_t online_qq_likelist(uint64_t **out_ids, size_t *out_n);
+/* 在 online_qq_likelist() 的结果里二分查（纯逻辑） */
+bool online_qq_liked_has(const uint64_t *ids, size_t n, const char *song_id);
+
+/* 加 / 取消「我喜欢」（dirid=201）；未登录或凭证过期返回 ESP_ERR_INVALID_STATE */
+esp_err_t online_qq_like(const char *song_id, bool like);
+
+/*
+ * 收藏到指定歌单。
+ *   dirid       目标歌单的目录 ID（"我喜欢"传 QQ_LIKE_DIRID=201，自建歌单用
+ *               online_acct_playlist_t.dirid）
+ *   song_id     歌曲的 songid（十进制）
+ *   playlist_id 歌单的 dissid（online_acct_playlist_t.id）；用于"是不是已经收藏过"
+ *               的检查，不知道可传 NULL —— 那就跳过检查，只按"加成功"处理
+ *   out_already 非 NULL 时返回"目标歌单里本来就有这首歌"（此时没有重复写入）
+ *
+ * 服务端会先查目标歌单（"我喜欢"按 fav/songs，其它按 songlist/{id}/detail），
+ * 命中就直接返回 already，不再打上游的写接口。
+ */
+esp_err_t online_qq_song_add(const char *dirid, const char *song_id, const char *playlist_id,
+                             bool *out_already);
+/* 从歌单里删除一首歌（dirid 同上；用于"删除：从当前歌单移除"） */
+esp_err_t online_qq_song_del(const char *dirid, const char *song_id);
+
+/*
+ * 「每日30首」与「私人雷达」（都是一次性推荐列表，服务端已拼好 30 首）：
+ *   GET /qq/recommend/daily → {"data":{"songs":[…30],"source":"guess"}}
+ *   GET /qq/recommend/radar → {"data":{"songs":[…30],"source":"radar"}}
+ * 服务端把"猜你喜欢"（每次 5 首、随机）连拿 6 次 / 雷达取 3 页再合并去重 ——
+ * 设备端只发一次请求。
+ */
+esp_err_t online_qq_daily_songs(online_song_t *out, size_t max, size_t *out_n);
+esp_err_t online_qq_radar_songs(online_song_t *out, size_t max, size_t *out_n);
+
+/* 网络搜索（/qq/search/general_search；*out 由本模块 malloc，调用方 free） */
+esp_err_t online_qq_search(const char *keyword, online_song_t **out, size_t *count, size_t max);
+
+/*
+ * 播放地址：服务端 /qq/song/{mid}/play_url 已经把 CDN 拼好了（见 docs/qq-provider.md §5.1），
+ * 固件直接拿来当流地址用。
+ *   ESP_OK                 out 里是完整 https 地址
+ *   ESP_ERR_NOT_FOUND      上游没有音源（无版权 / 非 VIP）—— 界面上提示"无播放权限"
+ *   ESP_ERR_INVALID_STATE  未登录（QQ 匿名只能拿到免费歌）
+ */
+esp_err_t online_qq_song_url(const online_song_t *song, char *out, size_t cap,
+                             int64_t *out_bytes, uint32_t *out_dur_ms);
+
+/* 歌词：/qq/song/{mid}/lyric → data.lyric（纯 LRC 文本）。*out 由调用方 free。 */
+esp_err_t online_qq_lyric(const online_song_t *song, char **out, size_t *out_len);
 
 #ifdef __cplusplus
 }

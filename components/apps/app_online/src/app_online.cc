@@ -32,6 +32,7 @@
 #include "online_service.h"
 
 #include "ao_common.h"
+#include "ao_provider.h"
 #include "ao_model.h"
 #include "ao_overlay.h"
 #include "ao_pages.h"
@@ -49,6 +50,7 @@ static void online_on_delete(lv_event_t *e)
     ao_work_set_page_alive(false);   /* 工作线程据此判断"这份结果还有没有人要" */
     ao_result_poll_stop();
     ao_modal_close();
+    ao_collect_close();   /* 收藏到歌单的浮层同样挂在 layer_top 上，退页面要收 */
     ao_pl_menu_close();
     ao_qr_close();       /* 二维码浮层挂在 lv_layer_top 上，不随页面销毁，必须显式收掉 */
     /* 二次确认框同样挂在 lv_layer_top 上：退页面时它必须一起消失，
@@ -111,7 +113,7 @@ static lv_obj_t *page_online(void)
     lv_obj_t *title = lv_label_create(head);
     lv_obj_set_style_text_font(title, UI_FONT_TITLE, LV_PART_MAIN);
     lv_obj_set_style_text_color(title, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(title, "网易云音乐");
+    lv_label_set_text(title, ao_provider_title());
     lv_obj_align(title, LV_ALIGN_LEFT_MID, UI_HEADER_TEXT_X, 0);
 
     /* 右上角只剩"添加歌单"：搜索已经是下面的 tab，删除/更新在歌单行的长按菜单里 */
@@ -165,20 +167,50 @@ static lv_obj_t *page_online(void)
 
     lv_obj_add_event_cb(scr, online_on_delete, LV_EVENT_DELETE, NULL);
     ao_result_poll_start();
-    ESP_LOGI(TAG, "online page created (%u playlist(s))", (unsigned)online_playlist_count());
+    if (ao_is_qq()) {
+        /* QQ 的"收藏到歌单"藏在长按里，第一次进来提示一次，否则没人发现 */
+        ui_toast("长按歌曲可收藏到歌单", 2400);
+    }
+    ESP_LOGI(TAG, "%s page created (%u playlist(s))", ao_provider_title(),
+             (unsigned)online_playlist_count());
     return scr;
 }
 
 /* ---------------------------------------------------------------- 注册 */
 
+/*
+ * 两个桌面入口、**同一份页面代码**：
+ *   "online"  网易云音乐（order 20，保持原来的位置）
+ *   "qqmusic" QQ 音乐（order 21，紧挨着网易云）
+ * page_online() 里所有文案与后端接口都按 ao_provider() 分派，见 ao_provider.h。
+ */
+static lv_obj_t *page_netease(void)
+{
+    ao_provider_set(AO_PROV_NETEASE);
+    return page_online();
+}
+
+static lv_obj_t *page_qqmusic(void)
+{
+    ao_provider_set(AO_PROV_QQ);
+    return page_online();
+}
+
 void app_online_register_apps(void)
 {
     static const app_desc_t online = {
         "online", "网易云音乐", LV_SYMBOL_WIFI, 0x3E9E86,
-        page_online, NULL, NULL, 20, 0,
+        page_netease, NULL, NULL, 20, 0,
         &netease_logo,          /* 桌面图标用网易云的 PNG（gen_icon.py 烘成位图） */
     };
     ui_app_register(&online);
+
+    static const app_desc_t qqmusic = {
+        "qqmusic", "QQ音乐", LV_SYMBOL_AUDIO, 0x2BB673,
+        page_qqmusic, NULL, NULL, 21, 0,
+        &qqmusic_logo,          /* assets/icons/qqmusic.png 烘成的位图 */
+    };
+    ui_app_register(&qqmusic);
 
     /* 请求队列（深度 4）+ online_work 任务（栈 16 KB，优先级 3） */
     ao_work_init();

@@ -21,10 +21,14 @@ extern "C" {
 #define AUDIO_CACHE_MAX    48
 
 /*
- * 在音频缓存目录里找这首歌已下载的文件（扩展名不定，所以按 `<id>.` 前缀找）。
+ * 在音频缓存目录里找这首歌已下载的文件（扩展名不定，所以按 `<key>.` 前缀找）。
  * 命中返回 true 并把完整路径写进 out；只认 ≥ 32 KB 的普通文件。
+ *
+ * key 是**字符串**而不是歌曲 ID：QQ 音乐的 songid 与网易云的歌曲 ID 是两套编号，
+ * 同一个数字可能对应两首完全不同的歌（"下载兜底"会把 A 平台的音频喂给 B 平台）。
+ * 调用方按 `<id>`（网易云）/ `q<id>`（QQ）生成 key，见 os_media_cache.cc。
  */
-bool os_find_cached_audio(uint32_t song_id, char *out, size_t cap);
+bool os_find_cached_audio(const char *key, char *out, size_t cap);
 
 /*
  * 缓存太多就删最旧的几个（SD 卡很大，但别无限涨）。

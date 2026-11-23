@@ -52,3 +52,15 @@ void ao_ime_hide(void);
 void ao_ime_show_for(lv_obj_t *ta);
 /* 查**键盘对象**（不是容器）的隐藏位判断键盘是否打开 */
 bool ao_ime_open(void);
+
+/* ================================================================ 收藏到歌单（QQ）
+ *
+ * 长按歌曲行 → 弹出账号里的歌单（"我喜欢的音乐" + 自建歌单），点一个就收藏进去。
+ * 网易云侧没有这个入口（那边只用播放器页的红心）。
+ */
+/*
+ * song_idx   当前队列里的下标
+ * cur_dirid  当前列表所属歌单的 dirid（"删除"要用；不知道传 NULL/""）
+ */
+void ao_collect_open(int song_idx, const char *cur_dirid);
+void ao_collect_close(void);

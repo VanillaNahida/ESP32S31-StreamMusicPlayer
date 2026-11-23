@@ -67,6 +67,8 @@ static uint64_t *s_ids;               /* "我喜欢"的全量 id（升序去重�
 static size_t    s_ids_n;
 static bool      s_ids_loaded;
 static char      s_uid_snapshot[24];  /* 这张表属于哪个 uid（换账号就作废） */
+/* 这张表属于哪个音源（换平台/换账号都要作废重拉） */
+static uint8_t   s_src_snapshot = ONLINE_SRC_NETEASE;
 
 typedef struct {
     char id[24];
@@ -118,26 +120,45 @@ static void ids_drop(void)
     s_ids_loaded = false;
 }
 
-/* 保证 s_ids 是"当前 uid"的那张表；返回 false = 拿不到（未登录/网络失败） */
+/*
+ * 保证 s_ids 是"当前音源 + 当前账号"的那张表；返回 false = 拿不到（未登录/网络失败）。
+ *
+ * 两个平台各有一套"我喜欢"：
+ *   网易云 /likelist?uid=<uid>       （全量 id，几百字节）
+ *   QQ    /qq/user/<euin>/fav/songs  （按页给歌，见 online_qq_likelist）
+ * 换平台时必须重拉：同一个数字 id 在两边是完全不同的歌。
+ */
 static bool ids_ensure(void)
 {
-    const char *uid = online_netease_uid();
-    if (s_ids_loaded && strcmp(s_uid_snapshot, uid) == 0) {
+    const uint8_t src = music_online_current_src();
+    const char *uid = (src == ONLINE_SRC_QQ) ? online_qq_musicid() : online_netease_uid();
+    if (s_ids_loaded && s_src_snapshot == src && strcmp(s_uid_snapshot, uid) == 0) {
         return true;
     }
     ids_drop();
     uint64_t *ids = NULL;
     size_t n = 0;
-    if (online_netease_likelist(&ids, &n) != ESP_OK) {
+    const esp_err_t err = (src == ONLINE_SRC_QQ) ? online_qq_likelist(&ids, &n)
+                                                 : online_netease_likelist(&ids, &n);
+    if (err != ESP_OK) {
         return false;
     }
     s_ids = ids;
     s_ids_n = n;
     s_ids_loaded = true;
+    s_src_snapshot = src;
     /* ★ snapshot 要在调用**之后**取：uid 为空时 likelist 内部会先打一次
      *   /user/account 把 uid 补上，之后 online_netease_uid() 才有值。 */
-    snprintf(s_uid_snapshot, sizeof(s_uid_snapshot), "%s", online_netease_uid());
+    snprintf(s_uid_snapshot, sizeof(s_uid_snapshot), "%s",
+             (src == ONLINE_SRC_QQ) ? online_qq_musicid() : online_netease_uid());
     return true;
+}
+
+/* 当前音源登录着吗 */
+static bool like_logged_in(void)
+{
+    return (music_online_current_src() == ONLINE_SRC_QQ) ? online_qq_logged_in()
+                                                         : online_netease_logged_in();
 }
 
 /* ---------------------------------------------------------------- 工作线程 */
@@ -149,7 +170,7 @@ static void like_task(void *arg)
     int state = 0;        /* 0 = 本次没得出状态（不改） */
     int result = 0;       /* toast 用 */
 
-    if (!online_netease_logged_in()) {
+    if (!like_logged_in()) {
         if (req->op != LIKE_OP_SYNC) {
             result = 3;                 /* 请先登录 */
         }
@@ -162,7 +183,9 @@ static void like_task(void *arg)
         }
     } else {
         const bool want = (req->op == LIKE_OP_ADD);
-        const esp_err_t err = online_netease_like(req->id, want);
+        const esp_err_t err = (music_online_current_src() == ONLINE_SRC_QQ)
+                                  ? online_qq_like(req->id, want)
+                                  : online_netease_like(req->id, want);
         if (err == ESP_OK) {
             state  = want ? 1 : 2;
             result = want ? 1 : 2;
@@ -237,7 +260,8 @@ void music_like_tick(void)
         switch (st->like_result) {
         case 1:  ui_toast("已添加到我喜欢歌单", 1600); break;
         case 2:  ui_toast("已取消喜欢", 1600); break;
-        case 3:  ui_toast("请先登录网易云账号", 1800); break;
+        case 3:  ui_toast((music_online_current_src() == ONLINE_SRC_QQ)
+                              ? "请先登录 QQ 音乐" : "请先登录网易云账号", 1800); break;
         default: ui_toast("操作失败，请稍后重试", 1600); break;
         }
         st->like_result = 0;
@@ -276,7 +300,7 @@ void music_like_tick(void)
     }
 
     /* ⑤ 未登录：不查（省一次必然失败的请求），红心保持空心 */
-    if (!online_netease_logged_in()) {
+    if (!like_logged_in()) {
         st->like_state = 0;
         return;
     }
@@ -305,8 +329,9 @@ void music_like_toggle(void)
     if (st->like_busy) {
         return;                          /* 转圈中：忽略连点 */
     }
-    if (!online_netease_logged_in()) {
-        ui_toast("请先登录网易云账号", 1800);
+    if (!like_logged_in()) {
+        ui_toast((music_online_current_src() == ONLINE_SRC_QQ) ? "请先登录 QQ 音乐"
+                                                              : "请先登录网易云账号", 1800);
         return;
     }
 

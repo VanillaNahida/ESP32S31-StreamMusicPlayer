@@ -38,6 +38,7 @@
 #include "internal/os_fs.h"
 #include "internal/os_http_client.h"
 #include "internal/os_json.h"
+#include "internal/os_qq.h"
 #include "internal/os_state.h"
 #include "internal/os_util.h"
 
@@ -262,6 +263,10 @@ esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_
     url[0] = '\0';
     if (song->cover_url[0]) {
         snprintf(url, sizeof(url), "%s", song->cover_url);
+    } else if (song->src == ONLINE_SRC_QQ) {
+        /* QQ 的封面地址是抓歌时按 album.mid 拼好的；没有就是真没有，
+         * **不能**拿 QQ 的 songid 去问网易云的 /song/detail（会查到另一首歌）。 */
+        return ESP_ERR_NOT_FOUND;
     } else if (!cover_from_detail(song->id, url, sizeof(url))) {
         return ESP_ERR_NOT_FOUND;
     }
@@ -327,6 +332,74 @@ esp_err_t online_song_cover_data(const online_song_t *song, uint8_t **out, size_
 }
 
 /*
+ * 取歌词原文（两种音源各走各的接口），成功时 *out 是**调用方所有**的 malloc 文本。
+ *
+ *   网易云  GET /lyric?id=<id>      → {"lrc":{"lyric":"[00:00.000] …"}}
+ *   QQ      GET /qq/song/<mid>/lyric → {"data":{"lyric":"[ti:]…\n[00:00.00]…"}}
+ *
+ * 两边都可能在末尾给一大堆标签行，缓存有上限（LRC_CACHE_BYTES_MAX），超了截断。
+ */
+static esp_err_t lyric_fetch(const online_song_t *song, char **out, size_t *out_len)
+{
+    *out = NULL;
+    *out_len = 0;
+
+    if (song->src == ONLINE_SRC_QQ) {
+        char *text = NULL;
+        size_t len = 0;
+        const esp_err_t err = online_qq_lyric(song, &text, &len);
+        if (err != ESP_OK) {
+            ESP_LOGD(TAG, "lyric %u(QQ): %s", (unsigned)song->id, esp_err_to_name(err));
+            return err;
+        }
+        if (len >= LRC_CACHE_BYTES_MAX) {
+            len = LRC_CACHE_BYTES_MAX - 1;
+            text[len] = '\0';
+        }
+        *out = text;
+        *out_len = len;
+        return ESP_OK;
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), API_PATH_LYRIC, (unsigned)song->id);
+    char *js = NULL;
+    esp_err_t ret = os_net_api_get_ex(path, true, &js);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "lyric %u: 请求失败 %s", (unsigned)song->id, esp_err_to_name(ret));
+        return ret;
+    }
+    cJSON *root = cJSON_Parse(js);
+    free(js);
+    if (!root) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    const cJSON *lrc = cJSON_GetObjectItemCaseSensitive(root, "lrc");
+    const cJSON *ly = cJSON_IsObject(lrc)
+                          ? cJSON_GetObjectItemCaseSensitive(lrc, "lyric") : NULL;
+    if (!cJSON_IsString(ly) || !ly->valuestring || !ly->valuestring[0]) {
+        cJSON_Delete(root);
+        ESP_LOGD(TAG, "lyric %u: 无歌词（纯音乐 / 接口没给）", (unsigned)song->id);
+        return ESP_ERR_NOT_FOUND;
+    }
+    size_t len = strlen(ly->valuestring);
+    if (len >= LRC_CACHE_BYTES_MAX) {
+        len = LRC_CACHE_BYTES_MAX - 1;          /* 超长歌词截断，别撑爆缓存 */
+    }
+    char *text = (char *)os_psram_alloc(len + 1);
+    if (!text) {
+        cJSON_Delete(root);
+        return ESP_ERR_NO_MEM;
+    }
+    memcpy(text, ly->valuestring, len);
+    text[len] = '\0';
+    cJSON_Delete(root);
+    *out = text;
+    *out_len = len;
+    return ESP_OK;
+}
+
+/*
  * 歌词文本（PSRAM 缓存，不落 SD）。命中缓存直接拷贝；没命中就取，进缓存 + 拷贝。
  * *out 用 free() 释放。
  *
@@ -366,40 +439,12 @@ esp_err_t online_song_lyrics_data(const online_song_t *song, char **out, size_t 
         return ESP_ERR_NOT_FOUND;
     }
 
-    char path[64];
-    snprintf(path, sizeof(path), API_PATH_LYRIC, (unsigned)song->id);
-    char *js = NULL;
-    esp_err_t ret = os_net_api_get_ex(path, true, &js);
+    char *text = NULL;
+    size_t len = 0;
+    esp_err_t ret = lyric_fetch(song, &text, &len);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "lyric %u: 请求失败 %s", (unsigned)song->id, esp_err_to_name(ret));
         return ret;
     }
-    cJSON *root = cJSON_Parse(js);
-    free(js);
-    if (!root) {
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-    const cJSON *lrc = cJSON_GetObjectItemCaseSensitive(root, "lrc");
-    const cJSON *ly = cJSON_IsObject(lrc)
-                          ? cJSON_GetObjectItemCaseSensitive(lrc, "lyric") : NULL;
-    if (!cJSON_IsString(ly) || !ly->valuestring || !ly->valuestring[0]) {
-        cJSON_Delete(root);
-        ESP_LOGD(TAG, "lyric %u: 无歌词（纯音乐 / 接口没给）", (unsigned)song->id);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    size_t len = strlen(ly->valuestring);
-    if (len >= LRC_CACHE_BYTES_MAX) {
-        len = LRC_CACHE_BYTES_MAX - 1;          /* 超长歌词截断，别撑爆缓存 */
-    }
-    char *text = (char *)os_psram_alloc(len + 1);
-    if (!text) {
-        cJSON_Delete(root);
-        return ESP_ERR_NO_MEM;
-    }
-    memcpy(text, ly->valuestring, len);
-    text[len] = '\0';
-    cJSON_Delete(root);
     if (len < 8) {
         /* 只有 "[00:00.000]" 这种空壳，当成没有 */
         free(text);
@@ -455,6 +500,17 @@ esp_err_t online_song_prepare_stream(const online_song_t *song)
  * 兜底路径：把整首歌下载到 SD（命中缓存直接返回），再当本地文件播放。
  * 流式失败时回退用它；也可以用来做离线缓存。
  */
+/* 下载缓存的键：网易云 = "<id>"，QQ = "q<id>"。
+ * 两家的编号是独立的，同一个数字可能是完全不同的两首歌 —— 不分开就会串音。 */
+static void song_cache_key(const online_song_t *song, char *out, size_t cap)
+{
+    if (song->src == ONLINE_SRC_QQ) {
+        snprintf(out, cap, "q%u", (unsigned)song->id);
+    } else {
+        snprintf(out, cap, "%u", (unsigned)song->id);
+    }
+}
+
 esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_t cap)
 {
     if (!song || !audio_path || cap == 0 || song->id == 0) {
@@ -462,7 +518,10 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
     }
     audio_path[0] = '\0';
 
-    if (os_find_cached_audio(song->id, audio_path, cap)) {
+    char key[24];
+    song_cache_key(song, key, sizeof(key));
+
+    if (os_find_cached_audio(key, audio_path, cap)) {
         /*
          * ★ 缓存体检：老缓存可能是**匿名时代下到的 30 秒试听片段**
          *   （2026-10 换"CK 直链优先"之前，会员歌就是这么被下下来的）。
@@ -493,7 +552,7 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
 
     /* 先下到临时文件，嗅探格式后再改名（扩展名决定用哪个解码器） */
     char tmp[192];
-    snprintf(tmp, sizeof(tmp), ONLINE_AUDIO_DIR "/%u.part", (unsigned)song->id);
+    snprintf(tmp, sizeof(tmp), ONLINE_AUDIO_DIR "/%s.part", key);
     uint8_t sniff[16] = {};
 
     /*
@@ -515,7 +574,7 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
     }
     char ext[8];
     os_ext_from_sniff(sniff, ext, sizeof(ext));
-    snprintf(audio_path, cap, ONLINE_AUDIO_DIR "/%u%s", (unsigned)song->id, ext);
+    snprintf(audio_path, cap, ONLINE_AUDIO_DIR "/%s%s", key, ext);
     unlink(audio_path);
     if (rename(tmp, audio_path) != 0) {
         unlink(tmp);

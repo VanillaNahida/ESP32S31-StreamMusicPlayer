@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ao_page_srch.cc —— 第 2 页「搜索」（历史 / 结果分页 / 输入法交互）
  *
  * 列表内容的三条规则（需求原文）：
@@ -268,6 +268,8 @@ static void srch_do_search(const char *kw)
         ui_toast("Wi-Fi 未连接", 1500);
         return;
     }
+    /* 搜索结果不属于任何歌单：清掉收藏上下文（「删除」按钮据此禁用） */
+    ao_collect_ctx_clear();
     online_history_add(k);           /* 记历史（服务侧去重 + 提到最前） */
     s_srch_busy    = true;           /* 先进入"正在搜索"态（见 s_srch_busy 的说明） */
     s_srch_has_res = false;          /* 结果没回来之前不算"有结果"，避免误报"没找到" */

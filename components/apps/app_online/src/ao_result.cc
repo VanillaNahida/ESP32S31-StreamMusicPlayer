@@ -15,6 +15,7 @@
 
 #include "ao_common.h"
 #include "ao_account.h"
+#include "ao_provider.h"
 #include "ao_model.h"
 #include "ao_pages.h"
 #include "ao_overlay.h"
@@ -119,13 +120,14 @@ static void on_result(void)
             ao_qr_set_status("二维码获取失败，点「刷新」重试");
             break;
         }
-        ao_qr_show_key(msg, res.img, res.img_len);   /* 内部 free(res.img) */
+        /* identifier 在 res.id 里（QQ 的 128 字符，msg 只有 64 装不下） */
+        ao_qr_show_key(res.id, res.img, res.img_len);   /* 内部 free(res.img) */
         break;
     case OREQ_QR_POLL: {
         const int code = res.qr;
         if (code == NET_QR_OK) {
             ao_qr_set_status("登录成功");
-            ui_toast("网易云登录成功", 1800);
+            ui_toast(ao_is_qq() ? "QQ 音乐登录成功" : "网易云登录成功", 1800);
             ao_login_success_forget(lv_tick_get());
             ao_qr_close();
             ao_pl_rebuild();
@@ -143,7 +145,11 @@ static void on_result(void)
     }
     case OREQ_LOGOUT:
         ao_logout_reset(lv_tick_get());
-        ui_toast(err == ESP_OK ? "已退出网易云登录" : "退出失败", 1600);
+        if (err == ESP_OK) {
+            ui_toast(ao_is_qq() ? "已退出 QQ 音乐登录" : "已退出网易云登录", 1600);
+        } else {
+            ui_toast("退出失败", 1600);
+        }
         ao_pl_rebuild();
         ao_acct_rebuild();
         break;
@@ -157,6 +163,9 @@ static void on_result(void)
     /* ---------------- 第 0 页「我的歌单」：账号歌单 / 每日推荐 ---------------- */
     case OREQ_ACCT_PLS:
         ao_acct_pls_result(err, res.pls, res.pls_n, lv_tick_get());
+        /* QQ 的昵称只有抓歌单时才看得到（歌单里的 creator.nick），
+         * 工作线程把它放进 msg 带回来 —— 有就用上，别让界面上一直是空名字。 */
+        ao_login_name_set(msg);
         ao_acct_rebuild();
         break;
     case OREQ_ACCT_SONGS: {
@@ -179,21 +188,71 @@ static void on_result(void)
         ao_acct_rebuild();
         break;
     }
-    case OREQ_DAILY:
+    case OREQ_DAILY: {
+        /*
+         * 一次性推荐列表，msg 是来源（工作线程原样带回的请求参数）：
+         *   "" → 网易云每日推荐；"guess" → QQ 每日30首；"radar" → QQ 私人雷达
+         */
+        const int feed = (strcmp(msg, "radar") == 0) ? AO_FEED_QQ_RADAR
+                         : (strcmp(msg, "guess") == 0) ? AO_FEED_QQ_DAILY
+                                                       : AO_FEED_NETEASE_DAILY;
+        static const char *const kFeedName[] = { "每日推荐", "每日30首", "私人雷达" };
         if (err == ESP_OK && songs) {
+            ao_acct_feed_set(feed);
             ao_queue_install(songs, count, DETAIL_KEY_DAILY, OWNER_ACCT);
             ao_daily_loaded();
-            ui_toast("每日推荐已载入", 1200);
+            char ok_msg[48];
+            snprintf(ok_msg, sizeof(ok_msg), "%s已载入", kFeedName[feed]);
+            ui_toast(ok_msg, 1200);
         } else {
             free(songs);
             /* 同上：带出服务侧的具体原因（"响应过大" / 版权 / 网络…） */
             const char *why = online_last_error();
             char buf[128];
-            snprintf(buf, sizeof(buf), "每日推荐读取失败：%.60s", why ? why : "网络不通");
+            snprintf(buf, sizeof(buf), "%.12s读取失败：%.48s", kFeedName[feed],
+                     why ? why : "网络不通");
             ui_toast(buf, 2600);
             ao_acct_detail_close();   /* 读不出来就退回列表，别停在空壳上 */
         }
         ao_acct_rebuild();
+        break;
+    }
+    case OREQ_COLLECT:
+        /*
+         * 收藏到歌单（QQ：dirid 来自账号歌单列表；"我喜欢" 是 201）。
+         * msg 是工作线程从服务端 data.already 翻出来的结论：
+         *   "already" → 目标歌单里本来就有（**没有重复写入**）
+         *   "added"   → 真加进去了
+         */
+        if (err == ESP_OK) {
+            ui_toast(strcmp(msg, "already") == 0 ? "这个歌单里已经有这首歌了" : "已收藏到歌单",
+                     strcmp(msg, "already") == 0 ? 1800 : 1500);
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            ui_toast("请先登录 QQ 音乐", 1800);
+        } else {
+            const char *why = online_last_error();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "收藏失败：%.48s", why ? why : "网络或权限问题");
+            ui_toast(buf, 2400);
+        }
+        break;
+    case OREQ_UNCOLLECT:
+        /* 从当前歌单删除：msg = 被删除的歌单 dirid（用于判断要不要刷新当前列表） */
+        if (err == ESP_OK) {
+            ui_toast("已从歌单删除", 1500);
+            if (ao_acct_detail() && msg[0] &&
+                strcmp(ao_collect_ctx_dirid(), msg) == 0) {
+                /* 删的正是眼前这个歌单：重新拉第一页，别让那首歌还挂在列表里 */
+                ao_acct_detail_refresh();
+            }
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            ui_toast("请先登录 QQ 音乐", 1800);
+        } else {
+            const char *why = online_last_error();
+            char buf[96];
+            snprintf(buf, sizeof(buf), "删除失败：%.48s", why ? why : "网络或权限问题");
+            ui_toast(buf, 2400);
+        }
         break;
     default:
         free(songs);
@@ -220,7 +279,7 @@ void ao_result_poll_cb(lv_timer_t *t)
      * —— 以前"问过就不再问"，用户重启后进来就是一片空。这里按 5 秒节流重试，
      * 转圈动画也跟着出现（见 ao_acct_kick_if_needed / ao_acct_nick_kick_if_needed）。
      */
-    if (online_netease_logged_in()) {
+    if (ao_logged_in()) {
         const bool busy_before = ao_acct_pls_busy();
         ao_acct_nick_kick_if_needed(lv_tick_get());
         ao_acct_kick_if_needed(lv_tick_get());

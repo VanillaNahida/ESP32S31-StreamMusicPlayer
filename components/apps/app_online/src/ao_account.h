@@ -28,15 +28,27 @@ int  ao_acct_page(void);
 void ao_acct_page_set(int page);
 
 bool ao_acct_detail(void);
+/* "一次性推荐列表"详情（每日推荐 / QQ 每日30首 / 私人雷达）——三者共用同一个队列 Key */
 bool ao_acct_daily(void);
 int  ao_acct_sel(void);
+
+/*
+ * 一次性推荐列表的来源（只影响标题文案，不影响数据）：
+ *   0 = 网易云每日推荐  1 = QQ 每日30首  2 = QQ 私人雷达
+ */
+#define AO_FEED_NETEASE_DAILY 0
+#define AO_FEED_QQ_DAILY      1
+#define AO_FEED_QQ_RADAR      2
+void ao_acct_feed_enter(int kind);   /* 进推荐详情（kind 见上） */
+int  ao_acct_feed(void);             /* 当前推荐来源 */
+void ao_acct_feed_set(int kind);     /* 结果回来时确认来源（ao_result 用） */
 
 /* 账号页那半份"详情身份 Key"（每日推荐标记 / 账号歌单 ID / 空串）。
  * ao_model.cc 的 ao_detail_want_key() 在"不是 meting 歌单详情"时委托给它。 */
 const char *ao_acct_detail_want_key(void);
 
 void ao_acct_detail_exit(void);        /* 返回列表：detail/sel/daily/page 全复位 */
-void ao_acct_daily_enter(void);        /* 进"每日推荐"详情 */
+void ao_acct_daily_enter(void);        /* 进"每日推荐"详情（= feed_enter(0)） */
 void ao_acct_pl_enter(int idx);        /* 进某个账号歌单详情 */
 void ao_acct_detail_close(void);       /* 只把详情关掉（读不出来时退回列表用） */
 void ao_acct_detail_mark_closed(void); /* 只清 detail 标志（online_on_delete 用） */
@@ -55,6 +67,8 @@ uint32_t    ao_backoff_ms(void);
 /* 昵称从两个地方来：**NVS 里存的那份**（重启后立刻可用）和 /user/account 的结果。
  * 这里只做"NVS → s_login_name"的补齐，避免每次重画都把界面上的新昵称盖回去。 */
 void ao_login_name_sync(void);
+/* 直接写昵称（QQ 的昵称在抓歌单时才拿到） */
+void ao_login_name_set(const char *name);
 
 /* 失败：间隔翻倍（上限 60 s）；成功：复位成 5 s */
 void ao_backoff_update(bool ok);

@@ -18,14 +18,17 @@
 #include "internal/os_state.h"
 
 /* 在音频缓存目录里找这首歌已下载的文件（扩展名不定，所以按前缀找） */
-bool os_find_cached_audio(uint32_t song_id, char *out, size_t cap)
+bool os_find_cached_audio(const char *key, char *out, size_t cap)
 {
+    if (!key || !key[0]) {
+        return false;
+    }
     DIR *d = opendir(ONLINE_AUDIO_DIR);
     if (!d) {
         return false;
     }
-    char prefix[24];
-    snprintf(prefix, sizeof(prefix), "%u.", (unsigned)song_id);
+    char prefix[40];
+    snprintf(prefix, sizeof(prefix), "%s.", key);
     const size_t plen = strlen(prefix);
     struct dirent *ent;
     bool found = false;

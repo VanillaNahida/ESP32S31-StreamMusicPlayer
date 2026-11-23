@@ -22,6 +22,7 @@
  */
 #include "ao_overlay.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include "esp_log.h"
@@ -38,6 +39,7 @@
 #include "ao_account.h"
 #include "ao_model.h"
 #include "ao_pages.h"
+#include "ao_provider.h"
 #include "ao_work.h"
 
 static const char *TAG = AO_TAG;
@@ -52,7 +54,9 @@ static lv_image_dsc_t *s_qr_dsc;       /* 图片描述符（堆上，随浮层�
 static uint8_t      *s_qr_px;          /* 解码后的 RGB565（media_meta_cover_free 释放） */
 static lv_obj_t     *s_qr_status;      /* 状态行：等待扫码 / 已扫码待确认 / 已失效… */
 static lv_timer_t   *s_qr_timer;       /* 轮询定时器 */
-static char          s_qr_key[64];     /* 当前 unikey */
+/* 当前 identifier（网易云叫 unikey）。QQ 的实测 128 字符 —— 64 字节会截断，
+ * 截断后轮询永远对不上（界面就一直停在"等待扫码"）。 */
+static char          s_qr_key[192];
 
 void ao_qr_set_status(const char *txt)
 {
@@ -75,13 +79,32 @@ static void qr_show_png(uint8_t *png, size_t len)
     uint8_t *px = NULL;
     int w = 0;
     int h = 0;
+    /*
+     * 解不出来时把 PNG 的 IHDR 打一行：两家二维码的**格式完全不一样** ——
+     *   网易云 = 8 bit 灰度/调色板、尺寸也大；
+     *   QQ     = **111x111、1 bit 灰度**（实测，见 docs/qq-music.md §4.3）。
+     * 有了位深/颜色类型/尺寸，才能一眼判断是"解码器不支持这种形态"还是"字节根本不对"。
+     */
     const esp_err_t err = media_meta_image_mem_rgb565(png, len, QR_IMG_MAX_DIM, &px, &w, &h);
-    free(png);
     if (err != ESP_OK || !px) {
-        ESP_LOGW(TAG, "qr png decode failed: %s", esp_err_to_name(err));
+        if (len >= 26 && png[0] == 0x89 && png[1] == 'P' && png[2] == 'N' && png[3] == 'G') {
+            const unsigned iw = ((unsigned)png[16] << 24) | ((unsigned)png[17] << 16) |
+                                ((unsigned)png[18] << 8) | (unsigned)png[19];
+            const unsigned ih = ((unsigned)png[20] << 24) | ((unsigned)png[21] << 16) |
+                                ((unsigned)png[22] << 8) | (unsigned)png[23];
+            ESP_LOGW(TAG, "qr png decode failed: %s (%ux%u depth=%u color=%u interlace=%u, %u bytes)",
+                     esp_err_to_name(err), iw, ih, (unsigned)png[24], (unsigned)png[25],
+                     (unsigned)png[28], (unsigned)len);
+        } else {
+            ESP_LOGW(TAG, "qr png decode failed: %s (not a PNG? magic %02x %02x %02x %02x, %u bytes)",
+                     esp_err_to_name(err), (unsigned)png[0], (unsigned)png[1],
+                     (unsigned)png[2], (unsigned)png[3], (unsigned)len);
+        }
+        free(png);
         ao_qr_set_status("二维码解析失败，点「刷新」重试");
         return;
     }
+    free(png);
 
     if (s_qr_px) {
         media_meta_cover_free(s_qr_px);
@@ -142,7 +165,7 @@ void ao_qr_show_key(const char *key, uint8_t *png, size_t png_len)
 {
     snprintf(s_qr_key, sizeof(s_qr_key), "%s", key ? key : "");
     qr_show_png(png, png_len);        /* 内部 free(png) */
-    ao_qr_set_status("请用网易云音乐 App 扫码");
+    ao_qr_set_status(ao_provider_scan_status());
     if (!s_qr_timer) {
         s_qr_timer = lv_timer_create(qr_poll_cb, QR_POLL_MS, NULL);
     }
@@ -170,13 +193,14 @@ void ao_qr_open(void)
     }
 
     /* 碧蓝档案风格白卡片：标题 + 黄色下划线 + 右上角 ✕（见 ui_ba.h） */
-    s_qr_dlg = ui_ba_open("扫码登录", 46, LV_ALIGN_CENTER, 0);
+    s_qr_dlg = ui_ba_open(ao_is_qq() ? "扫码登录 QQ 音乐" : "扫码登录", 46,
+                          LV_ALIGN_CENTER, 0);
     s_qr_scrim = s_qr_dlg.scrim;
     /* ✕ / 点空白 都走同一个关闭路径（要顺手停轮询、释放二维码内存） */
     ui_ba_on_close(&s_qr_dlg, [](void *user) { (void)user; ao_qr_close(); }, NULL);
     ui_ba_scrim_dismissible(&s_qr_dlg, true);
 
-    ui_ba_hint(s_qr_dlg.body, "用网易云音乐 App 扫码，即可获取你的账号歌单与每日推荐");
+    ui_ba_hint(s_qr_dlg.body, ao_provider_scan_hint());
 
     s_qr_img = lv_image_create(s_qr_dlg.body);
     lv_obj_set_size(s_qr_img, UI_PX_H(QR_IMG_MAX_DIM), UI_PX_H(QR_IMG_MAX_DIM));
@@ -213,14 +237,16 @@ static void logout_confirmed(void *user)
 static void logout_clicked(lv_event_t *e)
 {
     (void)e;
-    ui_ba_confirm_ex("退 出 登 录", "确认退出网易云账号吗？\n退出后需要重新扫码登录。",
-                     "退出", "取消", true, logout_confirmed, NULL);
+    char msg[96];
+    snprintf(msg, sizeof(msg), "确认退出%s账号吗？\n退出后需要重新扫码登录。",
+             ao_provider_account_name());
+    ui_ba_confirm_ex("退 出 登 录", msg, "退出", "取消", true, logout_confirmed, NULL);
 }
 
 /* 账号状态行：未登录 = 「扫码登录」入口；已登录 = 昵称 + 「退出登录」 */
 void ao_acct_row_build(lv_obj_t *col)
 {
-    const bool in = online_netease_logged_in();
+    const bool in = ao_logged_in();
     /* 昵称先用 NVS 里存的那份（重启后不用等 /user/account 往返） */
     ao_login_name_sync();
     if (in) {
@@ -239,9 +265,10 @@ void ao_acct_row_build(lv_obj_t *col)
     lv_obj_set_style_text_font(txt, UI_FONT_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_color(txt, in ? UI_COLOR_ACCENT : UI_COLOR_FG, LV_PART_MAIN);
     if (in) {
-        lv_label_set_text_fmt(txt, "已登录：%.24s", name[0] ? name : "网易云账号");
+        lv_label_set_text_fmt(txt, "已登录：%.24s",
+                              name[0] ? name : ao_provider_account_name());
     } else {
-        lv_label_set_text(txt, "未登录网易云");
+        lv_label_set_text_fmt(txt, "未登录%s", ao_provider_account_name());
     }
     lv_obj_align(txt, LV_ALIGN_LEFT_MID, 0, 0);
 
@@ -253,6 +280,285 @@ void ao_acct_row_build(lv_obj_t *col)
     lv_obj_set_ext_click_area(btn, UI_PX_H(12));
     lv_obj_add_event_cb(btn, in ? logout_clicked : login_clicked, LV_EVENT_CLICKED, NULL);
     lv_obj_align(btn, LV_ALIGN_RIGHT_MID, 0, 0);
+}
+
+/* ================================================== 收藏到歌单浮层（QQ）
+ *
+ * 交互（2026-11 用户要求改版）：**选一个歌单 + 三个按钮**，不再是"点一下歌单就收藏"。
+ *
+ *   ┌ 收藏「歌名」 ────────────────── ✕ ┐
+ *   │ ◉ 我喜欢的音乐            719 首  │
+ *   │ ○ 我创建的                5 首    │
+ *   │ …（可上下滑动）                  │
+ *   │ [取消]  [收藏]  [删除]            │
+ *   └──────────────────────────────────┘
+ *
+ * ★ 为什么改：旧版把"收藏"直接挂在行点击上，**上下滑动时手指在行上抬起来就误收藏**。
+ *   现在行点击只改选中项（无副作用），真正的写操作必须再按「收藏」。
+ *
+ * ★ 滑动误触还有第二道保险：行点击不是用 ui_ba_opt_row（那套按下缩小/复原后派发，
+ *   对滚动手势不友好），而是普通的 LV_EVENT_CLICKED + **按下点到松手点的位移检查**
+ *   —— LVGL 在真的滚动时本来就不发 CLICKED，但"想滚却没滚够 10 px"那次仍会当成点击，
+ *   位移一超过 14 px 我们就忽略它。
+ *
+ * ★ 「删除」是"从**当前**歌单删掉这首歌"，只对能确定 dirid 的列表可用
+ *   （我的歌单里的自建歌单 / 我喜欢的音乐）；搜索结果、按 ID 添加的歌单没有 dirid，
+ *   点了会给一句"当前列表不是你的歌单，无法删除"。
+ *
+ * ★ 「已经收藏过了」由**服务端**判定（add_songs 先查目标歌单，命中就不写，
+ *   返回 data.already）。本地还能省一次往返：目标就是当前歌单时，这首歌显然在里面。
+ */
+
+/* 对话框里最多列几个歌单：再多就不是"选一下"而是"翻半天"了 */
+#define COLLECT_MAX_ROWS  16
+/* 按下→松手的位移超过这个就当成滑动，不算点选 */
+#define COLLECT_TAP_SLOP  UI_PX_H(14)
+
+static ui_ba_dialog_t s_col_dlg;
+static lv_obj_t     *s_col_scrim;
+static lv_obj_t     *s_col_rows[COLLECT_MAX_ROWS];
+static lv_obj_t     *s_col_dots[COLLECT_MAX_ROWS];
+static int           s_col_row_n;
+static int           s_col_sel = -1;          /* 选中的歌单下标（-1 = 还没选） */
+static int           s_col_idx = -1;          /* 要收藏的歌曲在队列里的下标 */
+static char          s_col_src[20];           /* 当前列表所属歌单的 dirid（删除用） */
+static lv_point_t    s_col_press;             /* 按下点（判"是不是滑动"） */
+static bool          s_col_pressed;
+
+void ao_collect_close(void)
+{
+    ui_ba_close(&s_col_dlg);
+    s_col_scrim = NULL;
+    s_col_idx   = -1;
+    s_col_sel   = -1;
+    s_col_row_n = 0;
+    s_col_src[0] = '\0';
+    s_col_pressed = false;
+    for (int i = 0; i < COLLECT_MAX_ROWS; i++) {
+        s_col_rows[i] = NULL;
+        s_col_dots[i] = NULL;
+    }
+}
+
+/* 把选中态画到所有行上（底色 + 左侧圆点） */
+static void collect_refresh_selection(void)
+{
+    for (int i = 0; i < s_col_row_n; i++) {
+        const bool on = (i == s_col_sel);
+        if (s_col_rows[i]) {
+            lv_obj_set_style_bg_color(s_col_rows[i],
+                                      lv_color_hex(on ? BA_BLUE_SOFT : BA_CARD), LV_PART_MAIN);
+            lv_obj_set_style_border_color(s_col_rows[i],
+                                          lv_color_hex(on ? BA_BLUE : BA_INPUT_BG), LV_PART_MAIN);
+        }
+        if (s_col_dots[i]) {
+            lv_obj_set_style_bg_opa(s_col_dots[i], on ? LV_OPA_COVER : LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_bg_color(s_col_dots[i], lv_color_hex(BA_BLUE), LV_PART_MAIN);
+            lv_obj_set_style_border_color(s_col_dots[i],
+                                          lv_color_hex(on ? BA_BLUE : BA_TEXT_DIM), LV_PART_MAIN);
+        }
+    }
+}
+
+static void collect_row_pressed(lv_event_t *e)
+{
+    (void)e;
+    const lv_indev_t *indev = lv_indev_active();
+    if (indev) {
+        lv_indev_get_point(indev, &s_col_press);
+        s_col_pressed = true;
+    }
+}
+
+/* 行点击 = **只选中**（不写任何东西）；滑动超过阈值直接忽略 */
+static void collect_row_clicked(lv_event_t *e)
+{
+    const int i = (int)(intptr_t)lv_event_get_user_data(e);
+    if (i < 0 || i >= s_col_row_n) {
+        return;
+    }
+    if (s_col_pressed) {
+        const lv_indev_t *indev = lv_indev_active();
+        if (indev) {
+            lv_point_t p;
+            lv_indev_get_point(indev, &p);
+            const int32_t dx = (int32_t)p.x - (int32_t)s_col_press.x;
+            const int32_t dy = (int32_t)p.y - (int32_t)s_col_press.y;
+            if (dx * dx + dy * dy > (int32_t)COLLECT_TAP_SLOP * COLLECT_TAP_SLOP) {
+                return;               /* 这是一次滑动，不是点选 */
+            }
+        }
+    }
+    s_col_sel = i;
+    collect_refresh_selection();
+}
+
+/* 造一行：圆点 + 名称 + 首数 */
+static void collect_make_row(lv_obj_t *col, int i, const online_acct_playlist_t *p)
+{
+    lv_obj_t *row = lv_obj_create(col);
+    lv_obj_remove_style_all(row);
+    lv_obj_set_width(row, LV_PCT(100));
+    lv_obj_set_height(row, UI_PX_H(48));
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_hor(row, UI_PX_H(12), LV_PART_MAIN);
+    lv_obj_set_style_pad_column(row, UI_PX_H(10), LV_PART_MAIN);
+    lv_obj_set_style_radius(row, UI_PX_H(10), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(row, lv_color_hex(BA_CARD), LV_PART_MAIN);
+    lv_obj_set_style_border_width(row, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(row, lv_color_hex(BA_INPUT_BG), LV_PART_MAIN);
+
+    lv_obj_t *dot = lv_obj_create(row);
+    lv_obj_remove_style_all(dot);
+    lv_obj_set_size(dot, UI_PX_H(18), UI_PX_H(18));
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(dot, 2, LV_PART_MAIN);
+    lv_obj_set_style_border_color(dot, lv_color_hex(BA_TEXT_DIM), LV_PART_MAIN);
+
+    lv_obj_t *lab = lv_label_create(row);
+    lv_obj_set_style_text_font(lab, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lab, lv_color_hex(BA_TEXT), LV_PART_MAIN);
+    lv_obj_set_flex_grow(lab, 1);
+    lv_label_set_long_mode(lab, LV_LABEL_LONG_DOT);
+    lv_label_set_text(lab, p->name[0] ? p->name : p->id);
+
+    lv_obj_t *cnt = lv_label_create(row);
+    lv_obj_set_style_text_font(cnt, UI_FONT_SMALL, LV_PART_MAIN);
+    lv_obj_set_style_text_color(cnt, lv_color_hex(BA_TEXT_DIM), LV_PART_MAIN);
+    lv_label_set_text_fmt(cnt, "%d 首", p->track_count);
+
+    lv_obj_add_event_cb(row, collect_row_pressed, LV_EVENT_PRESSED, (void *)(intptr_t)i);
+    lv_obj_add_event_cb(row, collect_row_clicked, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+
+    s_col_rows[i] = row;
+    s_col_dots[i] = dot;
+}
+
+/* 「收藏」：写进选中的歌单 */
+static void collect_add_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (s_col_sel < 0) {
+        ui_toast("先点一下要收藏到的歌单", 1600);
+        return;
+    }
+    const size_t n = ao_acct_pls_count();
+    if ((size_t)s_col_sel >= n) {
+        ao_collect_close();
+        return;
+    }
+    const online_acct_playlist_t *p = ao_acct_playlists(NULL) + s_col_sel;
+    const online_song_t *songs = ao_queue_songs();
+    if (s_col_idx < 0 || (size_t)s_col_idx >= ao_queue_count()) {
+        ao_collect_close();
+        return;
+    }
+    if (!p->dirid[0]) {
+        ui_toast("这个歌单不支持加歌", 1600);
+        return;
+    }
+    /* 目标就是当前列表 → 这首歌本来就在里面（省一次往返，也避免服务端白查一遍） */
+    if (s_col_src[0] && strcmp(s_col_src, p->dirid) == 0) {
+        ui_toast("这个歌单里已经有这首歌了", 1800);
+        ao_collect_close();
+        return;
+    }
+    char sid[24];
+    snprintf(sid, sizeof(sid), "%u", (unsigned)songs[s_col_idx].id);
+    /* arg3 传目标歌单的 dissid：服务端据此判"是不是已经收藏过" */
+    ao_work_submit3(OREQ_COLLECT, p->dirid, sid, p->id);
+    ao_collect_close();
+}
+
+/* 「删除」：从当前列表所属的歌单里移除 */
+static void collect_del_clicked(lv_event_t *e)
+{
+    (void)e;
+    if (!s_col_src[0]) {
+        ui_toast("当前列表不是你的歌单，无法删除", 1800);
+        return;
+    }
+    const online_song_t *songs = ao_queue_songs();
+    if (s_col_idx < 0 || (size_t)s_col_idx >= ao_queue_count()) {
+        ao_collect_close();
+        return;
+    }
+    char sid[24];
+    snprintf(sid, sizeof(sid), "%u", (unsigned)songs[s_col_idx].id);
+    ao_work_submit2(OREQ_UNCOLLECT, s_col_src, sid);
+    ao_collect_close();
+}
+
+void ao_collect_open(int song_idx, const char *cur_dirid)
+{
+    if (s_col_scrim) {
+        return;                          /* 已经开着：绝不留第二块遮罩 */
+    }
+    if (song_idx < 0 || (size_t)song_idx >= ao_queue_count()) {
+        return;
+    }
+    const size_t n = ao_acct_pls_count();
+    if (n == 0) {
+        ui_toast("先登录并加载歌单，才能收藏", 1800);
+        return;
+    }
+    s_col_idx = song_idx;
+    s_col_sel = -1;
+    s_col_row_n = 0;
+    s_col_pressed = false;
+    snprintf(s_col_src, sizeof(s_col_src), "%s", (cur_dirid && cur_dirid[0]) ? cur_dirid : "");
+    for (int i = 0; i < COLLECT_MAX_ROWS; i++) {
+        s_col_rows[i] = NULL;
+        s_col_dots[i] = NULL;
+    }
+
+    char title[64];
+    snprintf(title, sizeof(title), "收藏「%.20s」", ao_queue_songs()[song_idx].title);
+    s_col_dlg = ui_ba_open(title, 64, LV_ALIGN_CENTER, 0);
+    s_col_scrim = s_col_dlg.scrim;
+    ui_ba_on_close(&s_col_dlg, [](void *user) { (void)user; ao_collect_close(); }, NULL);
+    ui_ba_scrim_dismissible(&s_col_dlg, true);
+
+    ui_ba_hint(s_col_dlg.body, "先选中歌单，再按「收藏」");
+
+    /* 歌单可能几十个：给一个可滚动的列，最多列 COLLECT_MAX_ROWS 行 */
+    lv_obj_t *col = lv_obj_create(s_col_dlg.body);
+    lv_obj_remove_style_all(col);
+    lv_obj_set_width(col, LV_PCT(100));
+    lv_obj_set_height(col, UI_PX_H(220));
+    lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(col, UI_PX_H(6), LV_PART_MAIN);
+    lv_obj_set_scroll_dir(col, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(col, LV_SCROLLBAR_MODE_AUTO);
+
+    const online_acct_playlist_t *pls = ao_acct_playlists(NULL);
+    const size_t shown = (n > COLLECT_MAX_ROWS) ? COLLECT_MAX_ROWS : n;
+    for (size_t i = 0; i < shown; i++) {
+        collect_make_row(col, (int)i, &pls[i]);
+    }
+    s_col_row_n = (int)shown;
+    /* 当前就在看这个歌单：默认选中它（再按收藏会得到"已经在里面了"） */
+    for (size_t i = 0; i < shown; i++) {
+        if (s_col_src[0] && strcmp(pls[i].dirid, s_col_src) == 0) {
+            s_col_sel = (int)i;
+            break;
+        }
+    }
+    collect_refresh_selection();
+
+    if (n > shown) {
+        ui_ba_hint(s_col_dlg.body, "歌单太多，只显示前 16 个");
+    }
+
+    ui_ba_btn(s_col_dlg.btn_row, "取消", false,
+              [](lv_event_t *e) { (void)e; ao_collect_close(); }, NULL);
+    ui_ba_btn(s_col_dlg.btn_row, "收藏", true, collect_add_clicked, NULL);
+    ui_ba_btn_styled(s_col_dlg.btn_row, "删除", 2, collect_del_clicked, NULL);
 }
 
 /* ================================================================ 浮层与键盘 */

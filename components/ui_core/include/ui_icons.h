@@ -48,6 +48,9 @@ LV_IMAGE_DECLARE(netease_logo);
 LV_IMAGE_DECLARE(momotalk_logo);
 /* 图库，96x96 ARGB8888（来自 assets/icons/gallery.png，512x512 原图缩放） */
 LV_IMAGE_DECLARE(gallery_logo);
+/* QQ 音乐，96x96 ARGB8888（来自 assets/icons/qqmusic.png，240x240 原图缩放）。
+ * 桌面把它和网易云并排放在一起（app_desc_t.order 20 / 21）。 */
+LV_IMAGE_DECLARE(qqmusic_logo);
 
 /* 文件管理列表里「图片文件」那一行的小图标，24x24（来自 assets/icons/gallery.svg）。
  * 素材是单色 #1f1f1f 的方块+山形，直接放在行内 40x40 的圆角色块上，

@@ -62,6 +62,17 @@ esp_err_t os_pl_save(const char *id, const online_song_t *songs, size_t count)
         os_str_copy(rec.cover_url, sizeof(rec.cover_url), songs[i].cover_url);
         os_str_copy(rec.audio_url, sizeof(rec.audio_url), songs[i].audio_url);
         os_str_copy(rec.lrc_url, sizeof(rec.lrc_url), songs[i].lrc_url);
+        /*
+         * 音源信息塞进 rsv 扩展区（**不动磁盘格式、不升 version**）：
+         *   rsv[0]    = src（0 网易云 / 1 QQ）
+         *   rsv[1..2] = dur_sec（小端 uint16，秒）
+         *   rsv[4..]  = mid（QQ 的歌曲 mid，NUL 结尾）
+         * 旧文件里这一段全是 0 → src=NETEASE、无 mid，行为与以前完全一致。
+         */
+        rec.rsv[0] = songs[i].src;
+        rec.rsv[1] = (uint8_t)(songs[i].dur_sec & 0xFF);
+        rec.rsv[2] = (uint8_t)(songs[i].dur_sec >> 8);
+        os_str_copy((char *)&rec.rsv[4], sizeof(rec.rsv) - 4, songs[i].mid);
         if (fwrite(&rec, sizeof(rec), 1, f) != 1) {
             fclose(f);
             unlink(path);
@@ -83,6 +94,10 @@ void os_pl_rec_to_song(const online_rec_t *rec, online_song_t *out)
     os_str_copy(out->cover_url, sizeof(out->cover_url), rec->cover_url);
     os_str_copy(out->audio_url, sizeof(out->audio_url), rec->audio_url);
     os_str_copy(out->lrc_url, sizeof(out->lrc_url), rec->lrc_url);
+    /* rsv 扩展区（见 os_pl_save 里的说明）：旧记录的 src=0 即网易云 */
+    out->src     = (rec->rsv[0] == (uint8_t)ONLINE_SRC_QQ) ? ONLINE_SRC_QQ : ONLINE_SRC_NETEASE;
+    out->dur_sec = (uint16_t)(rec->rsv[1] | ((uint16_t)rec->rsv[2] << 8));
+    os_str_copy(out->mid, sizeof(out->mid), (const char *)&rec->rsv[4]);
 }
 
 bool os_pl_read_record(FILE *f, online_rec_t *rec)

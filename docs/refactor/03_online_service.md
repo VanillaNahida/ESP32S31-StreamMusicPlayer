@@ -6,6 +6,11 @@
 > 换行符当行界 —— 本报告一律以工具行号为准）
 > 头文件：`components/services/online_service/include/online_service.h`（295 行）
 > 本报告为**只读审计产物**，未修改任何源文件。
+>
+> **2026-11 增补**：本报告描述的是"拆出 online_service 组件"那一次重构。之后新增了
+> QQ 音乐音源（`os_qq.cc` 凭证/请求、`os_qq_json.cc` 纯逻辑映射、`os_qq_data.cc` 业务），
+> 以及 `os_http_client` 的两个自定义请求头 + POST 支持；它们的契约见
+> [docs/qq-music.md](../qq-music.md)，与本文的行号表无关。
 
 ---
 

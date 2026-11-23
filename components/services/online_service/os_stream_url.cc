@@ -31,6 +31,7 @@
 
 #include "internal/os_fs.h"
 #include "internal/os_http_client.h"
+#include "internal/os_qq.h"
 #include "internal/os_state.h"
 #include "online_service.h"
 
@@ -80,6 +81,17 @@ esp_err_t online_song_stream_info(const online_song_t *song, char *out, size_t c
     }
     if (!song || !out || cap == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    /*
+     * ★ QQ 音乐是**另一条**取流链路（2026-11）：
+     *   服务端 /qq/song/{mid}/play_url 已经把 CDN 拼好了，直接就是最终地址，
+     *   既没有 302、也没有"码率×长度"可算 —— 时长直接用元数据里的 dur_sec。
+     *   拿不到音源（无版权 / 非 VIP）返回 ESP_ERR_NOT_FOUND，由上层提示，
+     *   **不要**再退回下面的网易云逻辑（那个 id 是 QQ 的，会取到别人的歌）。
+     */
+    if (song->src == ONLINE_SRC_QQ) {
+        return online_qq_song_url(song, out, cap, out_bytes, out_dur_ms);
     }
 
     /*
@@ -221,6 +233,11 @@ esp_err_t online_song_stream_url(const online_song_t *song, char *out, size_t ca
 {
     if (!song || !out || cap == 0) {
         return ESP_ERR_INVALID_ARG;
+    }
+
+    /* QQ 音乐：一条道路走到底（见 online_song_stream_info 里的说明） */
+    if (song->src == ONLINE_SRC_QQ) {
+        return online_qq_song_url(song, out, cap, NULL, NULL);
     }
 
     /* ★ 同上：先用"登录 CK + 中间件"拿直链，失败才退回旧地址（说明见 stream_info） */
