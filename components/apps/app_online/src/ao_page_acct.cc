@@ -57,6 +57,12 @@ static void acct_feed_clicked(lv_event_t *e)
 {
     const int kind = (int)(intptr_t)lv_event_get_user_data(e);
     ao_collect_ctx_clear();       /* 推荐列表不是可编辑歌单 */
+    /*
+     * 先把"当前队列属于谁"抹掉：请求在途的那 1~2 秒里屏幕上是"载入中"，
+     * 而不是上一份列表（2026-11 用户报"两家的每日推荐/私人雷达串了"）。
+     * 只清身份、不释放数组 —— 正在播的那首不受影响。
+     */
+    ao_queue_key_reset();
     ao_acct_feed_enter(kind);
     ao_detail_mark_request(lv_tick_get());   /* 超时兜底计时（见 ao_detail_wait_rows） */
     ao_acct_rebuild();                       /* 先把"载入中"铺上，再发请求 */

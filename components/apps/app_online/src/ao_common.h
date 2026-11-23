@@ -87,6 +87,15 @@
  */
 #define DETAIL_KEY_DAILY  "\x01" "daily"
 
+/*
+ * ★ 一次性推荐列表的队列 Key **必须按音源 + 种类区分**（2026-11 用户报"两家的每日推荐/
+ *   私人雷达串了"）：只要 Key 相同，ao_detail_key_matches() 就会认为"这份列表就是我要的"，
+ *   于是刚点开新入口的那 1~2 秒里，屏幕上画的是**上一份列表的歌**；请求失败时更是一直留着。
+ *   网易云的每日推荐继续用 DETAIL_KEY_DAILY，QQ 的两个入口各用自己的 Key。
+ */
+#define DETAIL_KEY_QQ_DAILY  "\x02" "qq-daily"
+#define DETAIL_KEY_QQ_RADAR  "\x02" "qq-radar"
+
 /* ---------------------------------------------------------------- 工作线程请求 */
 
 typedef enum {

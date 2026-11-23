@@ -59,6 +59,13 @@ const char *ao_acct_detail_want_key(void)
         return "";
     }
     if (s_acct_daily) {
+        /* 三个入口三种 Key：换源/换种类时旧列表立刻"不匹配"，不会被当成这一份画出来 */
+        if (s_acct_feed == AO_FEED_QQ_DAILY) {
+            return DETAIL_KEY_QQ_DAILY;
+        }
+        if (s_acct_feed == AO_FEED_QQ_RADAR) {
+            return DETAIL_KEY_QQ_RADAR;
+        }
         return DETAIL_KEY_DAILY;
     }
     if (s_acct_sel >= 0 && (size_t)s_acct_sel < s_acct_pls_n) {
@@ -72,6 +79,7 @@ void ao_acct_detail_exit(void)
     s_acct_detail = false;
     s_acct_sel    = -1;
     s_acct_daily  = false;
+    s_acct_feed   = AO_FEED_NETEASE_DAILY;   /* 回到列表：下次进推荐默认网易云口径 */
     s_acct_page   = 0;
 }
 

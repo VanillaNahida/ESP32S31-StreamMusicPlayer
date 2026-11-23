@@ -250,6 +250,11 @@ void ao_queue_key_clear_if(const char *key)
     }
 }
 
+void ao_queue_key_reset(void)
+{
+    s_cur_pl_id[0] = '\0';
+}
+
 /* ================================================================ 账号歌单懒加载 */
 
 bool   ao_acct_lazy(void)   { return s_acct_lazy; }

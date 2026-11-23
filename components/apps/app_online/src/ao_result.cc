@@ -199,7 +199,12 @@ static void on_result(void)
         static const char *const kFeedName[] = { "每日推荐", "每日30首", "私人雷达" };
         if (err == ESP_OK && songs) {
             ao_acct_feed_set(feed);
-            ao_queue_install(songs, count, DETAIL_KEY_DAILY, OWNER_ACCT);
+            /* 队列 Key 跟着来源走（与 ao_acct_detail_want_key() 一一对应），
+             * 否则换入口时会把上一份列表当成这一份显示（"串了"）。 */
+            const char *key = (feed == AO_FEED_QQ_DAILY) ? DETAIL_KEY_QQ_DAILY
+                              : (feed == AO_FEED_QQ_RADAR) ? DETAIL_KEY_QQ_RADAR
+                                                           : DETAIL_KEY_DAILY;
+            ao_queue_install(songs, count, key, OWNER_ACCT);
             ao_daily_loaded();
             char ok_msg[48];
             snprintf(ok_msg, sizeof(ok_msg), "%s已载入", kFeedName[feed]);

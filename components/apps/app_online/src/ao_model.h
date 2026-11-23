@@ -51,6 +51,12 @@ void ao_queue_install(online_song_t *songs, size_t count, const char *pl_id, int
 void ao_queue_drop_stale(void);
 /* OREQ_ADD 成功后：内存里那份过期了，把身份标记清掉（下次点进这个歌单会重新读） */
 void ao_queue_key_clear_if(const char *key);
+/*
+ * 只清"当前队列属于谁"的身份标记，**不动歌曲数组**（播放器手里的指针仍然有效）。
+ * 用途：点开新的推荐入口时先把身份抹掉 —— 旧列表既不会被 ao_detail_key_matches()
+ * 当成"这一份"画出来，也不会打断正在播放的那首（2026-11"串了"的兜底）。
+ */
+void ao_queue_key_reset(void);
 
 /* ---------------------------------------------------------------- 分页数学 */
 
