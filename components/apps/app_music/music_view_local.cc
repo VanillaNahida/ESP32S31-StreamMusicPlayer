@@ -166,7 +166,7 @@ static void local_render(void)
 }
 
 /*
- * 进目录/换目录前的"加载态"：把列表换成转圈 + "载入中…"。
+ * 进目录/换目录前的"加载态"：把列表换成转圈 + "奋力加载中…"。
  *
  * ★ 为什么需要（用户 2026-10 反馈"点进去卡在当前页面，加载完才进去"）：
  *   进目录要读 SD（列目录 + 建播放队列两遍 walk），大目录要几百毫秒到几秒。
@@ -203,10 +203,10 @@ static void local_show_loading(void)
         lv_obj_t *t = lv_label_create(box);
         lv_obj_set_style_text_font(t, UI_FONT_TEXT, LV_PART_MAIN);
         lv_obj_set_style_text_color(t, UI_COLOR_FG_DIM, LV_PART_MAIN);
-        lv_label_set_text(t, "载入中…");
+        lv_label_set_text(t, "奋力加载中…");
     }
     if (s_list_hint) {
-        lv_label_set_text_fmt(s_list_hint, "%s · 载入中…", local_source_dir());
+        lv_label_set_text_fmt(s_list_hint, "%s · 奋力加载中…", local_source_dir());
     }
 }
 
@@ -366,7 +366,7 @@ static void local_sd_apply_inserted(void)
     s_page = 0;
     local_source_set_dir(bsp_sdcard_mount_point());
     if (s_list_hint) {
-        lv_label_set_text(s_list_hint, "载入中…");
+        lv_label_set_text(s_list_hint, "奋力加载中…");
     }
     local_rebuild();
 }

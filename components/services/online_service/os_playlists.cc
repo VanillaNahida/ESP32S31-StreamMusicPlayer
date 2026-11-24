@@ -15,6 +15,7 @@
  */
 #include "internal/os_playlists.h"
 
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -223,6 +224,103 @@ esp_err_t online_playlist_remove(const char *id)
     os_pl_path(id, path, sizeof(path));
     unlink(path);
     return ESP_OK;
+}
+
+/* ================================================================ 每日推荐缓存
+ *
+ * 见 online_service.h 的说明：key 里自带日期，落盘格式与歌单完全一致
+ * （os_pl_save/os_pl_load 就是同一套），所以这里只是"限定前缀 + 顺手清旧文件"。
+ */
+#define FEED_KEY_PREFIX "qq30_"
+
+/* key 是不是本模块的每日缓存（"qq30_20261124" 这种） */
+static bool feed_key_is_ours(const char *key)
+{
+    return key && strncmp(key, FEED_KEY_PREFIX, sizeof(FEED_KEY_PREFIX) - 1) == 0;
+}
+
+/*
+ * 删掉"不是今天"的旧缓存。
+ *
+ * 每份 30 首 ≈ 42 KB，一天一份、永远不删的话几个月就是十几 MB —— SD 卡再大也不该
+ * 这么攒。save 成功之后扫一次目录（一天最多一次，几十毫秒），把旧日期的删掉。
+ */
+static void feed_cache_prune(const char *keep_key)
+{
+    DIR *d = opendir(ONLINE_ROOT);
+    if (!d) {
+        return;
+    }
+    const size_t plen = sizeof("pl_") - 1;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        const char *nm = ent->d_name;
+        if (strncmp(nm, "pl_", plen) != 0) {
+            continue;
+        }
+        const char *key = nm + plen;
+        if (!feed_key_is_ours(key)) {
+            continue;
+        }
+        /* 去掉 ".bin" 后缀再和 keep_key 比 */
+        char id[ONLINE_ID_MAX];
+        size_t n = strlen(key);
+        if (n > 4 && strcmp(key + n - 4, ".bin") == 0) {
+            n -= 4;
+        }
+        if (n >= sizeof(id)) {
+            continue;
+        }
+        memcpy(id, key, n);
+        id[n] = '\0';
+        if (strcmp(id, keep_key) == 0) {
+            continue;
+        }
+        char path[128];
+        os_pl_path(id, path, sizeof(path));
+        if (unlink(path) == 0) {
+            ESP_LOGI(TAG, "feed cache pruned: %s", id);
+        }
+    }
+    closedir(d);
+}
+
+esp_err_t online_feed_cache_load(const char *key, online_song_t **songs, size_t *count)
+{
+    if (!key || !songs || !count) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *songs = NULL;
+    *count = 0;
+    if (!feed_key_is_ours(key)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    return os_pl_load(key, songs, count);
+}
+
+esp_err_t online_feed_cache_save(const char *key, const online_song_t *songs, size_t count)
+{
+    if (!key || !songs || count == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!feed_key_is_ours(key)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t ret = os_pl_save(key, songs, count);
+    if (ret == ESP_OK) {
+        feed_cache_prune(key);
+    }
+    return ret;
+}
+
+void online_feed_cache_forget(const char *key)
+{
+    if (!feed_key_is_ours(key)) {
+        return;
+    }
+    char path[128];
+    os_pl_path(key, path, sizeof(path));
+    unlink(path);
 }
 
 esp_err_t online_playlist_load(const char *id, online_song_t **songs, size_t *count)

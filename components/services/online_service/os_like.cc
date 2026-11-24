@@ -245,3 +245,86 @@ bool online_netease_liked_has(const uint64_t *ids, size_t n, const char *song_id
     }
     return false;
 }
+
+/* ---------------------------------------------------------------- 最近收藏的那首
+ *
+ * 「我喜欢的音乐」歌单卡片的封面要显示**最新收藏**的那首歌（2026-11 用户），
+ * 而歌单列表第一首通常是「最早收藏」的那一首，所以收藏成功时在这里记一份。
+ * 记录落 NVS（key 'lkcov'），重启后仍能用；值是一个短字符串：
+ *     <src>,<id>,<cover_url>
+ * 用 %n 把前两段的长度量出来，剩下的原样当 URL（URL 里可能有逗号，不能按分隔符切）。
+ */
+#define NVS_KEY_LIKECOVER  "lkcov"
+#define LIKECOVER_BUF      (ONLINE_URL_MAX + 32)
+
+static online_song_t s_last_liked;
+static bool          s_last_liked_valid;
+static bool          s_last_liked_loaded;
+
+static void last_liked_load(void)
+{
+    if (s_last_liked_loaded) {
+        return;
+    }
+    s_last_liked_loaded = true;
+
+    char buf[LIKECOVER_BUF];
+    buf[0] = 0;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READONLY, &h) != ESP_OK) {
+        return;
+    }
+    size_t len = sizeof(buf);
+    const esp_err_t err = nvs_get_str(h, NVS_KEY_LIKECOVER, buf, &len);
+    nvs_close(h);
+    if (err != ESP_OK || !buf[0]) {
+        return;
+    }
+
+    unsigned src = 0;
+    unsigned id  = 0;
+    int off = 0;
+    if (sscanf(buf, "%u,%u,%n", &src, &id, &off) != 2 || off <= 0 || buf[off] == 0) {
+        return;
+    }
+    memset(&s_last_liked, 0, sizeof(s_last_liked));
+    s_last_liked.id  = id;
+    s_last_liked.src = (src == (unsigned)ONLINE_SRC_QQ) ? ONLINE_SRC_QQ : ONLINE_SRC_NETEASE;
+    snprintf(s_last_liked.cover_url, sizeof(s_last_liked.cover_url), "%s", buf + off);
+    s_last_liked_valid = true;
+}
+
+void online_last_liked_song_set(const online_song_t *song)
+{
+    if (!song || song->id == 0 || !song->cover_url[0]) {
+        return;
+    }
+    s_last_liked = *song;          /* 只留 id/标题/歌手/封面/src，够当封面用了 */
+    s_last_liked_valid  = true;
+    s_last_liked_loaded = true;
+
+    char buf[LIKECOVER_BUF];
+    snprintf(buf, sizeof(buf), "%u,%u,%s", (unsigned)song->src, (unsigned)song->id,
+             song->cover_url);
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    if (nvs_set_str(h, NVS_KEY_LIKECOVER, buf) == ESP_OK) {
+        nvs_commit(h);
+    }
+    nvs_close(h);
+    ESP_LOGI(TAG, "last liked song: src=%u id=%u", (unsigned)song->src, (unsigned)song->id);
+}
+
+bool online_last_liked_song_get(online_song_t *out)
+{
+    last_liked_load();
+    if (!s_last_liked_valid) {
+        return false;
+    }
+    if (out) {
+        *out = s_last_liked;
+    }
+    return true;
+}

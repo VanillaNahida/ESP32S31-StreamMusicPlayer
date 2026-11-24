@@ -19,6 +19,15 @@
 static const char *TAG = "app_music";
 
 /*
+ * 歌词逐行透明度的四档（照设计稿：当前行 100%，上下各一行 45%，再外 30%，更远 18%）。
+ * LVGL 的 LV_OPA_xx 只有 10 档粒度，取最接近的：50 ≈ 45%、30 ≈ 30%、20 ≈ 18%。
+ */
+#define LYRIC_OPA_CUR  LV_OPA_COVER
+#define LYRIC_OPA_NEAR LV_OPA_50
+#define LYRIC_OPA_MID  LV_OPA_30
+#define LYRIC_OPA_FAR  LV_OPA_20
+
+/*
  * 歌词列最多建多少个标签。
  * ★ 从 80 提到 240（2026-10 用户报"歌词显示不全"）：网易云的 LRC 经常带翻译/罗马音
  *   双语行，一首 4 分钟的歌轻松超过 80 行 —— 超出的部分以前**根本不建标签**，
@@ -67,12 +76,54 @@ static int32_t s_center_box_y  = -1;
  * "歌词框中心"与"当前行中心"（`obj->coords` 不含 translate，归零后测量绝对可靠）
  * → 差值就是新的平移量。整列是刚性平移，一次到位，与行高/换行数都无关。
  */
+/*
+ * 歌词滚动的**平滑过渡动画**（2026-11 用户："歌词滚动的时候要有平滑的过渡动画"）。
+ *
+ * 原来换行是把整列的 translate_y 一步到位 —— 长句换行、拖动定位、跳到最后一句时
+ * 都是一次"闪跳"。现在改成对 translate_y 做一段 260 ms 的缓出动画：
+ *   - 动画对象是**整列**（不是逐行滚动），所以行与行之间绝不会错位；
+ *   - 用 lv_anim + set_style_translate_y：与 LVGL 自己的滚动同一条路径，
+ *     每帧只让歌词区那一块失效重绘；
+ *   - 关键帧只在"目标变了"时重起，行号不变时一个字节都不写（见 tick）。
+ */
+#define LYRIC_SCROLL_ANIM_MS  260
+
+static void lyric_translate_anim_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_translate_y((lv_obj_t *)var, v, LV_PART_MAIN);
+}
+
+/* 把歌词列平滑地挪到 y（已在目标位置就直接落定，不起动画） */
+static void lyric_scroll_to(int32_t y)
+{
+    if (!s_lyric_col) {
+        return;
+    }
+    /* 先停掉上一段动画，避免两段叠在一起互相拉扯 */
+    lv_anim_delete(s_lyric_col, lyric_translate_anim_cb);
+    if (lv_obj_get_style_translate_y(s_lyric_col, LV_PART_MAIN) == y) {
+        return;
+    }
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_lyric_col);
+    lv_anim_set_values(&a, lv_obj_get_style_translate_y(s_lyric_col, LV_PART_MAIN), y);
+    lv_anim_set_duration(&a, LYRIC_SCROLL_ANIM_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&a, lyric_translate_anim_cb);
+    lv_anim_start(&a);
+}
+
 static void lyric_center_on(int idx)
 {
     if (idx < 0 || (size_t)idx >= s_lyric_n || !s_lyric_labels[idx] ||
         !s_lyric_box || !s_lyric_col) {
         return;
     }
+    /* 先记住当前位置（动画的起点），再归零去量几何 —— 归零不会上屏：
+     * 同一个刷新周期内就被下面那句 lyric_scroll_to() 拉回起点并开始动画。 */
+    const int32_t from = lv_obj_get_style_translate_y(s_lyric_col, LV_PART_MAIN);
+    lv_anim_delete(s_lyric_col, lyric_translate_anim_cb);
     lv_obj_set_style_translate_y(s_lyric_col, 0, LV_PART_MAIN);
     lv_obj_update_layout(s_lyric_box);      /* 字号/换行刚变过：必须先落地，坐标才是真的 */
 
@@ -83,7 +134,10 @@ static void lyric_center_on(int idx)
     const int32_t box_cy  = (box.y1 + box.y2) / 2;
     const int32_t line_cy = (line.y1 + line.y2) / 2;
 
-    lv_obj_set_style_translate_y(s_lyric_col, box_cy - line_cy, LV_PART_MAIN);
+    /* 归零只是为了测量：先摆回原处，再从原处动画到新位置 */
+    lv_obj_set_style_translate_y(s_lyric_col, from, LV_PART_MAIN);
+    lyric_scroll_to(box_cy - line_cy);
+
     s_center_box_y  = box_cy;
     s_center_line_y = line_cy;
 }
@@ -186,6 +240,8 @@ void music_view_lyric_set_accent(uint32_t rgb)
 void music_view_lyric_rebuild(void)
 {
     if (s_lyric_col) {
+        /* 换曲重建：先把在跑的滚动动画停掉再清行（否则动画会追着已删的行算位置） */
+        lv_anim_delete(s_lyric_col, lyric_translate_anim_cb);
         lv_obj_clean(s_lyric_col);
         lv_obj_set_style_translate_y(s_lyric_col, 0, LV_PART_MAIN);
     }
@@ -201,9 +257,15 @@ void music_view_lyric_rebuild(void)
     size_t n = s_lrc.count < LYRIC_VIEW_MAX_LINES ? s_lrc.count : LYRIC_VIEW_MAX_LINES;
     for (size_t i = 0; i < n; i++) {
         lv_obj_t *l = lv_label_create(s_lyric_col);
-        lv_obj_set_style_text_font(l, UI_FONT_SMALL, LV_PART_MAIN);
-        lv_obj_set_style_text_color(l, UI_COLOR_FG_DIM, LV_PART_MAIN);
-        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+        /*
+         * 版面照 assets/UIDesign/播放器UI重构参考.svg：
+         *   左对齐（text-anchor="start"，列起点 x=336）、白字、按离当前行的距离淡出。
+         * 逐行透明度由 lyric_style_line() 按距离算，这里先给"最淡"那档。
+         */
+        lv_obj_set_style_text_font(l, UI_FONT_TEXT, LV_PART_MAIN);
+        lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+        lv_obj_set_style_text_opa(l, LYRIC_OPA_FAR, LV_PART_MAIN);
+        lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
         lv_obj_set_width(l, LV_PCT(100));
         /* ★ WRAP 而不是 DOT：歌词一句可能很长，DOT 会把它截成"…"（"显示不全"的另一半原因） */
         lv_label_set_long_mode(l, LV_LABEL_LONG_WRAP);
@@ -222,37 +284,65 @@ void music_view_lyric_rebuild(void)
  *   于是"上一行"永远是 -1，**旧那行再也没被复位**，多拖几次就亮一片
  *   （2026-10 用户报"多次拖动进度条后歌词高亮异常"）。
  */
+/*
+ * 按"离当前行的距离"给一行上样式（版面照设计稿）：
+ *
+ *   距离 0  → 100% 白 + 大一号（纯 ASCII 用 22 px；中文只有 16 px，见 ui_metrics.h）
+ *   距离 1  → 45% 白
+ *   距离 2  → 30% 白
+ *   更远    → 18% 白（设计稿里最淡那一档）
+ *
+ * 只改**样式**，不改文本；字号变化只发生在"当前行"进出时（触发一次 flex 重排），
+ * 所以换行时最多动 7 行，不会像"每行都重设字号"那样卡。
+ */
+static void lyric_style_line(int i, int cur)
+{
+    if (i < 0 || (size_t)i >= s_lyric_n || !s_lyric_labels[i]) {
+        return;
+    }
+    lv_obj_t *l = s_lyric_labels[i];
+    const bool is_cur = (i == cur);
+    const int d = is_cur ? 0 : (i > cur ? i - cur : cur - i);
+    const lv_opa_t opa = is_cur ? LYRIC_OPA_CUR
+                        : (d == 1) ? LYRIC_OPA_NEAR
+                        : (d == 2) ? LYRIC_OPA_MID
+                                   : LYRIC_OPA_FAR;
+    if (lv_obj_get_style_text_opa(l, LV_PART_MAIN) != opa) {
+        lv_obj_set_style_text_opa(l, opa, LV_PART_MAIN);
+    }
+    /* 当前行用 22 px 大标题字体（生僻字自动落到 16 px，见 UI_FONT_TITLE_22） */
+    const lv_font_t *f = is_cur ? UI_FONT_TITLE_22 : UI_FONT_TEXT;
+    if (lv_obj_get_style_text_font(l, LV_PART_MAIN) != f) {
+        lv_obj_set_style_text_font(l, f, LV_PART_MAIN);
+    }
+}
+
 static void lyric_apply_cur(int idx)
 {
     const int prev = s_lyric_cur;
     s_lyric_cur = idx;
 
     /*
-     * 只重设"上一行"和"当前行"。
-     *
-     * 歌词标签建的时候统一是 UI_FONT_SMALL + UI_COLOR_FG_DIM（见 lyric_rebuild），
-     * 不变式是"只有第 s_lyric_cur 行是强调色 + 大一号字"，所以换行时动这两行就够。
-     *
-     * 原来对全部（最多 LYRIC_VIEW_MAX_LINES）行调 set_style_text_font：
-     * 改字号等于改行高，会触发整列 flex 重新布局 —— 每换一行歌词就卡一下。
+     * 只重设**新旧当前行各自 ±3**，不是"从旧行到新行的整段"：
+     * 两行离得远时（比如跳到最后一句），整段会有几十上百行 ——
+     * 每行改字号等于改行高，会触发整列 flex 重新布局，白卡一下。
+     * 更远的行透明度本来就是最淡那档，本来就不用动。
      */
-    const int touched[2] = { prev, idx };
-    for (size_t k = 0; k < 2; k++) {
-        const int i = touched[k];
-        if (i < 0 || (size_t)i >= s_lyric_n || !s_lyric_labels[i]) {
+    const int centers[2] = { prev, idx };
+    for (int k = 0; k < 2; k++) {
+        const int c = centers[k];
+        if (c < 0) {
             continue;
         }
-        const bool cur = (i == idx);
-        lv_obj_set_style_text_color(s_lyric_labels[i],
-                                    cur ? UI_COLOR_ACCENT : UI_COLOR_FG_DIM, LV_PART_MAIN);
-        lv_obj_set_style_text_font(s_lyric_labels[i],
-                                   cur ? UI_FONT_TEXT : UI_FONT_SMALL, LV_PART_MAIN);
+        for (int i = c - 3; i <= c + 3; i++) {
+            lyric_style_line(i, idx);
+        }
     }
 
     /*
      * 用整列的 translate_y 把"当前行"平移到歌词框正中（见 lyric_center_on）。
-     * 居中基准必须是**歌词区自己的高度**：歌词区在封面右侧（右栏），
-     * 用 UI_H/2 会把整列推到屏幕外 —— 这正是旧版"看不到歌词"的原因。
+     * 居中基准必须是**歌词区自己的高度**：歌词区在封面右侧，用 UI_H/2 会把整列
+     * 推到屏幕外 —— 这正是旧版"看不到歌词"的原因。
      */
     lyric_center_on(idx);
 }

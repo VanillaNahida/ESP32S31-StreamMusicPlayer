@@ -64,6 +64,12 @@ DST_JP2 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-jp2.ttf"
 #   （真机报 `error: #error "Too large font or glyphs in UI_FONT_SC16"` ✓）。
 #   所以拆分：主字体只放常用字，这一份放"词典新增字 + extra_chars.txt"，用 2bpp。
 DST_DICT = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-dict.ttf"
+# ★ 22 px 大标题字体（播放器歌名 / 歌词当前行 / 歌单名 / 账号昵称）用的子集。
+#   只收 **GB2312 第一级汉字（3755 字）+ 区 1~9 的符号标点 + ASCII**：
+#   4 bpp 全量 GB2312 在 22 px 下要 1.7 MB（app 槽放不下），而第一级已经覆盖
+#   ~99.7% 的日常文本；剩下的生僻字由 fallback 落到 16 px 主字体 ——
+#   同一个字**只是小一号**，不会变方框（这是这份"不完整"字体安全的前提）。
+DST_LV1 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-lv1.ttf"
 
 
 def gb2312_charset() -> set:
@@ -85,6 +91,29 @@ def gb2312_charset() -> set:
     # 几个 UI 里会用到的补充符号（GB2312 未覆盖的）
     chars.update("·—…“”‘’《》〈〉【】、。，！？；：（）％＋－／")
 
+    return chars
+
+
+def gb2312_level1_charset() -> set:
+    """GB2312 区 1~9（符号/标点/假名）+ 第一级汉字（区 16~55）+ ASCII。
+
+    22 px 大标题字体的口径：够用、且只占全量 GB2312 的 ~2/3 体积。
+    """
+    chars = set()
+    for hi in range(0xA1, 0xAA):          # 区 1~9：全角标点、希腊/西里尔、假名
+        for lo in range(0xA1, 0xFF):
+            try:
+                chars.add(bytes([hi, lo]).decode("gb2312"))
+            except UnicodeDecodeError:
+                pass
+    for hi in range(0xB0, 0xD8):          # 区 16~55：第一级汉字 3755 个
+        for lo in range(0xA1, 0xFF):
+            try:
+                chars.add(bytes([hi, lo]).decode("gb2312"))
+            except UnicodeDecodeError:
+                pass
+    for c in range(0x20, 0x7F):           # ASCII
+        chars.add(chr(c))
     return chars
 
 
@@ -193,7 +222,7 @@ def make_subset(chars: set, dst: Path) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(
-        description="为 LVGL 位图字体切子集 TTF（主字体 / 日文补充 / 输入法词典生僻字）")
+        description="为 LVGL 位图字体切子集 TTF（主字体 / 日文补充 / 输入法词典生僻字 / 22px 标题）")
     ap.add_argument("--dict-dir", type=Path, default=DICT_DIR_DEFAULT,
                     help=("lvgl_pinyin_ime 的 data/dict 目录（默认按仓库布局推导："
                           f"{DICT_DIR_DEFAULT}）；同目录下的 extra_chars.txt 是用户"
@@ -230,7 +259,12 @@ def main() -> int:
     print(f"\n[4/4] 日文生僻补充（JIS 第 2 水準，减去 GB2312）：{len(jp2)} 个字符")
     make_subset(jp2, DST_JP2)
 
-    print("\n下一步 : 运行 tools/font/gen_lvgl_font.py 生成四个 LVGL 字体（含 dict16）")
+    # ---- 22 px 大标题字体（第一级汉字）----
+    lv1 = gb2312_level1_charset()
+    print(f"\n[5/5] 22px 标题字体（GB2312 第一级 + 符号 + ASCII）: {len(lv1)} 个字符")
+    make_subset(lv1, DST_LV1)
+
+    print("\n下一步 : 运行 tools/font/gen_lvgl_font.py 生成五个 LVGL 字体（含 dict16 / sc22）")
     return 0
 
 

@@ -251,6 +251,32 @@ static bool like_kick(like_op_t op, const char *id, uint32_t seq)
 
 /* ---------------------------------------------------------------- LVGL 任务侧 */
 
+/*
+ * 把「刚收藏的那首」记进 online_service（内存 + NVS）。
+ *
+ * 用户需求（2026-11）："我喜欢的音乐的封面没有成功使用最新收藏的一首歌的封面作为封面" ——
+ * 歌单卡片的封面原来取列表第一首（通常是最早收藏的那首），所以收藏完回去看封面永远不变。
+ * 这里在**加收藏成功**的那一刻把这首歌（带封面地址）记下来，由 app_online 打开
+ * 「我喜欢的音乐」时优先拿它当封面。
+ *
+ * 只在 id 对得上时记：like_pub_id 是"那次请求针对的那首"，切歌后 like_cur_id 已经换了，
+ * 拿 on_songs[index] 会记错一首（红心代次那一套防的就是这个）。
+ */
+static void remember_liked_song(const music_state_t *st)
+{
+    if (!st->on_mode || !st->on_songs || st->index < 0 ||
+        (size_t)st->index >= st->on_count) {
+        return;
+    }
+    const online_song_t *song = &((const online_song_t *)st->on_songs)[st->index];
+    char id[24];
+    snprintf(id, sizeof(id), "%u", (unsigned)song->id);
+    if (strcmp(id, st->like_cur_id) != 0) {
+        return;                          /* 记的不是这一首：算了，宁可少记也不要记错 */
+    }
+    online_last_liked_song_set(song);
+}
+
 void music_like_tick(void)
 {
     music_state_t *st = music_state();
@@ -258,7 +284,9 @@ void music_like_tick(void)
     /* ① 先消费 toast —— 那是"用户刚才那一下"的反馈，与当前是哪首歌无关 */
     if (st->like_result) {
         switch (st->like_result) {
-        case 1:  ui_toast("已添加到我喜欢歌单", 1600); break;
+        case 1:  ui_toast("已添加到我喜欢歌单", 1600);
+                 remember_liked_song(st);
+                 break;
         case 2:  ui_toast("已取消喜欢", 1600); break;
         case 3:  ui_toast((music_online_current_src() == ONLINE_SRC_QQ)
                               ? "请先登录 QQ 音乐" : "请先登录网易云账号", 1800); break;

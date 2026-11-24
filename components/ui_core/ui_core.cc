@@ -384,9 +384,25 @@ void ui_cc_toggle(void) { ui_cc_apply_open(!ui_cc_state(), true); }
  * ⚠ `back_arrow` 素材本身就是整块圆底，**不要再给 lv_button 画圆底/描边**
  *   （会露出两层边）。按钮只保留透明外壳 + 命中区域。
  */
+/* 页面接管返回键（见 ui_back_button_set_handler 的说明）：返回 true 表示"我处理了" */
+static bool (*s_back_handler)(void);
+
+void ui_back_button_set_handler(bool (*handler)(void))
+{
+    s_back_handler = handler;
+}
+
 static void back_click_after_restore(lv_event_t *e)
 {
     (void)e;
+    /*
+     * 先问当前页：在线音乐的"歌单详情"是同一页里换内容（没压栈），
+     * 这时返回键应当回到歌单列表而不是退出整个 APP。handler 返回 false
+     * 或者没设 handler 时照旧退栈 —— 老页面的行为一个字节都不变。
+     */
+    if (s_back_handler && s_back_handler()) {
+        return;
+    }
     ui_router_pop();
 }
 

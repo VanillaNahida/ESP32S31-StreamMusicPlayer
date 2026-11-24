@@ -158,6 +158,14 @@ CONFIG_LV_FONT_SOURCE_HAN_SANS_SC_16_CJK=y
 CONFIG_LV_FONT_MONTSERRAT_14=y
 CONFIG_LV_FONT_MONTSERRAT_20=y
 CONFIG_LV_FONT_MONTSERRAT_40=y
+# ⚠ 不要再打开 CONFIG_LV_FONT_MONTSERRAT_22：22 px 那一档现在用的是项目自带的
+#   中文位图字体 ui_font_sc22（components/ui_font，见 partitions.csv 的注释），
+#   Montserrat 22 只会白占 ~70 KB flash。
+
+# 渐变停靠点：设计稿的背景是 3 段线性渐变（#132536 → #0E1722 → #0A0F16），
+# 而 LVGL 默认 LV_GRADIENT_MAX_STOPS=2 只支持两段。4 段足够，且 RAM 只影响
+# lv_grad_dsc_t（每个样式 4 个 stop，几十字节）。
+CONFIG_LV_GRADIENT_MAX_STOPS=4
 
 # ---------------------------------------------------------------------------
 # 拼音输入法（lvgl_pinyin_ime）

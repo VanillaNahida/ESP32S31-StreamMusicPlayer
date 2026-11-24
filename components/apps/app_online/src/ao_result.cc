@@ -15,6 +15,7 @@
 
 #include "ao_common.h"
 #include "ao_account.h"
+#include "ao_pl_cover.h"
 #include "ao_provider.h"
 #include "ao_model.h"
 #include "ao_pages.h"
@@ -129,9 +130,11 @@ static void on_result(void)
             ao_qr_set_status("登录成功");
             ui_toast(ao_is_qq() ? "QQ 音乐登录成功" : "网易云登录成功", 1800);
             ao_login_success_forget(lv_tick_get());
+            ao_daily_cache_clear();        /* 换了账号：今天的推荐缓存作废 */
             ao_qr_close();
             ao_pl_rebuild();
             ao_acct_rebuild();
+            ao_account_rebuild();          /* 第 3 页：昵称/状态要立刻变 */
             ao_login_success_pull_account();
         } else if (code == NET_QR_SCAN) {
             ao_qr_set_status("已扫码，请在手机上确认");
@@ -145,6 +148,7 @@ static void on_result(void)
     }
     case OREQ_LOGOUT:
         ao_logout_reset(lv_tick_get());
+        ao_daily_cache_clear();
         if (err == ESP_OK) {
             ui_toast(ao_is_qq() ? "已退出 QQ 音乐登录" : "已退出网易云登录", 1600);
         } else {
@@ -152,11 +156,13 @@ static void on_result(void)
         }
         ao_pl_rebuild();
         ao_acct_rebuild();
+        ao_account_rebuild();
         break;
     case OREQ_ACCOUNT:
         ao_account_result(err, msg, lv_tick_get());
         ao_pl_rebuild();
         ao_acct_rebuild();
+        ao_account_rebuild();              /* 昵称/UID 到了 */
         ao_acct_pls_after_account(err == ESP_OK, lv_tick_get());
         break;
 
@@ -167,6 +173,7 @@ static void on_result(void)
          * 工作线程把它放进 msg 带回来 —— 有就用上，别让界面上一直是空名字。 */
         ao_login_name_set(msg);
         ao_acct_rebuild();
+        ao_account_rebuild();              /* 歌单数量变了（账号页那张卡上写着） */
         break;
     case OREQ_ACCT_SONGS: {
         /*
@@ -204,6 +211,8 @@ static void on_result(void)
             const char *key = (feed == AO_FEED_QQ_DAILY) ? DETAIL_KEY_QQ_DAILY
                               : (feed == AO_FEED_QQ_RADAR) ? DETAIL_KEY_QQ_RADAR
                                                            : DETAIL_KEY_DAILY;
+            /* 先落盘再交所有权：同一天再进来就直接用这份（QQ 的每日30首服务端是随机的） */
+            ao_daily_cache_store(feed, songs, count);
             ao_queue_install(songs, count, key, OWNER_ACCT);
             ao_daily_loaded();
             char ok_msg[48];
@@ -276,8 +285,15 @@ void ao_result_poll_cb(lv_timer_t *t)
         ao_pl_rebuild();
         ao_srch_rebuild();
         ao_acct_rebuild();              /* 账号页：网络回来要重新拉歌单/昵称 */
+        ao_account_rebuild();
     }
     on_result();
+
+    /*
+     * 歌单详情的左卡片封面：取工作线程解好的那张上屏；
+     * 没人再看就按闲置超时还给 PSRAM（需求："用一段时间未使用则自动释放"）。
+     */
+    ao_pl_cover_tick(lv_tick_get());
 
     /*
      * 登录态下的"补拉"：开机后 Wi-Fi 可能还没连上，那次拉歌单/昵称必然失败

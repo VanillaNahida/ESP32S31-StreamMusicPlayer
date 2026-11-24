@@ -122,6 +122,22 @@ void ui_back_button_place(lv_obj_t *btn);
  */
 void ui_back_button_suppress(bool suppress);
 
+/*
+ * 让**当前页**接管返回钮的语义（页面内部还有一层、但不想压路由栈时用）。
+ *
+ * 典型场景：在线音乐的"歌单详情"是同一页里换内容（不是新路由），
+ * 点返回键应当先回到歌单列表，而不是直接退出整个在线音乐页。
+ *
+ *   handler 返回 true  = "我处理了"，ui_core 不再 ui_router_pop()；
+ *   handler 返回 false = 交回默认行为（退栈）；
+ *   handler 传 NULL    = 取消接管（恢复默认）。
+ *
+ * ⚠ **谁设置谁负责清**：页面 DELETE / on_exit 里必须再调一次 NULL，
+ *   否则用户退出这一页之后，别的页面的返回键仍然会先问一个已经失效的 handler。
+ * ⚠ 只改**行为**，返回钮的外观/位置/按下动画一律不变（见上面的版面口径）。
+ */
+void ui_back_button_set_handler(bool (*handler)(void));
+
 /* ------------------------------------------------------------------ 页面底色 */
 
 /*

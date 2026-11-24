@@ -110,7 +110,14 @@ http 建连失败才回 https 兜底（同主机同路径，只换 scheme），�
 - 页签仍是三页：`我的歌单` / `我添加的歌单` / `搜索`。
 - 「我的歌单」顶部两条**推荐入口**：`每日30首`（服务端串行取 6 次"猜你喜欢"拼 30 首）
   和 `私人雷达`（服务端翻页拼 30 首）。点进去和网易云的"每日推荐"同一条路径：
-  一次拿整份、不懒加载，队列 Key 都是 `DETAIL_KEY_DAILY`。
+  一次拿整份、不懒加载，队列 Key 都是 `DETAIL_KEY_QQ_DAILY` / `DETAIL_KEY_QQ_RADAR`。
+  - ⚠ **每日30首在服务端是随机的**（每次请求 6 次"猜你喜欢"都是新歌），
+    所以固件**按天缓存**：`/sdcard/online/pl_qq30_<yyyymmdd>.bin`（与歌单同一套二进制），
+    同一天反复进出看到的是同一份，换天自然失效；登录/退出登录时清掉当日缓存。
+    实现见 `ao_page_acct.cc` 的 `ao_daily_cache_take/store` 与
+    `online_service` 的 `online_feed_cache_*`。
+  - 它**仍然不等于 QQ 音乐 App 里的"每日30首"**：那是上游另一条接口（sidecar 的
+    QQMusicApi 没开放），服务端只能拿"猜你喜欢"凑。要完全一致得先给服务端补上游接口。
 - 登录昵称由**服务端**在扫码成功时一并返回（`data.nickname`，来自
   `/user/{euin}/homepage` 的 `base_info.name`），固件只负责存进 NVS 并显示。
   - QQ 的「我的歌单」里第一条是 **我喜欢的音乐**（心形行、红色强调），
@@ -147,4 +154,5 @@ http 建连失败才回 https 兜底（同主机同路径，只换 scheme），�
 | 登录成功但歌单是空的 | 凭证里有没有 `encryptUin`（收藏类接口必需）；看串口 `qq` 日志 |
 | 点歌提示"没有播放权限" | 该曲需要 VIP，或匿名态下 `purl` 为空（上游行为） |
 | 收藏失败 401 | 凭证过期 → 退出重新扫码 |
+| 收藏失败 HTTP 422 | 2026-11 的老问题：Node 侧 axios 把数组参数序列化成 `song_id[]=1`，而 sidecar 的 `list[int]` 只认 `song_id=1`（`extra_forbidden`）→ 422。已修（`qq-sidecar.js` 的 `paramsSerializer: { indexes: null }` + 回归测试），**需要重新部署 ncm-api**。设备侧现在也会把服务端那句原因显示出来（`HTTP 422：…`） |
 | 封面不显示 | QQ 封面按 `album.mid` 拼 `y.gtimg.cn`；无 mid 的歌没有封面 |

@@ -29,7 +29,6 @@
 #include <dirent.h>
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
 #include <unistd.h>
 
 #include "esp_log.h"
@@ -56,29 +55,20 @@ esp_err_t online_service_init(void)
      *   节点海量（3 万首 ≈ 2 MB），不搬 PSRAM 就会把内部 RAM 抽干（见 os_json_mem.cc）。 */
     os_json_use_psram();
     os_mkdir_if_needed(ONLINE_ROOT);
-    os_mkdir_if_needed(ONLINE_AUDIO_DIR);
-    /* 封面/歌词不再落 SD：把旧固件写下来的 cover/ 目录与 *.lrc 清掉，
-     * 免得它们继续占用 SD 空间、也避免下次切歌再读到旧文件。 */
+    /*
+     * ⚠ **不再**无条件创建 ONLINE_AUDIO_DIR（/sdcard/online/audio）。
+     *
+     * 正常播放在线歌是**纯流式**（边下边解），一首歌都不会落到 SD 上；只有
+     * "容器不支持流式（m4a/ogg/opus）"或"取流失败"时的**兜底下载**才需要它
+     * —— 那个目录改在真正要下载时按需创建（见 os_media_cache.cc 的
+     * online_song_prepare）。于是开机不再在 SD 上留一个空目录，也就没有这里的
+     * 历史遗留清扫（曾经还要删老固件写进去的 *.lrc）。
+     *
+     * 封面/歌词同理（只进 PSRAM）：这两行是给**从老固件升上来的卡**擦屁股的，
+     * 老版本把 cover/ 与 *.lrc 写在 SD 上，留着会白占空间。
+     */
     os_wipe_dir(ONLINE_COVER_DIR);
     os_wipe_dir(ONLINE_LRC_DIR);
-    {
-        DIR *d = opendir(ONLINE_AUDIO_DIR);
-        if (d) {
-            struct dirent *ent;
-            while ((ent = readdir(d)) != NULL) {
-                if (ent->d_name[0] == '.') {
-                    continue;
-                }
-                const char *dot = strrchr(ent->d_name, '.');
-                if (dot && strcasecmp(dot, ".lrc") == 0) {
-                    char path[320];
-                    snprintf(path, sizeof(path), "%s/%s", ONLINE_AUDIO_DIR, ent->d_name);
-                    unlink(path);
-                }
-            }
-            closedir(d);
-        }
-    }
     os_playlists_nvs_load();
     os_history_nvs_load();
     os_nick_load();           /* 账号昵称：重启后不等网络就能显示"已登录：XX" */
@@ -126,7 +116,11 @@ esp_err_t online_playlist_rename(size_t idx, const char *name)
 
 esp_err_t online_cache_clear(void)
 {
-    /* SD 上的音频缓存（封面/歌词早已不进 SD） */
+    /*
+     * SD 上的音频缓存（封面/歌词早已不进 SD）。
+     * ⚠ 这个目录**可能不存在**：正常流式播放从不创建它，只有兜底下载过才在
+     *   （见 online_service_init 的说明）。opendir 失败就是"没有缓存"，正常。
+     */
     DIR *d = opendir(ONLINE_AUDIO_DIR);
     if (d) {
         struct dirent *ent;

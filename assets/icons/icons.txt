@@ -66,4 +66,8 @@ assets/icons/back.png               back_arrow          64
 # ⚠ 边长要与 music_view_page.cc 里的红心显示尺寸一致（按显示尺寸烘，不做运行期缩放）。
 assets/icons/heart.svg              heart_on            26
 assets/icons/heart_hollow.svg       heart_off           26
+# 播放器控制排最右边的「输出设备」按钮 —— 2026-11 用户给的 SVG（便携音箱图形）。
+# 按白色烘，按钮上按当前输出 recolor（扬声器 / 蓝牙 / USB / 静音各一色）；
+# 边长与 music_view_make_icon_btn() 里那批 20 px 字形图标同档。
+assets/icons/out_device.svg         out_device          20
 

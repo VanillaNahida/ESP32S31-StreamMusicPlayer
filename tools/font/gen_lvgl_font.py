@@ -55,19 +55,24 @@ SUBSET_TTF = FONTS_DIR / "DreamHanSansSC-W17-subset.ttf"
 JP1_TTF = FONTS_DIR / "DreamHanSansSC-W17-jp1.ttf"
 JP2_TTF = FONTS_DIR / "DreamHanSansSC-W17-jp2.ttf"
 DICT_TTF = FONTS_DIR / "DreamHanSansSC-W17-dict.ttf"   # 生僻字 + extra_chars（2bpp）
+LV1_TTF = FONTS_DIR / "DreamHanSansSC-W17-lv1.ttf"     # 22px 标题用：GB2312 第一级 + 符号
 LVGL_DIR = ROOT / "managed_components" / "lvgl__lvgl"
 FA_WOFF = LVGL_DIR / "scripts" / "built_in_font" / "FontAwesome5-Solid+Brands+Regular.woff"
 SYMBOL_HDR = LVGL_DIR / "src" / "font" / "lv_symbol_def.h"
 OUT_DIR = ROOT / "components" / "ui_font"
 
 SIZE = 16
-# 每个产物：(子集 TTF, 输出 .c, LVGL 字体名, bpp, 是否并图标)
+# 每个产物：(子集 TTF, 输出 .c, LVGL 字体名, 字号, bpp, 是否并图标)
 SPECS = [
-    (SUBSET_TTF, "ui_font_sc16.c",   "ui_font_sc16",   4, True),
-    (JP1_TTF,    "ui_font_jp1_16.c", "ui_font_jp1_16", 4, False),
-    (JP2_TTF,    "ui_font_jp2_16.c", "ui_font_jp2_16", 2, False),
+    (SUBSET_TTF, "ui_font_sc16.c",   "ui_font_sc16",   SIZE, 4, True),
+    (JP1_TTF,    "ui_font_jp1_16.c", "ui_font_jp1_16", SIZE, 4, False),
+    (JP2_TTF,    "ui_font_jp2_16.c", "ui_font_jp2_16", SIZE, 2, False),
     # ★ 生僻字/补充表：2bpp（同 jp2 的理由——省一半体积；LVGL 未压缩路径支持 2bpp）
-    (DICT_TTF,   "ui_font_dict16.c", "ui_font_dict16", 2, False),
+    (DICT_TTF,   "ui_font_dict16.c", "ui_font_dict16", SIZE, 2, False),
+    # ★ 22 px 大标题字体（2026-11 UI 重构稿）：只收 GB2312 第一级，4 bpp，不并图标。
+    #   体积实测 1.02 MB（字体本身），fallback 到 16 px 主字体链 —— 生僻字只是小一号，
+    #   不会缺字。字号/取舍的来历见 assets/UIDesign/ 与 docs/ui-refactor-2026-11.md。
+    (LV1_TTF,    "ui_font_sc22.c",   "ui_font_sc22",   22, 4, False),
 ]
 
 
@@ -109,13 +114,13 @@ def lv_font_conv_argv() -> list:
     sys.exit("找不到可执行的 lv_font_conv，请先执行：npm i -g lv_font_conv")
 
 
-def build_one(conv: list, ttf: Path, out_name: str, font_name: str, bpp: int,
-              with_icons: bool, syms: list) -> None:
+def build_one(conv: list, ttf: Path, out_name: str, font_name: str, size: int,
+              bpp: int, with_icons: bool, syms: list) -> None:
     out_c = OUT_DIR / out_name
     cmd = conv + [
         "--no-compress", "--no-prefilter",
         "--bpp", str(bpp),
-        "--size", str(SIZE),
+        "--size", str(size),
         # 汉字侧：子集 TTF 里已经只含需要的字符，这里给一个覆盖整个 BMP 的范围，
         # 字体里没有的码点会被自动跳过
         "--font", str(ttf), "-r", "0x20-0xFFFF",
@@ -134,13 +139,13 @@ def build_one(conv: list, ttf: Path, out_name: str, font_name: str, bpp: int,
 
     text = out_c.read_text(encoding="utf-8", errors="ignore")
     glyphs = len(re.findall(r"/\* U\+", text))
-    print(f"  {out_name:22s} {bpp} bpp  {glyphs:5d} 字形  "
+    print(f"  {out_name:22s} {size}px {bpp} bpp  {glyphs:5d} 字形  "
           f"源码 {out_c.stat().st_size / 1048576:.1f} MB")
     return glyphs
 
 
 def main() -> int:
-    for p in (SUBSET_TTF, JP1_TTF, JP2_TTF, FA_WOFF, SYMBOL_HDR):
+    for p in (SUBSET_TTF, JP1_TTF, JP2_TTF, DICT_TTF, LV1_TTF, FA_WOFF, SYMBOL_HDR):
         if not p.exists():
             sys.exit(f"缺少输入文件：{p}\n"
                      f"  （子集字体由 tools/font/gen_subset.py 生成）")
@@ -156,8 +161,8 @@ def main() -> int:
 
     total = 0
     print("生成     : lv_font_conv ...")
-    for ttf, out_name, font_name, bpp, with_icons in SPECS:
-        total += build_one(conv, ttf, out_name, font_name, bpp, with_icons, syms)
+    for ttf, out_name, font_name, size, bpp, with_icons in SPECS:
+        total += build_one(conv, ttf, out_name, font_name, size, bpp, with_icons, syms)
 
     print(f"\n合计     : {total} 个字形")
     # ★ 别用"数 0xNN 字面量"来估 flash —— 字形位图里还有大批十进制描述符，

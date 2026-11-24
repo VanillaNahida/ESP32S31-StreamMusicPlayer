@@ -13,7 +13,7 @@ ESP32-S31 单芯片触摸音乐播放器：4.3" 800×480 屏 + LVGL 9，支持�
 | 解码 | vendored 组件 `libs/espaudiocore`（不是 ESP-GMF / esp_audio_simple_player） |
 | 重采样 | `espressif/esp_asrc`（S31 硬件 ASRC） |
 | 拼音 | `lvgl_pinyin_ime` + `libgooglepinyin`，词库放独立 `dict` 分区 |
-| 存储 | 16 MB Flash + 16 MB PSRAM；单 app 槽 11.81 MB，无 OTA A/B |
+| 存储 | 16 MB Flash + 16 MB PSRAM；单 app 槽 **12.31 MB**（2026-11 为 22px 字体与内置封面位图扩过，见 partitions.csv），无 OTA A/B |
 | 音频硬件 | ES8389（I2S TDM，48 kHz/16 bit）+ 扬声器 / BT A2DP / USB UAC |
 
 ## 2. 目录结构

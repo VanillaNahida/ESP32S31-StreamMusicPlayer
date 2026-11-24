@@ -100,6 +100,11 @@ LV_IMAGE_DECLARE(back_arrow);
 LV_IMAGE_DECLARE(heart_on);
 LV_IMAGE_DECLARE(heart_off);
 
+/* 播放器控制排最右边的「输出设备」键，**20x20**（来自 assets/icons/out_device.svg，
+ * 2026-11 用户给的便携音箱图形）。与上面几个一样是**纯白单色**位图：按钮上按当前
+ * 输出 recolor（扬声器 / 蓝牙 / USB / 静音各一色，见 music_view_output.cc）。 */
+LV_IMAGE_DECLARE(out_device);
+
 #ifdef __cplusplus
 }
 #endif

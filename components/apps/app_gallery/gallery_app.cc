@@ -130,7 +130,7 @@ static void show_index(int idx)
     gallery_view_set_item(&s_items[idx]);
     gallery_view_set_orig_size(0, 0);
     gallery_view_set_pager_visible(s_count > 1);   /* 只有 1 张就不画箭头 */
-    gallery_view_set_hint("载入中…");
+    gallery_view_set_hint("奋力加载中…");
     caption_update();
     gallery_decode_request(idx, &s_items[idx]);
 }

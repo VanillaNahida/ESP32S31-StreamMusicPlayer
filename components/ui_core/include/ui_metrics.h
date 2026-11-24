@@ -180,6 +180,17 @@
 #define UI_FONT_NUM    (&lv_font_montserrat_20)
 #define UI_FONT_SMALL  (&ui_font_text)
 
+/*
+ * 22 px 大标题：UI 重构稿（assets/UIDesign 里的那几张 svg）22~23 px 那一档
+ * （播放器歌名、歌词当前行、歌单名、账号昵称）。
+ *
+ * 这是**项目自带的中文 22 px 位图字体**（components/ui_font 的 ui_font_sc22），
+ * 收 GB2312 第一级 + 符号 + ASCII；第一级之外的字自动 fallback 到 16 px 主字体
+ * （同一个字、小一号，不会缺字）。字体本身的取舍见 tools/font/gen_subset.py 与
+ * docs/ui-refactor-2026-11.md，改分区前先读那份文档。
+ */
+#define UI_FONT_TITLE_22 (&ui_font_title22)
+
 #ifdef __cplusplus
 extern "C" {
 #endif

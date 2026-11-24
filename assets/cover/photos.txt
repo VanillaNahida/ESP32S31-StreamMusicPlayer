@@ -1,0 +1,27 @@
+# 内置封面像素清单 —— 交给 tools/icons/gen_photo.py 一次烘成 .bin
+#
+# 格式：源图路径  输出名  宽  高  格式(rgb565|rgb565a8|argb8888)
+#
+# 口径：
+#   * 尺寸 = 显示尺寸（不要运行期缩放，那是每帧都要重算的）。
+#   * rgb565   不带 alpha，用于完全不透明的图；
+#     rgb565a8  保留 alpha，且比 argb8888 省 1/4 flash（黑胶唱片四周是透明的，用它）；
+#     argb8888  只有在需要更高色彩还原时才用（比 rgb565a8 多 33% 体积）。
+#   * 产物在 assets/cover/<输出名>_<宽>x<高>.bin，由各组件的 CMakeLists 用
+#     target_add_binary_data(..., BINARY, RENAME_TO ...) 烘进 flash。
+#   * ⚠ flash 很紧（app 槽 12.31 MB，见 partitions.csv），加图之前先看余量。
+#   * ⚠ rgb565a8 是**平面分离**布局（先 w*h*2 的 RGB565，再 w*h 的 A8），
+#     不是逐像素交错 —— 后者在真机上整块花屏（2026-11-24 修过）。
+#
+# 重新生成：
+#   tools/font/venv/Scripts/python.exe tools/icons/gen_photo.py
+
+# 歌单详情左卡片的默认封面（还没有第一首歌的封面时显示）。
+# 源图 1080x1080 的扁平灰底 + 白色音符，缩到 128 后由 LVGL 拉伸到 184（扁平图看不出差别），
+# 这样只占 32 KB 而不是 66 KB —— app 槽吃紧，能省则省。
+assets/defalut_cover.png              pl_default_cover      128  128  rgb565
+# 播放器页没有专辑封面时的默认占位（黑胶唱片，源图四周透明 → 用 rgb565a8 保留 alpha）。
+# 188x188：显示方框 188（卡片 210），唱片直径 ≈173 px；因为改成**补透明边**凑方，
+# 源图内容一个像素都不裁（唱片在源图里本来就顶到左/下边缘，居中裁会切掉左右各 14~15 px）。
+# ⚠ 这个尺寸必须与 music_view_page.cc 的 COVER_BMP_SIDE 一致（那边有字节数校验）。
+assets/default_black_vinyl_record.png player_default_cover  188  188  rgb565a8

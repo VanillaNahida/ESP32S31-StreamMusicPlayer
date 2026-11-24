@@ -1,25 +1,19 @@
 /*
- * app_online.cc —— 网易云音乐（网易云歌单 / 搜索 / 播放）APP 的**外壳**
+ * app_online.cc —— 网易云音乐 / QQ 音乐 APP 的**外壳**
  *
  * 需求对应：
- *   - 添加网易云歌单 ID → 抓取歌单 → **二进制存到 SD**（都在 online_service 里）
- *   - 播放歌单里的在线歌曲：默认**流式播放**（音频边下边播，不落 SD），
- *     下载失败时回退"先下载到 SD 再播"；封面/歌词一律缓存在 **PSRAM**，
- *     不写 SD 卡（SD 读写是之前切歌卡顿的根因）
- *   - 中文拼音输入法搜索：搜索浮层用 lvgl_pinyin_ime 键盘，
- *     关键词走服务端的 type=search（关键词放 id=，内部做百分号编码，
- *     支持中文），没网时退化成扫本地已保存歌单
- *   - 歌单/搜索的结果都交给 app_music 当"当前队列"，上下曲一起工作
+ *   - 添加歌单 ID → 抓取歌单 → **二进制存到 SD**（都在 online_service 里）
+ *   - 播放歌单里的在线歌曲：默认**流式播放**，封面/歌词缓存在 **PSRAM**
+ *   - 中文拼音输入法搜索
+ *   - 歌单/搜索的结果都交给 app_music 当"当前队列"
+ *   - 界面照 assets/UIDesign/在线音乐主界面.svg：顶栏 + 四个页签（我的歌单 /
+ *     我添加的歌单 / 搜索 / 账号）+ 渐变背景 + 右上角径向光晕
  *
  * 线程模型（照 app_music 的老规矩）：
- *   LVGL 任务只做 UI；HTTP（抓歌单/搜索/下载）全在 online_work 任务里做，
- *   结果写进一组静态槽位 + 一个"完成"标志，由 200 ms 的 LVGL 定时器搬到界面上。
+ *   LVGL 任务只做 UI；HTTP 全在 online_work 任务里做，结果经 200 ms 轮询搬到界面。
  *
- * ★ 2026-10 拆分（见 docs/refactor/04_app_online.md）：本文件**只剩三件事** ——
- *   注册桌面 App、组装页面控件树（页面外壳）、页面销毁时按顺序收尾。
- *   其余按职责分到：ao_work（工作线程/协议）、ao_model（纯逻辑）、ao_pages（骨架/
- *   切页）、ao_page_acct/pl/srch（三页）、ao_qr_login（二维码）、ao_modal（浮层/
- *   键盘）、ao_widgets（通用控件）、ao_result（结果分发/轮询）、ao_selftest（自检）。
+ * ★ 版面是**绝对坐标版**（设计稿 800x480）：screen 不留 padding，标题/加号/页签/
+ *   宿主全部按设计稿的像素位置摆；换方向编译时靠 UI_PX_W/UI_PX_H 按比例缩放。
  */
 #include "app_online.h"
 
@@ -32,15 +26,20 @@
 #include "online_service.h"
 
 #include "ao_common.h"
+#include "ao_pl_cover.h"
 #include "ao_provider.h"
 #include "ao_model.h"
 #include "ao_overlay.h"
 #include "ao_pages.h"
 #include "ao_result.h"
 #include "ao_selftest.h"
+#include "ao_style.h"
 #include "ao_work.h"
 
 static const char *TAG = AO_TAG;
+
+#define D_X(n) UI_PX_W(n)
+#define D_Y(n) UI_PX_H(n)
 
 /* ---------------------------------------------------------------- 页面 */
 
@@ -53,36 +52,51 @@ static void online_on_delete(lv_event_t *e)
     ao_collect_close();   /* 收藏到歌单的浮层同样挂在 layer_top 上，退页面要收 */
     ao_pl_menu_close();
     ao_qr_close();       /* 二维码浮层挂在 lv_layer_top 上，不随页面销毁，必须显式收掉 */
-    /* 二次确认框同样挂在 lv_layer_top 上：退页面时它必须一起消失，
-     * 否则会跟着用户到别的页面去（而且回调还指着本页的状态） */
+    /* 二次确认框同样挂在 lv_layer_top 上：退页面时它必须一起消失 */
     ui_ba_confirm_close();
-    /*
-     * ★ 拼音键盘和自带键盘挂在 lv_layer_top 上，**不归本页所有**（只建一次、
-     * 全局复用），所以这里只收起、不能删 —— 删了下次搜索就得重建（还要重新
-     * 加载词库，卡一秒）。
-     */
+    /* 拼音键盘和自带键盘挂在 lv_layer_top 上，**不归本页所有**：只收不删 */
     ao_ime_hide();
 
-    ao_pages_clear();    /* 骨架：页面根 / 三个 tab / 宿主 / 三个页容器 */
-    ao_acct_clear();     /* 第 0 页控件（列表/提示/返回行）随 screen 一起销毁，
-                          * 必须清指针，否则残留的悬垂指针一旦被 rebuild 碰到就是崩溃 */
+    /* ★ 返回键的接管必须跟着清掉：否则退出本 APP 之后，
+     *   别的页面的返回键还会先问一个已经失效的 handler。
+     * ⚠ 这里**不要**再调 ao_pages_set_detail_mode()：screen 的 DELETE 事件是在
+     *   子对象已经销毁之后才派发的（LVGL 先删子对象），那时 tabs/title 都是野指针。 */
+    ui_back_button_set_handler(NULL);
+
+    /* 歌单详情的封面：页面没了就整块还给 PSRAM */
+    ao_pl_cover_release_all();
+
+    ao_pages_clear();    /* 骨架：页面根 / 四个 tab / 宿主 / 四个页容器 */
+    ao_acct_clear();     /* 各页控件随 screen 一起销毁，必须清指针 */
     ao_pl_clear();
-    ao_srch_clear();     /* 内含 s_srch_has_res = false */
+    ao_srch_clear();
+    ao_account_clear();
     ao_detail_close_all();
 
-    /* 结果槽位里可能还压着一份"工作线程刚发布、本页定时器还没搬走"的结果：一次清干净 */
+    /* 结果槽位里可能还压着一份"工作线程刚发布、本页定时器还没搬走"的结果 */
     ao_work_discard_pending();
-    /* 被替换下来的旧队列：交给播放器托管（它换队列时会自己放），别留在这儿 */
+    /* 被替换下来的旧队列：交给播放器托管 */
     ao_queue_drop_stale();
-    /* 请求序号/重试节流 + 分页/懒加载状态复位：下次进来重新拉、从第 1 页开始 */
     ao_session_end();
 }
 
-/* 右上角那个「+」：加歌单浮层（搜索已经是下面的 tab，删除/更新在歌单行的长按菜单里） */
-static void on_add_clicked(lv_event_t *e)
+/*
+ * 全局返回钮的接管（见 ui_core.h 的 ui_back_button_set_handler）：
+ * 歌单详情是"同一页里换内容"，没有压路由栈 —— 这时返回键必须先回歌单列表，
+ * 而不是把整个在线音乐 APP 退掉。
+ */
+static bool online_back_handler(void)
 {
-    (void)e;
-    ao_modal_open(OREQ_ADD);
+    if (!ao_pages_in_detail()) {
+        return false;               /* 列表态：交回默认行为（退栈） */
+    }
+    const int page = ao_pages_current();
+    if (page == 0) {
+        ao_acct_leave_detail();
+    } else if (page == 1) {
+        ao_pl_leave_detail();
+    }
+    return true;
 }
 
 static lv_obj_t *page_online(void)
@@ -91,81 +105,72 @@ static lv_obj_t *page_online(void)
     ao_session_begin(lv_tick_get());
 
     lv_obj_t *scr = lv_obj_create(NULL);
-    ui_screen_apply_default_bg(scr);   /* 深色不透明底：否则会露出上一页（常见是播放器背景图） */
+    /* 设计稿的背景：斜向三段渐变（#132536 → #0E1722 → #0A0F16） */
+    ao_style_screen_bg(scr);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_style_pad_all(scr, UI_PAGE_PAD, LV_PART_MAIN);
-    /* pad_top = UI_TITLEBAR_Y：标题行正好落在状态栏下面那条标题栏里，
-     * 与全局返回钮同一条中线（原来是 +UI_PX_H(6)，比标题栏高 2 px，会错开） */
-    lv_obj_set_style_pad_top(scr, UI_TITLEBAR_Y, LV_PART_MAIN);
-    lv_obj_set_style_pad_row(scr, UI_PX_H(6), LV_PART_MAIN);
-    /* 纵向 flex：标题行 / tab 行 / 三页宿主（宿主 flex_grow 吃掉剩余高度）。
-     * 为什么不用"绝对定位 + 给宿主留 pad_top"：那样宿主容器会整屏盖住标题行，
-     * LVGL 的容器默认 clickable，会把 tab 的点击全吞掉。 */
-    lv_obj_set_flex_flow(scr, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_all(scr, 0, LV_PART_MAIN);   /* 绝对坐标版式 */
     ao_pages_set_root(scr);
 
-    /* 标题行（返回键由 ui_router/ui_core 统一叠在顶层，不再每页自己画）。
-     * 高取 UI_TITLEBAR_H：和那条标题栏同高，标题 LEFT_MID 就自动落在中线上 */
-    lv_obj_t *head = lv_obj_create(scr);
-    lv_obj_remove_style_all(head);
-    lv_obj_set_size(head, LV_PCT(100), UI_TITLEBAR_H);
-    lv_obj_remove_flag(head, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *title = lv_label_create(head);
-    lv_obj_set_style_text_font(title, UI_FONT_TITLE, LV_PART_MAIN);
-    lv_obj_set_style_text_color(title, UI_COLOR_FG, LV_PART_MAIN);
+    /* 右上角径向光晕（设计稿 cx=80% cy=15% r=55% 25% 不透明）：先建 = 最底层 */
+    ao_style_glow(scr, 80, 15, 64);
+
+    /* 标题（返回键由 ui_core 统一叠在顶层；标题从 UI_HEADER_TEXT_X 起排，给按钮让位） */
+    lv_obj_t *title = lv_label_create(scr);
+    lv_obj_set_style_text_font(title, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
     lv_label_set_text(title, ao_provider_title());
-    lv_obj_align(title, LV_ALIGN_LEFT_MID, UI_HEADER_TEXT_X, 0);
+    /* screen 的 pad 是 0（绝对坐标版式），所以这里要自己补上标题栏的顶边
+     * UI_TITLEBAR_Y，否则标题会跑到状态栏里（见 ui_metrics.h 的版面说明） */
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, UI_HEADER_TEXT_X,
+                 UI_TITLEBAR_Y + ui_titlebar_text_dy());
+    ao_pages_set_chrome(title);
 
-    /* 右上角只剩"添加歌单"：搜索已经是下面的 tab，删除/更新在歌单行的长按菜单里 */
-    lv_obj_t *add = lv_button_create(head);
-    lv_obj_set_size(add, UI_PX_H(36), UI_PX_H(36));
-    lv_obj_set_style_radius(add, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(add, UI_COLOR_PILL, LV_PART_MAIN);
-    lv_obj_add_event_cb(add, on_add_clicked, LV_EVENT_CLICKED, NULL);
-    lv_obj_t *al = lv_label_create(add);
-    lv_obj_set_style_text_font(al, UI_FONT_TEXT, LV_PART_MAIN);
-    lv_obj_set_style_text_color(al, UI_COLOR_FG, LV_PART_MAIN);
-    lv_label_set_text(al, LV_SYMBOL_PLUS);
-    lv_obj_center(al);
-    lv_obj_align(add, LV_ALIGN_RIGHT_MID, 0, 0);
+    /*
+     * 右上角的「+」（添加歌单 ID 浮层）已按需求**移除**（2026-11 用户："去掉右上角的添加歌单
+     * 按钮，现在它是没有什么用了"）——歌单都从「我的歌单」里按账号同步下来，这个入口只剩
+     * 手工录 ID 一条用途。要加回来：在这里重建按钮 + 挂 ao_modal_open(OREQ_ADD)。
+     */
 
-    /* ---- 顶部三个 tab：文字即标题，点一下切页（页签次序在 ao_pages.cc 里保证）---- */
+    /*
+     * 页签行：设计稿 (54,76)，四段文字 + 会跟着当前页走的 3 px 强调色下划线。
+     * 页签排布由 ao_pages_build_tabs() 负责（文字宽随语言变，不能写死坐标）。
+     */
     lv_obj_t *tabs = lv_obj_create(scr);
     lv_obj_remove_style_all(tabs);
-    lv_obj_set_size(tabs, LV_PCT(100), UI_PX_H(42));
-    /* 让开悬到内容区的下半截返回钮（见 ui_metrics.h 的 UI_BACK_BTN_DIP）：
-     * 按钮在 lv_layer_top 上 z 序最高，不让开的话第一个页签会被它压住 */
-    lv_obj_set_style_pad_top(tabs, UI_BACK_BTN_DIP, LV_PART_MAIN);
+    lv_obj_set_pos(tabs, D_X(54), D_Y(76));
+    lv_obj_set_size(tabs, D_X(692), D_Y(36));
+    lv_obj_set_style_pad_top(tabs, D_Y(6), LV_PART_MAIN);
     lv_obj_set_flex_flow(tabs, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(tabs, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_set_style_pad_column(tabs, UI_PX_W(26), LV_PART_MAIN);
+    lv_obj_set_flex_align(tabs, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_style_pad_column(tabs, D_X(26), LV_PART_MAIN);
     lv_obj_remove_flag(tabs, LV_OBJ_FLAG_SCROLLABLE);
     ao_pages_build_tabs(tabs);
 
-    /* ---- 三页的宿主：吃掉剩余高度，并把三页裁剪在可视范围内 ---- */
+    /* ---- 四页的宿主（y=118 起，详情模式会自己上移到 88） ---- */
     lv_obj_t *host = ao_pages_build_host(scr);
 
-    /* ================= 第 0 页：我的歌单（网易云账号） ================= */
+    /* ================= 第 0 页：我的歌单 ================= */
     ao_pages_set_page(0, ao_acct_build(host));
-
     /* ================= 第 1 页：我添加的歌单 ================= */
     ao_pages_set_page(1, ao_pl_build(host));
-
-    /* ================= 第 2 页：歌曲搜索 ================= */
+    /* ================= 第 2 页：搜索 ================= */
     ao_pages_set_page(2, ao_srch_build(host));
+    /* ================= 第 3 页：账号（新增） ================= */
+    ao_pages_set_page(3, ao_account_build(host));
 
     /*
      * ★ 首次定位必须在**整屏跑过一次 layout 之后**：页宽取自 lv_obj_get_width(s_host)，
-     * 而 s_host 的宽度是父级 flex（flex_grow）算出来的 —— 只 update 它自己拿不到。
-     * 没 layout 时宽是 0，三页会叠在一起。
+     *   而 s_host 的宽度是父级的百分比算出来的 —— 没 layout 时宽是 0，几页会叠一起。
      */
     lv_obj_update_layout(scr);
     ao_srch_reset_view();
     ao_page_show(0, false);
     ao_pl_rebuild();
     ao_srch_rebuild();
+    ao_account_rebuild();
 
     lv_obj_add_event_cb(scr, online_on_delete, LV_EVENT_DELETE, NULL);
+    ui_back_button_set_handler(online_back_handler);
     ao_result_poll_start();
     if (ao_is_qq()) {
         /* QQ 的"收藏到歌单"藏在长按里，第一次进来提示一次，否则没人发现 */
@@ -182,7 +187,6 @@ static lv_obj_t *page_online(void)
  * 两个桌面入口、**同一份页面代码**：
  *   "online"  网易云音乐（order 20，保持原来的位置）
  *   "qqmusic" QQ 音乐（order 21，紧挨着网易云）
- * page_online() 里所有文案与后端接口都按 ao_provider() 分派，见 ao_provider.h。
  */
 static lv_obj_t *page_netease(void)
 {

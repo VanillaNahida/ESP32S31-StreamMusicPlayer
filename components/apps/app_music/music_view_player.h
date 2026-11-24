@@ -25,30 +25,77 @@ extern "C" {
 lv_obj_t *music_view_player_build(void);
 
 /*
- * 圆形按钮工厂。
- * code 一般传 LV_EVENT_CLICKED；**有长按动作的按钮要传 LV_EVENT_SHORT_CLICKED** ——
- * 见输出设备按钮处的说明。播放器页与输出设备按钮共用同一套样式。
+ * 控制排上的图标键工厂（按设计稿 assets/UIDesign/播放器UI重构参考.svg）。
+ *
+ * 设计稿的控制排**没有按钮底色**，只有一个个图标；唯一的例外是中央播放键
+ * （半透明白圆 48 px，见 music_view_make_play_btn）。
+ *   - 命中区 44x44（UI_MIN_TOUCH），图标 20 px 居中；
+ *   - 透明底上没有"按下变暗"的天然反馈，所以这里挂 LV_STATE_PRESSED 的 55% 不透明度；
+ *   - code 一般传 LV_EVENT_CLICKED；**有长按动作的按钮要传 LV_EVENT_SHORT_CLICKED**
+ *     （见 music_view_output.h 的说明）。
+ *
+ * fg / fg_opa 就是设计稿里那个图标的颜色与不透明度（例如控制排两端是 65% 白）。
  */
-lv_obj_t *music_view_make_round_btn_ex(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
-                                       lv_event_code_t code, lv_color_t bg, lv_color_t fg);
-lv_obj_t *music_view_make_round_btn(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
-                                    lv_color_t bg, lv_color_t fg);
+lv_obj_t *music_view_make_icon_btn(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
+                                   lv_event_code_t code, lv_color_t fg, lv_opa_t fg_opa);
+
+/*
+ * 同上，但图标是**烘焙好的位图**（lv_image）而不是字形。
+ *
+ * 为什么要这个：输出设备按钮要用用户给的 SVG（assets/icons/out_device.svg 烘成
+ * ui_icons.h 里的 out_device），字形里没有那个图形。图标是白色烘的，
+ * fg 用 image_recolor 上色、fg_opa 用整对象的 opa —— 与字形版观感一致。
+ * 返回的按钮**第 0 个子对象**就是那个 lv_image（换配色时取它）。
+ */
+lv_obj_t *music_view_make_icon_btn_image(lv_obj_t *parent, const lv_image_dsc_t *icon,
+                                         lv_event_cb_t cb, lv_event_code_t code,
+                                         lv_color_t fg, lv_opa_t fg_opa);
+
+/*
+ * 中央播放/暂停键：48x48 半透明白圆（#FFFFFF 16%）+ 20 px 白色图标。
+ * ⚠ 图标 label 必须是按钮的**第 0 个子对象**：加载态的转圈、
+ *   set_play_icon() 的换字形都按这个约定取（见 music_view_player.cc）。
+ */
+lv_obj_t *music_view_make_play_btn(lv_obj_t *parent);
 
 /* 页面建完后建的两个常驻定时器（tick / 蓝牙媒体键）的双保险入口 */
 void music_view_player_build_prepare(void);
 
+/*
+ * 封面左下角渠道胶囊的三套**平台主题色**（2026-11 用户：每个胶囊按不同平台的主题色
+ * 显示对应的颜色）。取值是平台自己的品牌色：
+ *   网易云  红（assets/icons/netease.png 图标底色 #F01010 一族）
+ *   QQ音乐  绿（QQ 音乐图标里那个音符的 #00B070）
+ *   本地播放 中性石板灰（本地没有"平台"，用不抢眼的灰，压在任何封面上都读得清）
+ * 定义放头文件：建控件（music_view_page.cc）与按音源刷新（music_view_player.cc）
+ * 两处都要用，不能各写一份。
+ */
+#define MUSIC_SRC_COLOR_LOCAL    0x5A6672
+#define MUSIC_SRC_COLOR_NETEASE  0xE01020
+#define MUSIC_SRC_COLOR_QQ       0x00B070
+#define MUSIC_SRC_COLOR_ONLINE   0x2F7FBF   /* 在线但取不到渠道（兜底） */
+
 /* ---------------------------------------------------------- 控件绑定（只给 music_view_page.cc） */
 
-void music_view_player_bind_cover(lv_obj_t *box, lv_obj_t *img);
+/* 封面容器 + 真封面 + 占位层（占位层 = 渐变卡片，有真封面时藏起来） */
+void music_view_player_bind_cover(lv_obj_t *box, lv_obj_t *img, lv_obj_t *placeholder);
+/*
+ * 封面左下角的渠道胶囊（本地播放 / QQ音乐 / 网易云）：
+ * 文案与底色由 apply_src_badge() 按当前音源刷；点它自己会隐藏（状态落 NVS）。
+ * ⚠ 封面上**不再有任何歌名/来源文字**（2026-11 用户），所以没有 bind_band_title 了。
+ */
 void music_view_player_bind_src_badge(lv_obj_t *badge);
-/* 渠道药丸（"网易云音乐" / "QQ音乐"，品牌色底）：本地曲目时自动隐藏 */
-void music_view_player_bind_provider_badge(lv_obj_t *badge);
+/* 渠道胶囊显隐（点它 = 隐藏；播放器设置里有开关；状态落 NVS，默认显示） */
+void music_view_player_src_badge_set_visible(bool on);
+bool music_view_player_src_badge_visible(void);
 /* 标题 / 歌手。★ 必须绑：set_now_playing() 靠这两个指针换曲时刷新，
  *   漏绑的表现是"首次进页面正常、之后换曲标题不动"（2026-10 修过这个 bug）。 */
 void music_view_player_bind_now_playing(lv_obj_t *title, lv_obj_t *artist);
-void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek);
+/* cur/tot：左下/右下的两个时间；seek：lv_bar 本体；knob：进度条上的白圆点 */
+void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek,
+                                  lv_obj_t *knob);
 void music_view_player_bind_seek(lv_obj_t *seek_hit);
-/* 红心：btn（透明，只有图标）+ img（heart_on/off）+ spin（请求中转圈，初始隐藏） */
+/* 红心（控制排里的第 6 个键）：btn（透明，只有图标）+ img（heart_on/off）+ spin（请求中转圈） */
 void music_view_player_bind_like(lv_obj_t *btn, lv_obj_t *img, lv_obj_t *spin);
 /* tick 用：按 music_state 的 like_* 画红心（内部缓存上次画的状态，没变零开销） */
 void music_view_player_like_apply(void);
@@ -90,8 +137,9 @@ void music_view_player_apply_src_badge(void);
 void music_view_player_apply_play_mode(void);
 
 /*
- * 主题色（跟随封面）应用到本页控件：进度条填充、播放键底色、单曲循环角标、
- * 各种转圈的弧、来源药丸的在线底色、频谱柱、歌词区缓冲转圈。
+ * 主题色（跟随封面）应用到本页控件：单曲循环角标、各种转圈的弧、频谱柱。
+ * ⚠ 重构稿（2026-11）的进度条/播放键是**白色**（不再是封面主色），所以这里
+ *   不再改那两处 —— 封面主色仍然由频谱柱与加载转圈体现。
  * **幂等**（内部缓存上次的 rgb，没变直接返回），tick 每 500 ms 调一次。
  */
 void music_view_player_accent_apply(void);

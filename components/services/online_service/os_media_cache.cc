@@ -550,6 +550,17 @@ esp_err_t online_song_prepare(const online_song_t *song, char *audio_path, size_
         return ESP_ERR_INVALID_STATE;
     }
 
+    /*
+     * ★ 兜底下载是**唯一**会往 SD 写音频的路径，所以这个目录在这里按需创建：
+     *   正常流式播放不会建它（2026-11 用户要求去掉 init 里那次无条件 mkdir，
+     *   见 online_service.cc 的说明）。建不出来只影响这一次兜底下载 ——
+     *   SD 没挂上/写保护时给一句明确日志，别让上层以为已经下好了。
+     */
+    if (os_mkdir_if_needed(ONLINE_AUDIO_DIR) != ESP_OK) {
+        ESP_LOGW(TAG, "建 %s 失败（SD 没挂上或只读），兜底下载放弃", ONLINE_AUDIO_DIR);
+        return ESP_FAIL;
+    }
+
     /* 先下到临时文件，嗅探格式后再改名（扩展名决定用哪个解码器） */
     char tmp[192];
     snprintf(tmp, sizeof(tmp), ONLINE_AUDIO_DIR "/%s.part", key);

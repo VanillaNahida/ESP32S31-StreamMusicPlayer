@@ -1,18 +1,22 @@
 /*
- * ao_pages.h —— **通用 LVGL 层**：页面骨架（三页 tab + 左右滑动切页）+ 控件工厂
+ * ao_pages.h —— **通用 LVGL 层**：页面骨架（四页 tab + 左右滑动切页）+ 控件工厂
  *
- * 页序（**必须与 PG_* 常量、动画下标一致**，加页时三处一起改）：
- *   0 = 我的歌单（网易云账号） / 1 = 我添加的歌单 / 2 = 搜索
+ * 页序（**必须与 PG_* 常量、ao_page_show 的下标、slide_exec_cb 三处一致**）：
+ *   0 = 我的歌单（账号歌单 + 每日推荐） / 1 = 我添加的歌单 / 2 = 搜索 / 3 = 账号
  *
- * 三个页面容器（s_page_acct / s_page_pl / s_page_srch）由本模块持有：
- * 切页动画要按下标同时平移它们；各页自己的控件（列表/提示/返回行）由各自的 .cc 持有。
+ * 版面照 assets/UIDesign/在线音乐主界面.svg：
  *
- * 控件工厂（ao_make_row / 占位 / 翻页行 / 返回行）也在这里：它们本来就是"跟哪一页无关"
- * 的通用件，四个列表长得一模一样就靠它，别再各写一份。
+ *     ◀  网易云音乐                                    (+)
+ *         我的歌单   我添加的歌单   搜索   账号
+ *         ▔▔▔▔                                    ← 3 px 强调色下划线（跟着当前页走）
+ *         歌单 · 14 个
+ *     [●] 每日推荐                          根据你的口味每天更新
+ *     ──────────────────────────────────────────────────────
  *
- * ⚠ 2026-10 拆分说明：蓝图里 `ao_widgets.cc`（约 180 行）与 `ao_pages.cc`（约 120 行）
- *   是两份；实际落地后两份都远不到"每个 .cc 300~600 行"的下限，而它们同属"通用 LVGL
- *   层"，合并成一份既满足行数带又不增加耦合 —— 这是对蓝图的**微调**，职责没变。
+ * 歌单详情（歌单曲目详情页.svg）是**同一页里换内容**：
+ *   ao_pages_set_detail_mode(true) 把页签收起来、宿主上移到 y=88、标题改成"歌单"，
+ *   页里再换成 ao_view 的详情版式。返回键由 ui_core 的 handler 钩子接管
+ *   （ui_back_button_set_handler），所以按返回是"回到歌单列表"而不是退出 APP。
  */
 #pragma once
 
@@ -27,15 +31,33 @@
 /* 给控件挂 LV_EVENT_GESTURE（屏幕绝大部分面积是行，横滑多从行上起手） */
 void ao_pager_attach(lv_obj_t *o);
 
-/* 建顶部三个 tab 标签（文字即标题，点一下切页）并登记 */
+/*
+ * 建顶部四个 tab 标签（文字即标题，点一下切页）+ 那条会跟着走的强调色下划线。
+ * 页签容器必须是**绝对定位**的（坐标由 app_online.cc 按设计稿摆）。
+ */
 void ao_pages_build_tabs(lv_obj_t *tabs);
-/* 建三页的宿主（负责裁剪，页宽也从它取）+ 挂手势 */
+/* 建四页的宿主（负责裁剪，页宽也从它取）+ 挂手势；默认在 y=118 */
 lv_obj_t *ao_pages_build_host(lv_obj_t *scr);
+
+/* 头部"标题"控件（app_online 建好后登记）：详情模式要把它改成"歌单" */
+void ao_pages_set_chrome(lv_obj_t *title_label);
+
+/* 进/出歌单详情模式：收/放页签、宿主上移/下移、标题换字 */
+void ao_pages_set_detail_mode(bool on);
+bool ao_pages_in_detail(void);
+
+/*
+ * 页面重建时同步"我这里是不是详情模式"。
+ * ⚠ 只有**当前显示的页**才有权改头部：别的页在后台重建（例如添加歌单的结果回来）
+ *   不能把正在看的详情页的页签/标题改回列表态。
+ */
+void ao_pages_sync_detail(int page, bool on);
 
 void ao_pages_set_root(lv_obj_t *root);
 void ao_pages_set_page(int which, lv_obj_t *page);
 
-/* 切页：夹页号、改页签样式、离开搜索页收键盘、220 ms 缓出平移 */
+/* 切页：夹页号、改页签样式、离开搜索页收键盘、220 ms 缓出平移。
+ * 详情模式下**不允许切页**（返回键先回列表），见实现里的说明。 */
 void ao_page_show(int which, bool animate);
 /* 当前页号（poll_cb 判断"本页可见吗"用） */
 int  ao_pages_current(void);
@@ -51,6 +73,22 @@ void      ao_acct_clear(void);
 lv_obj_t *ao_acct_list(void);
 /* 重新载入当前歌单详情的第 1 页（删除歌曲成功后用；每日推荐/无详情时什么都不做） */
 void      ao_acct_detail_refresh(void);
+/* 返回键：退出歌单详情，回到账号歌单列表（app_online 的返回键 handler 调） */
+void      ao_acct_leave_detail(void);
+
+/* ---------------------------------------------------------------- 每日推荐缓存
+ *
+ * 每日推荐 / 每日30首都是"一天一份"：QQ 的 /qq/recommend/daily 在服务端是
+ * 串 6 次"猜你喜欢"拼出来的（每次请求都不同），所以这里按**日期**落盘，
+ * 同一天反复进出看到的是同一份；换账号时 ao_daily_cache_clear() 清掉。
+ *
+ *   take: 命中就直接装进队列并返回 true（调用方不必再发请求）
+ *   store: 请求成功回来后落盘
+ */
+bool ao_daily_cache_take(int feed);
+void ao_daily_cache_store(int feed, const online_song_t *songs, size_t n);
+/* 换账号（登录成功 / 退出登录）：今日缓存作废，别把上一个人的列表留给下一个人 */
+void ao_daily_cache_clear(void);
 
 /* ---------------------------------------------------------------- 第 1 页：我添加的歌单 */
 
@@ -63,6 +101,8 @@ void      ao_pl_menu_close(void);
 /* 重命名目标（pl_menu_close() 会清 s_menu_idx，所以先存到这份里） */
 int       ao_pl_rename_idx(void);
 void      ao_pl_rename_idx_set(int idx);
+/* 返回键：退出歌单详情，回到"我添加的歌单"列表 */
+void      ao_pl_leave_detail(void);
 
 /* ---------------------------------------------------------------- 第 2 页：搜索 */
 
@@ -77,20 +117,34 @@ void      ao_srch_set_has_res(bool has);
 /* 拼音键盘上的对勾 / 回车（ao_modal.cc 按上下文分派过来） */
 void      ao_srch_ime_ready(lv_event_t *e);
 
+/* ---------------------------------------------------------------- 第 3 页：账号 */
+
+lv_obj_t *ao_account_build(lv_obj_t *parent);
+void      ao_account_rebuild(void);
+void      ao_account_clear(void);
+
 /* ---------------------------------------------------------------- 通用控件工厂 */
 
-/* 通用列表行（图标块 + 标题 + 右侧副标题），返回行对象 */
+/* 通用列表行（图标块 + 标题 + 右侧副标题），返回行对象（搜索页仍在用） */
 lv_obj_t *ao_make_row(lv_obj_t *parent, const char *sym, uint32_t accent,
                       const char *title, const char *sub);
 
-/* 歌曲列表（歌单详情 / 搜索结果 / 账号歌单共用）：画 s_songs[first, first+count) */
+/* 歌曲列表（搜索结果共用）：画 s_songs[first, first+count) */
 void ao_fill_song_rows_range(lv_obj_t *list, size_t first, size_t count);
+
+/*
+ * 给"歌曲行"挂上点播（SHORT_CLICKED）+ 长按收藏（LONG_PRESSED，仅 QQ 音乐有效）。
+ * 详情页用 ao_style_song_row() 建好行之后调它；搜索页仍用 ao_fill_song_rows_range()。
+ */
+void ao_song_row_wire(lv_obj_t *row, size_t idx);
 
 /* 列表内容整段换掉之后回到顶部（不归零的话新内容会从中间开始显示） */
 void ao_list_scroll_top(lv_obj_t *list);
 
-/* "‹ 上一页 / 下一页 ›"两行（页码提示由各页自己写在 hint 里） */
+/* "‹ 上一页 / 下一页 ›"两行（页码提示由各页自己写在 hint 里） —— 旧卡片风格 */
 void ao_page_rows(lv_obj_t *list, int which, int page, int pages);
+/* 同上，但用**扁平列表**那一行的样式（歌单详情页用） */
+void ao_page_rows_flat(lv_obj_t *list, int which, int page, int pages);
 
 /* 详情页顶部"‹ 返回"行（**必须挂在页容器上，不放进可滚动列表**，见实现里的说明） */
 lv_obj_t *ao_make_back_label(lv_obj_t *parent, const char *text, lv_event_cb_t cb);

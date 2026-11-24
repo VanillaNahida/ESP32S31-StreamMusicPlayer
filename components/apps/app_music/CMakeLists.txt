@@ -57,3 +57,23 @@ if(EXISTS "${PLAYER_BG_JPG}")
 else()
     message(WARNING "app_music: 找不到 assets/player_background.jpg（见 music_player_bg.cc）")
 endif()
+# ---------------------------------------------------------------------------
+# 播放器页的默认专辑封面：assets/cover/player_default_cover_188x188.bin
+#
+# 需求（2026-11 用户）："播放器显示的专辑封面需要圆角；若没有专辑封面，则改用内置的
+# assets/default_black_vinyl_record.png"。那张图四周是透明的，透出封面卡片的底色
+# （现在是浅粉灰），所以烘成 RGB565A8（带 alpha，比 ARGB8888 省 1/4 flash）；
+# 原始像素由 tools/icons/gen_photo.py 按清单 assets/cover/photos.txt 生成（不要手改 .bin）。
+#
+# 尺寸 **188x188**（源图 488x459 用"补透明边"凑成 488x488 再缩，不裁任何内容），
+# 必须与 music_view_page.cc 的 COVER_BMP_SIDE 一致（那边按字节数校验，对不上会打 ERROR
+# 并斜切）。显示边长是另一个宏 COVER_DEF_SIDE，可单独调（CONTAIN 缩放）。
+# ---------------------------------------------------------------------------
+set(PLAYER_DEF_COVER "${CMAKE_SOURCE_DIR}/assets/cover/player_default_cover_188x188.bin")
+if(EXISTS "${PLAYER_DEF_COVER}")
+    target_add_binary_data(${COMPONENT_LIB} "${PLAYER_DEF_COVER}" BINARY
+                           RENAME_TO "player_default_cover_bin")
+    message(STATUS "app_music: 默认专辑封面 <- assets/cover/player_default_cover_188x188.bin")
+else()
+    message(WARNING "app_music: 找不到默认专辑封面 .bin（先跑 tools/icons/gen_photo.py）")
+endif()

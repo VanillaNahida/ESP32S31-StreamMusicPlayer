@@ -22,6 +22,7 @@
 
 #include "music_info.h"
 #include "music_spectrum.h"
+#include "music_view_player.h"   /* 音源标签的显隐（music_view_player_src_badge_*） */
 
 static ui_ba_dialog_t s_dlg;
 static bool s_open;
@@ -41,6 +42,20 @@ static void fft_switch_cb(lv_event_t *e)
     const bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
     music_spectrum_set_enabled(on);
     ui_toast(on ? "已开启音频可视化" : "已关闭音频可视化", 1400);
+}
+
+/*
+ * 音源标签（封面左下角那个渠道胶囊）的显隐开关。
+ *
+ * 需求（2026-11 用户）：胶囊"尽可能小，点击它可以隐藏，这个隐藏状态可以记忆"。
+ * 点胶囊自己就能隐藏；想找回来就进这里 —— 否则藏了之后没有任何入口。
+ */
+static void src_badge_switch_cb(lv_event_t *e)
+{
+    lv_obj_t *sw = lv_event_get_target_obj(e);
+    const bool on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    music_view_player_src_badge_set_visible(on);
+    ui_toast(on ? "已显示音源标签" : "已隐藏音源标签", 1400);
 }
 
 /* 进了"歌曲信息"就把本弹窗关掉：两个都是居中卡片，叠着看不清也没必要 */
@@ -105,7 +120,38 @@ void music_menu_open(void)
 
     ui_ba_hint(s_dlg.body, "播放时在进度条上方显示频谱柱");
 
-    /* ---- 第 2 行：歌曲信息入口 ---- */
+    /* ---- 第 2 行：音源标签（封面左下角渠道胶囊）显隐 ---- */
+    lv_obj_t *row2 = lv_obj_create(s_dlg.body);
+    lv_obj_remove_style_all(row2);
+    lv_obj_set_width(row2, LV_PCT(100));
+    lv_obj_set_height(row2, LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(row2, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(row2, LV_FLEX_ALIGN_SPACE_BETWEEN,
+                          LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_remove_flag(row2, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_pad_ver(row2, UI_PX_H(4), LV_PART_MAIN);
+
+    lv_obj_t *name2 = lv_label_create(row2);
+    lv_obj_set_style_text_font(name2, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_color(name2, lv_color_hex(BA_TEXT), LV_PART_MAIN);
+    lv_label_set_text(name2, "音源标签");
+
+    lv_obj_t *sw2 = lv_switch_create(row2);
+    lv_obj_set_size(sw2, UI_PX_W(52), UI_PX_H(28));
+    lv_obj_set_style_bg_color(sw2, lv_color_hex(BA_CANCEL_B), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(sw2, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(sw2, lv_color_hex(BA_BLUE), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(sw2, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(sw2, lv_color_hex(BA_CARD), LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(sw2, LV_OPA_COVER, LV_PART_KNOB);
+    if (music_view_player_src_badge_visible()) {
+        lv_obj_add_state(sw2, LV_STATE_CHECKED);
+    }
+    lv_obj_add_event_cb(sw2, src_badge_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+
+    ui_ba_hint(s_dlg.body, "封面左下角显示本地/QQ音乐/网易云");
+
+    /* ---- 第 3 行：歌曲信息入口 ---- */
     ui_ba_opt_row(s_dlg.body, "歌曲信息", BA_BLUE, info_row_cb, NULL);
 
     /* ---- 底部 ---- */

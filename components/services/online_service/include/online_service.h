@@ -25,7 +25,10 @@
  *
  * 落盘（需求："抓取歌单后把歌单列表二进制保存在存储卡内"）：
  *   /sdcard/online/pl_<歌单ID>.bin     定长头 + 定长记录数组（见 online_service.cc）
- *   /sdcard/online/audio/<歌曲ID>.<ext>  已下载的音频（播放的就是它）
+ *   /sdcard/online/audio/<歌曲ID>.<ext>  **兜底下载**才有（流式播放不落盘）：
+ *                                       m4a/ogg/opus 这类顺序流接不上的容器、
+ *                                       或取流失败时，才整首下到这里当本地文件播。
+ *                                       目录也是那时候才建（2026-11 起不再开机创建）
  *
  * 封面 / 歌词**只缓存在 PSRAM，不写 SD 卡**（2026-10 改）：
  *   之前封面/歌词落 SD，切歌时读/写这些文件会让 SD 卡忙到"切歌阻塞"（日志里
@@ -154,6 +157,25 @@ esp_err_t online_playlist_add_qq(const char *id);
  * 成功时 *songs 由本模块 malloc（PSRAM 优先），调用方用 free() 释放。
  */
 esp_err_t online_playlist_load(const char *id, online_song_t **songs, size_t *count);
+
+/*
+ * "每天一份"的推荐列表缓存（每日推荐 / QQ 每日30首）。
+ *
+ * 为什么要它：QQ 的 /qq/recommend/daily 是**服务端串 6 次"猜你喜欢"拼出来的**
+ * （见 ncm-api 的 qq-provider.md §5.4），每次请求都是新的 30 首 —— 同一个入口
+ * 反复进出会看到不停变化的歌单。用户要的是"今天的 30 首"，所以这里按 key 落盘，
+ * **由调用方在 key 里带日期**（例如 "qq30_20261124"），于是同一天命中、换天自然失效。
+ *
+ * 文件格式与歌单**完全相同**（/sdcard/online/pl_<key>.bin，定长头 + 定长记录），
+ * 读出来的是 os_psram_alloc 的数组，所有权交给调用方（与 online_playlist_load 一致）。
+ *
+ *   load: ESP_ERR_NOT_FOUND = 没有这一天的缓存（调用方去请求网络）
+ *   save: 失败只意味着"下次再取一次"，调用方可以忽略；成功后会顺手清掉旧日期的缓存
+ */
+esp_err_t online_feed_cache_load(const char *key, online_song_t **songs, size_t *count);
+esp_err_t online_feed_cache_save(const char *key, const online_song_t *songs, size_t count);
+/* 删掉某一天的缓存（换账号时用：每日推荐是按账号算的，别把上一个人的列表留给下一个人） */
+void      online_feed_cache_forget(const char *key);
 
 /*
  * 搜索歌曲。三级：
@@ -358,6 +380,21 @@ esp_err_t online_netease_likelist(uint64_t **out_ids, size_t *out_n);
 
 /* 在 online_netease_likelist() 的结果里二分查 song_id（纯逻辑，无网络）。 */
 bool online_netease_liked_has(const uint64_t *ids, size_t n, const char *song_id);
+
+/*
+ * 最近一次"加进我喜欢"的那首歌（id / 封面地址 / 音源 / mid），落 NVS。
+ *
+ * 为什么要它（2026-11 用户）："我喜欢的音乐的封面没有成功使用最新收藏的一首歌的
+ * 封面作为封面"。歌单卡片原来的封面取的是**列表第一首**，而那首通常是"最早收藏"的
+ * 那一首 —— 刚点亮红心的那首根本不会出现在封面上。所以收藏成功时在这里记一份，
+ * 打开「我喜欢的音乐」时优先用它当封面（见 app_online 的 ao_page_acct.cc）。
+ *
+ * ⚠ 在 LVGL 任务里调即可（只有一次 NVS 写，不碰网络）；两个音源共用一份记录，
+ *   取用方按 song->src 自己校验是不是当前平台的。
+ */
+void online_last_liked_song_set(const online_song_t *song);
+/* 取这份记录：没有任何收藏记录 / 没登录过 → false（out 不动） */
+bool online_last_liked_song_get(online_song_t *out);
 
 /*
  * 歌词文本（PSRAM 缓存，不落 SD）。

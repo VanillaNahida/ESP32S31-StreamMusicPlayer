@@ -19,21 +19,24 @@ extern "C" {
 #endif
 
 typedef struct {
-    lv_obj_t *title;         /* 歌名（整宽滚动 label） */
+    lv_obj_t *title;         /* 歌名（封面下方那行大标题） */
     lv_obj_t *artist;        /* 歌手 */
     lv_obj_t *seek;          /* lv_bar：进度条本体（纯显示，触摸由抓取区管） */
+    lv_obj_t *seek_knob;     /* 进度条上的白色小圆点（设计稿里那粒 12 px 拖动位标记） */
     lv_obj_t *seek_hit;      /* 进度条抓取区：自己算比例，松手才真定位 */
     lv_obj_t *cur;           /* 已播时间 */
     lv_obj_t *tot;           /* 总时长 */
     lv_obj_t *btn;           /* 播放/暂停按钮 */
-    lv_obj_t *cover_box;     /* 左栏封面容器 */
+    lv_obj_t *cover_box;     /* 左栏封面容器（圆角 + 投影 + clip_corner 裁圆角） */
     lv_obj_t *cover_img;     /* 真封面（没解出来时隐藏） */
-    lv_obj_t *src_badge;     /* 来源药丸（在线播放 / 本地播放） */
+    lv_obj_t *cover_ph;      /* 默认占位封面（内置黑胶唱片位图；有真封面时藏起来） */
+    /*
+     * 封面左下角那个**很小的半透明胶囊**：渠道指示（本地播放 / QQ音乐 / 网易云）。
+     * 2026-11 用户要求"封面上不要有任何文字，仅允许左下角这个胶囊"，
+     * 所以原来那条'歌名 + 来源'的底部信息条（band_title / band_sub）已经删掉。
+     */
+    lv_obj_t *src_badge;
     int       src_badge_state;   /* 上次画的状态（-1 = 还没画过） */
-    /* 渠道药丸（「在线播放」右边的品牌色标签：网易云音乐 / QQ音乐）：
-     * 只在在线曲目时出现，本地文件隐藏。 */
-    lv_obj_t *provider_badge;
-    int       provider_badge_state;  /* 0=隐藏 1=网易云 2=QQ（-1 = 还没画过） */
     lv_obj_t *mode_btn;      /* 模式按钮里的图标 label */
     lv_obj_t *mode_badge;    /* 单曲循环的 "1" 角标 */
     lv_obj_t *btn_spinner;   /* 加载态：播放按钮里的转圈（懒建，与按钮同生共死） */

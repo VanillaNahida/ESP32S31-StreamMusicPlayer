@@ -117,7 +117,7 @@ lv_obj_t *gallery_view_create(lv_obj_t *parent);
 void gallery_view_set_still(uint8_t *px, int w, int h);
 bool gallery_view_set_gif(uint8_t *gif, size_t len);
 
-/* 居中提示（"载入中…" / "没有图片" / "这张打不开"），空串 = 不显示 */
+/* 居中提示（"奋力加载中…" / "没有图片" / "这张打不开"），空串 = 不显示 */
 void gallery_view_set_hint(const char *text);
 
 /* 底部说明：文件名 + 序号 */

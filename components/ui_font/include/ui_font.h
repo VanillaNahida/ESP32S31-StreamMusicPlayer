@@ -23,8 +23,10 @@
  *
  * 体积账（实测常量数据）
  * ---------------------
- *   主字体 559.0 KB + jp1 92.0 KB + jp2 85.5 KB = 736.5 KB
- *   （改 bpp 前先看 tools/font/gen_lvgl_font.py 顶部的说明：app 分区很紧。）
+ *   16 px 主字体 1.01 MB + jp1 4.2 KB + jp2 0.7 KB + dict16 762 KB ≈ 1.79 MB
+ *   22 px 大标题（ui_font_sc22，GB2312 第一级）1.02 MB
+ *   合计约 2.81 MB（app 槽 12.25 MB，见 partitions.csv 的沿革）。
+ *   （改 bpp / 字符集前先看 tools/font/gen_lvgl_font.py 顶部的说明：app 分区很紧。）
  */
 #pragma once
 
@@ -40,6 +42,18 @@ extern lv_font_t ui_font_text;
  * 常用字走 sc16（4bpp，质量不变），生僻字自动落到这份 —— 见 ui_font.c 的链条说明。
  * 单独一份的原因：LVGL 紧凑字形描述符的 bitmap_index 只有 20 位 ⇒ 单份字形数据 ≤1MB ✗。*/
 extern lv_font_t ui_font_dict16;
+
+/*
+ * 22 px 大标题字体（2026-11 UI 重构稿：播放器歌名 / 歌词当前行 / 歌单名 / 账号昵称）。
+ *
+ * 只有 **GB2312 第一级汉字（3755）+ 区 1~9 符号标点 + ASCII**，4 bpp ——
+ * 全量 GB2312 在 22 px 下要 1.7 MB，app 槽放不下（见 docs/ui-refactor-2026-11.md）。
+ * fallback 指向 ui_font_text：第一级之外的字落到 16 px **同一个字**，
+ * 只是小一号、不会变方框 —— 这是"敢只收第一级"的前提。
+ *
+ * ⚠ 与 ui_font_text 一样，**必须先 ui_font_init()** 再给任何标签用。
+ */
+extern lv_font_t ui_font_title22;
 
 /* 建好 fallback 链。幂等；必须在创建任何标签之前调用一次。 */
 void ui_font_init(void);

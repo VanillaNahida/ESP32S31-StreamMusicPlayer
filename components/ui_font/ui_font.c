@@ -16,6 +16,7 @@
 #include "ui_font.h"
 
 LV_FONT_DECLARE(ui_font_sc16)
+LV_FONT_DECLARE(ui_font_sc22)
 LV_FONT_DECLARE(ui_font_jp1_16)
 LV_FONT_DECLARE(ui_font_jp2_16)
 
@@ -23,6 +24,8 @@ LV_FONT_DECLARE(ui_font_jp2_16)
 static lv_font_t s_jp1;
 /* 主字体的可写副本：UI_FONT_* 全部指向它 */
 lv_font_t ui_font_text;
+/* 22 px 大标题的可写副本：它要指向 ui_font_text，所以不能直接用 flash 里的 const 原件 */
+lv_font_t ui_font_title22;
 // 链尾的"生僻字"字体副本（要改 fallback 指针，见文件头说明：不能改 flash 里的原件）
 static lv_font_t s_jp2;
 static lv_font_t s_dict;
@@ -44,4 +47,12 @@ s_jp2.fallback = &s_dict;
 s_jp1.fallback = &s_jp2;
 
     ui_font_text.fallback = &s_jp1;
+
+    /*
+     * 22 px 大标题字体：GB2312 第一级 + 符号 + ASCII，链到主字体。
+     * ⚠ 顺序要紧：必须在 ui_font_text（含它自己的 fallback 链）建好之后接、
+     *   而且**只能**指向 ui_font_text —— 指向 s_jp1 会跳过 16 px 的中文常用字。
+     */
+    ui_font_title22 = ui_font_sc22;
+    ui_font_title22.fallback = &ui_font_text;
 }

@@ -230,6 +230,52 @@ static bool is_own_api(const char *url)
  * 不必每次都从 http 重新跳一次 https（历史上 meting 就是这么 302 的）。
  * `cookie` 非空时给**自家 base** 加 `X-Netease-Cookie` 头（语义见头文件）。
  */
+/*
+ * 从响应体里挑一句人能看懂的原因（**只用于报错**，不做完整 JSON 解析）：
+ *   1) 优先取 {"msg":"…"} —— /qq 与网易云两套外壳都有这个字段；
+ *   2) 取不到就把 body 开头压成一行。
+ * ⚠ body 不一定以 NUL 结尾、也可能不是文本，所以先限长拷进栈上小缓冲再解析。
+ */
+static void http_reason_of(const char *body, size_t len, char *out, size_t cap)
+{
+    if (!out || cap < 8) {
+        return;
+    }
+    out[0] = '\0';
+    if (!body || len == 0) {
+        return;
+    }
+    char head[160];
+    size_t hn = (len < sizeof(head) - 1) ? len : sizeof(head) - 1;
+    memcpy(head, body, hn);
+    head[hn] = '\0';
+
+    const char *src = head;
+    const char *p = strstr(head, "\"msg\"");
+    if (p) {
+        p = strchr(p, ':');
+        if (p) {
+            p = strchr(p, '"');
+            if (p) {
+                src = p + 1;
+            }
+        }
+    }
+    /* 正文里的控制字符压成空格：这一行要进串口日志与 Toast */
+    size_t i = 0;
+    for (; src[i] && i + 1 < cap; i++) {
+        const char c = src[i];
+        if (src != head && c == '"') {
+            break;                      /* msg 的结束引号 */
+        }
+        if (src == head && (c == '\n' || c == '\r')) {
+            break;
+        }
+        out[i] = (c < 0x20) ? ' ' : c;
+    }
+    out[i] = '\0';
+}
+
 static esp_err_t http_get_hops(char *cur, size_t cur_cap, http_verb_t verb,
                                const char *hdr1_name, const char *hdr1_val,
                                const char *hdr2_name, const char *hdr2_val,
@@ -356,9 +402,25 @@ static esp_err_t http_get_hops(char *cur, size_t cur_cap, http_verb_t verb,
             return ret;
         }
         if (status != 200) {
-            ESP_LOGW(TAG, "GET status %d: %s", status, url_for_log(cur));
+            /*
+             * ★ 2026-11：把**服务端那句原因**带出来。
+             *   只报"HTTP 422"的时候，界面上只有"收藏失败：服务器返回 HTTP 422"，
+             *   根本看不出是参数不对还是凭证过期（QQ 的 add_songs 就踩过：
+             *   sidecar 的 list[int] 只认 song_id=，axios 默认写成 song_id[]=，
+             *   于是每次都 422，而设备侧一个字都看不见）。
+             *   两家接口的外壳都是 {"code":N,"msg":"…"}，优先取 msg；取不到就把
+             *   body 开头压成一行（截断到 last_error 的 64 字节里放得下）。
+             */
+            char reason[40];
+            http_reason_of(sink.buf, sink.len, reason, sizeof(reason));
+            ESP_LOGW(TAG, "GET status %d: %s | %s", status, url_for_log(cur),
+                     reason[0] ? reason : "-");
             char msg[64];
-            snprintf(msg, sizeof(msg), "服务器返回 HTTP %d", status);
+            if (reason[0]) {
+                snprintf(msg, sizeof(msg), "HTTP %d：%s", status, reason);
+            } else {
+                snprintf(msg, sizeof(msg), "服务器返回 HTTP %d", status);
+            }
             os_state_set_last_error(msg);
             free(sink.buf);
             return ESP_ERR_INVALID_RESPONSE;

@@ -11,6 +11,7 @@ idf_component_register(
     SRCS
         "ui_font.c"
         "ui_font_sc16.c"
+        "ui_font_sc22.c"
         "ui_font_jp1_16.c"
         "ui_font_jp2_16.c"
     "ui_font_dict16.c"

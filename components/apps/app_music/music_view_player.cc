@@ -18,6 +18,7 @@
 #include <string.h>
 
 #include "esp_log.h"
+#include "nvs.h"             /* 渠道胶囊的显隐开关（music_cfg / srcbadge） */
 
 #include "audio_service.h"   /* 缓冲提示要取 速度/百分比（纯查询，取值给绘制用） */
 #include "online_service.h"  /* online_song_t / ONLINE_SRC_QQ：渠道药丸按来源着色 */
@@ -34,6 +35,7 @@
 #include "music_player.h"
 #include "music_spectrum.h"  /* 频谱柱的底色跟着主题色走 */
 #include "music_state.h"
+#include "storage_service.h" /* 建页时按当前曲目取标题/歌手（纯查询） */
 #include "music_theme.h"     /* 封面取色的当前主题色 */
 #include "music_view_internal.h"
 #include "music_view_lyric.h"
@@ -64,24 +66,32 @@ static void label_set_if_changed(lv_obj_t *label, const char *text)
 }
 
 /*
- * 圆形按钮。
+ * 图标键（设计稿口径）：44x44 透明命中区 + 居中 20 px 图标。
  * code 一般传 LV_EVENT_CLICKED；**有长按动作的按钮要传 LV_EVENT_SHORT_CLICKED**——
  * 见输出设备按钮处的说明。
+ *
+ * 为什么图标用 lv_font_montserrat_20：设计稿的控制键图标是 18~24 px 的线稿，
+ * 而 ui_font_text 是 16 px 位图字体，直接用它图标会小一圈、和 48 px 的播放键不协调。
+ * Montserrat 里编进了整套 LV_SYMBOL_*（FontAwesome）字形，20 px 刚好。
  */
-lv_obj_t *music_view_make_round_btn_ex(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
-                                       lv_event_code_t code, lv_color_t bg, lv_color_t fg)
+lv_obj_t *music_view_make_icon_btn(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
+                                   lv_event_code_t code, lv_color_t fg, lv_opa_t fg_opa)
 {
     lv_obj_t *b = lv_button_create(parent);
-    lv_obj_set_size(b, UI_PX_H(56), UI_PX_H(56));
+    lv_obj_set_size(b, UI_PX_H(44), UI_PX_H(44));
     lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(b, bg, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(b, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, LV_PART_MAIN);   /* 设计稿没有按钮底色 */
     lv_obj_set_style_shadow_width(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
+    /* 透明底上没有"按下变暗"的天然反馈：整键降到 55%（见头文件说明） */
+    lv_obj_set_style_opa(b, LV_OPA_50, LV_STATE_PRESSED);
 
     lv_obj_t *l = lv_label_create(b);
-    lv_obj_set_style_text_font(l, UI_FONT_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(l, fg, LV_PART_MAIN);
-    lv_label_set_text(l, sym);
+    lv_obj_set_style_text_opa(l, fg_opa, LV_PART_MAIN);
+    lv_label_set_text(l, sym ? sym : "");
     lv_obj_center(l);
 
     if (cb) {
@@ -90,92 +100,193 @@ lv_obj_t *music_view_make_round_btn_ex(lv_obj_t *parent, const char *sym, lv_eve
     return b;
 }
 
-lv_obj_t *music_view_make_round_btn(lv_obj_t *parent, const char *sym, lv_event_cb_t cb,
-                                    lv_color_t bg, lv_color_t fg)
+/*
+ * 位图版的图标键：外观与上面的字形版完全一致，只是把 label 换成 lv_image。
+ * 图标是**纯白**烘的（见 assets/icons/icons.txt 的口径），所以 fg 用 image_recolor
+ * 直接染色，fg_opa 给整对象（等价字形版的 text_opa）。
+ */
+lv_obj_t *music_view_make_icon_btn_image(lv_obj_t *parent, const lv_image_dsc_t *icon,
+                                         lv_event_cb_t cb, lv_event_code_t code,
+                                         lv_color_t fg, lv_opa_t fg_opa)
 {
-    return music_view_make_round_btn_ex(parent, sym, cb, LV_EVENT_CLICKED, bg, fg);
+    lv_obj_t *b = lv_button_create(parent);
+    lv_obj_set_size(b, UI_PX_H(44), UI_PX_H(44));
+    lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_opa(b, LV_OPA_50, LV_STATE_PRESSED);
+
+    lv_obj_t *img = lv_image_create(b);
+    lv_image_set_src(img, icon);
+    lv_obj_set_style_image_recolor(img, fg, LV_PART_MAIN);
+    lv_obj_set_style_image_recolor_opa(img, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_opa(img, fg_opa, LV_PART_MAIN);
+    lv_obj_remove_flag(img, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_center(img);
+
+    if (cb) {
+        lv_obj_add_event_cb(b, cb, code, NULL);
+    }
+    return b;
+}
+
+/* 中央播放/暂停键：48 px 半透明白圆（#FFFFFF 16%）+ 20 px 白色图标 */
+lv_obj_t *music_view_make_play_btn(lv_obj_t *parent)
+{
+    lv_obj_t *b = lv_button_create(parent);
+    lv_obj_set_size(b, UI_PX_H(48), UI_PX_H(48));
+    lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(b, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(b, (lv_opa_t)40, LV_PART_MAIN);   /* 16% 白（LVGL 只给了 10% 一档） */
+    lv_obj_set_style_shadow_width(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_border_width(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(b, 0, LV_PART_MAIN);
+    lv_obj_set_style_opa(b, LV_OPA_50, LV_STATE_PRESSED);
+
+    lv_obj_t *l = lv_label_create(b);      /* ★ 必须是第 0 个子对象（见头文件） */
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
+    lv_label_set_text(l, LV_SYMBOL_PLAY);
+    lv_obj_center(l);
+    return b;
 }
 
 /* ------------------------------------------------------------------ 来源徽标与模式 */
 
 /*
- * 播放来源徽标（需求：播放器页要**显式**说明现在放的是本地还是在线）。
+ * 渠道胶囊的显隐（2026-11 用户："显示渠道的胶囊尽可能小，点击它可以隐藏，
+ * 这个隐藏状态可以记忆"）。
  *
- * 在线曲目和本地曲目的体验差别很大（在线要缓冲、地址会过期、拖动定位受限），
- * 光看标题看不出来源。这里在标题**上方**放一个小药丸：
- *   在线播放 → 强调色底 + 深色字（显眼）
- *   本地播放 → 灰底 + 暗字（安静）
- *
- * 为什么单独一行而不是挤进标题行：标题是整宽的 LONG_SCROLL_CIRCULAR label，
- * 同一行放别的对象会把它的滚动宽度吃掉。
+ *   - 点胶囊 = 隐藏（并 Toast 提示去哪里再打开）；
+ *   - 播放器设置弹窗里有「音源标签」开关，可以重新打开；
+ *   - 状态落 NVS（music_cfg / srcbadge，默认显示），重启后保持。
  */
-/*
- * 渠道药丸：紧挨着「在线播放」的品牌标签。
- *
- *   网易云音乐 → 品牌红 #C20C0C + 白字
- *   QQ音乐     → 品牌绿 #31C27C + 深墨绿字（白字在这个绿上对比度太低，看不清）
- *
- * 只在在线曲目时出现；本地文件隐藏（本地没有"渠道"可言）。
- * 它必须**独立**判断：切歌时"在线播放"可能不变，但来源会从网易云换到 QQ。
- */
-static void apply_provider_badge(void)
+#define BADGE_NVS_NS   "music_cfg"
+#define BADGE_NVS_KEY  "srcbadge"
+
+static int s_badge_show = -1;          /* -1 = 还没读过 NVS */
+
+static bool badge_show_load(void)
 {
-    const music_state_t *st = music_state();
-    if (!s_c.provider_badge) {
+    if (s_badge_show >= 0) {
+        return s_badge_show != 0;
+    }
+    uint8_t v = 1;
+    nvs_handle_t h;
+    if (nvs_open(BADGE_NVS_NS, NVS_READONLY, &h) == ESP_OK) {
+        if (nvs_get_u8(h, BADGE_NVS_KEY, &v) != ESP_OK) {
+            v = 1;
+        }
+        nvs_close(h);
+    }
+    s_badge_show = (v != 0) ? 1 : 0;
+    return s_badge_show != 0;
+}
+
+/* 把"用户要不要看"贴到控件上（幂等；页面不在时是空操作）
+ *
+ * ⚠ 必须**先比状态再写**：tick 每 500 ms 调一次，而 lv_obj_add/remove_flag(HIDDEN)
+ *   会无条件 lv_obj_invalidate() —— 每 tick 让封面那一块重绘一次纯属浪费
+ *   （还带着 clip_corner 的圆角裁切层）。 */
+static void badge_apply_visible(void)
+{
+    if (!s_c.src_badge) {
         return;
     }
-    int provider = 0;                 /* 0=隐藏 1=网易云 2=QQ */
+    const bool show = badge_show_load();
+    const bool hidden = lv_obj_has_flag(s_c.src_badge, LV_OBJ_FLAG_HIDDEN);
+    if (show == !hidden) {
+        return;                      /* 已经是这个状态 */
+    }
+    if (show) {
+        lv_obj_remove_flag(s_c.src_badge, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_c.src_badge, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+void music_view_player_src_badge_set_visible(bool on)
+{
+    s_badge_show = on ? 1 : 0;
+    nvs_handle_t h;
+    if (nvs_open(BADGE_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u8(h, BADGE_NVS_KEY, on ? 1 : 0);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+    badge_apply_visible();
+}
+
+bool music_view_player_src_badge_visible(void)
+{
+    return badge_show_load();
+}
+
+/* 点胶囊本身 = 隐藏它（提示一句，否则用户不知道去哪儿找回来） */
+static void on_src_badge_click(lv_event_t *e)
+{
+    (void)e;
+    music_view_player_src_badge_set_visible(false);
+    ui_toast("音源标签已隐藏，可在「播放器设置」里重新显示", 2200);
+}
+
+/*
+ * 封面左下角那个**渠道胶囊**（2026-11 用户要求）。
+ *
+ * 需求原话："歌曲专辑封面上不要有任何文字，仅允许歌曲专辑封面左下角有一个很小的
+ * 圆形半透明胶囊标签的渠道指示：本地播放 / QQ音乐 / 网易云。每个圆形半透明胶囊标签
+ * 需根据不同平台的主题色显示对应的颜色。"
+ *
+ * 实现：s_c.src_badge 是封面容器里的一个 lv_obj（LV_SIZE_CONTENT + LV_RADIUS_CIRCLE
+ * = 胶囊），label 是它的第 0 个子对象，这里按音源换文案 + 换底色（半透明）。
+ *
+ * ★ 必须**按渠道分别判**：切歌时"在线/本地"可能没变（都在线），但来源会从网易云
+ *   换到 QQ，只看 on_mode 的话第二首歌的渠道色就不更新了。所以状态位把渠道一起编进去。
+ * ★ 用户还能点它把自己隐藏（状态落 NVS，见下面的 badge 显隐三个函数），
+ *   所以这里每次都要顺带把可见性对齐（幂等）。
+ */
+void music_view_player_apply_src_badge(void)
+{
+    const music_state_t *st = music_state();
+    if (!s_c.src_badge) {
+        return;
+    }
+    badge_apply_visible();            /* 用户隐藏过就一直藏着（幂等，很便宜） */
+
+    int provider = 0;                 /* 0=本地/无渠道 1=网易云 2=QQ */
     if (st->on_mode && st->on_songs && st->index >= 0 &&
         (size_t)st->index < st->on_count) {
         const online_song_t *song = &((const online_song_t *)st->on_songs)[st->index];
         provider = (song->src == ONLINE_SRC_QQ) ? 2 : 1;
     }
-    if (s_c.provider_badge_state == provider) {
-        return;                       /* 没变就别每 tick 重设样式 */
-    }
-    s_c.provider_badge_state = provider;
-    if (provider == 0) {
-        lv_obj_add_flag(s_c.provider_badge, LV_OBJ_FLAG_HIDDEN);
-        return;
-    }
-    lv_obj_remove_flag(s_c.provider_badge, LV_OBJ_FLAG_HIDDEN);
-    if (provider == 2) {
-        lv_label_set_text(s_c.provider_badge, "QQ音乐");
-        lv_obj_set_style_bg_color(s_c.provider_badge, lv_color_hex(0x31C27C), LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_c.provider_badge, lv_color_hex(0x06301C), LV_PART_MAIN);
-    } else {
-        lv_label_set_text(s_c.provider_badge, "网易云音乐");
-        lv_obj_set_style_bg_color(s_c.provider_badge, lv_color_hex(0xC20C0C), LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_c.provider_badge, lv_color_hex(0xFFFFFF), LV_PART_MAIN);
-    }
-}
-
-void music_view_player_apply_src_badge(void)
-{
-    /*
-     * 渠道药丸先判：切歌时"在线/本地"可能没变（都是在线），但来源可能从网易云
-     * 换到 QQ —— 而下面那段会在状态没变时提前 return。
-     */
-    apply_provider_badge();
-    const music_state_t *st = music_state();
-    if (!s_c.src_badge) {
-        return;
-    }
-    if (s_c.src_badge_state == (int)st->on_mode) {
+    /* 状态位同时编码"渠道"和"在线/本地"，任一变化都要重画 */
+    const int code = provider * 2 + (st->on_mode ? 1 : 0);
+    if (s_c.src_badge_state == code) {
         return;                      /* 没变就别每 tick 重设样式 */
     }
-    s_c.src_badge_state = (int)st->on_mode;
-    if (st->on_mode) {
-        lv_label_set_text(s_c.src_badge, "在线播放");
-        /* 底色用**主题色**（跟封面走）而不是全局琥珀色；深色字在亮底上更清楚 */
-        lv_obj_set_style_bg_color(s_c.src_badge, lv_color_hex(music_theme_accent_rgb()),
-                                  LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_c.src_badge, lv_color_hex(0x14141A), LV_PART_MAIN);
-    } else {
-        lv_label_set_text(s_c.src_badge, "本地播放");
-        lv_obj_set_style_bg_color(s_c.src_badge, UI_COLOR_PILL, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_c.src_badge, UI_COLOR_FG_DIM, LV_PART_MAIN);
+    s_c.src_badge_state = code;
+
+    /* 文案与平台色（色值见 music_view_player.h 的 MUSIC_SRC_COLOR_*） */
+    const char *text = "本地播放";
+    uint32_t    rgb  = MUSIC_SRC_COLOR_LOCAL;
+    if (provider == 2) {
+        text = "QQ音乐";
+        rgb  = MUSIC_SRC_COLOR_QQ;
+    } else if (provider == 1) {
+        text = "网易云";
+        rgb  = MUSIC_SRC_COLOR_NETEASE;
+    } else if (st->on_mode) {
+        text = "在线播放";
+        rgb  = MUSIC_SRC_COLOR_ONLINE;
     }
+
+    lv_obj_t *label = lv_obj_get_child(s_c.src_badge, 0);
+    if (label) {
+        lv_label_set_text(label, text);
+    }
+    lv_obj_set_style_bg_color(s_c.src_badge, lv_color_hex(rgb), LV_PART_MAIN);
 }
 
 /*
@@ -206,10 +317,11 @@ void music_view_player_accent_apply(void)
 
     if (s_c.accent_rgb != rgb) {
         s_c.accent_rgb = rgb;
-        lv_obj_set_style_bg_color(s_c.seek, accent, LV_PART_INDICATOR);   /* 进度条已播填充 */
-        if (s_c.btn) {                  /* 播放/暂停键（唯一的实心强调色按钮） */
-            lv_obj_set_style_bg_color(s_c.btn, accent, LV_PART_MAIN);
-        }
+        /*
+         * ⚠ 重构稿（2026-11）的进度条填充与播放键是**白色**（设计稿明确写了
+         *   #FFFFFF 与 16% 白圆底），所以这里不再给 seek / btn 涂封面主色。
+         *   封面主色继续体现在：单曲循环角标、各种转圈、频谱柱（下面两处）。
+         */
         if (s_c.mode_badge) {           /* 单曲循环的 "1" 角标 */
             lv_obj_set_style_text_color(s_c.mode_badge, accent, LV_PART_MAIN);
         }
@@ -219,10 +331,6 @@ void music_view_player_accent_apply(void)
         if (s_c.like_spin) {            /* 红心请求中的转圈 */
             lv_obj_set_style_arc_color(s_c.like_spin, accent, LV_PART_INDICATOR);
         }
-        /* 来源药丸的在线底色由 apply_src_badge 画：作废它的缓存再让它重画一次
-         * （本地分支是灰底主题色无关，重画一次也没有副作用）。 */
-        s_c.src_badge_state = -1;
-        music_view_player_apply_src_badge();
     }
 
     /* 这两处不属于控件表（频谱柱归 music_spectrum.cc、缓冲转圈归歌词模块），
@@ -295,9 +403,28 @@ void music_view_player_on_mode_click(lv_event_t *e)
 
 /* ------------------------------------------------------------------ 数值刷新 */
 
+/*
+ * 歌名 / 歌手 / 封面信息条第 1 行。
+ *
+ * ★ 字号用 UI_FONT_TITLE_22（项目自带的 22 px 中文位图字体，生僻字回落 16 px）。
+ *   放在这里（唯一的写入口），换曲时字号与文本一起换，不会出现"新歌用旧字号"。
+ */
+static void apply_title_font(lv_obj_t *label, const char *text)
+{
+    (void)text;
+    if (!label) {
+        return;
+    }
+    if (lv_obj_get_style_text_font(label, LV_PART_MAIN) != UI_FONT_TITLE_22) {
+        lv_obj_set_style_text_font(label, UI_FONT_TITLE_22, LV_PART_MAIN);
+    }
+}
+
 void music_view_player_set_now_playing(const char *title, const char *artist)
 {
     if (s_c.title) {
+        apply_title_font(s_c.title, title);
+        /* LONG_SCROLL_CIRCULAR：换文本时 LVGL 会重算宽度，短了自动停滚（见 music_view_page.cc） */
         lv_label_set_text(s_c.title, title ? title : "");
     }
     if (s_c.artist) {
@@ -396,11 +523,33 @@ void music_view_player_set_total_text_placeholder(void)
     }
 }
 
+/* 把进度条上的白圆点摆到千分比位置（设计稿 r=6 的那粒点） */
+static void seek_knob_place(int32_t permille)
+{
+    if (!s_c.seek_knob) {
+        return;
+    }
+    if (permille < 0) {
+        permille = 0;
+    } else if (permille > 1000) {
+        permille = 1000;
+    }
+    /* 抓取区就是进度条的整宽；圆点按"直径"内缩，两端都不会越界 */
+    lv_obj_update_layout(s_c.seek_knob);
+    const int32_t w = s_c.seek_hit ? lv_obj_get_width(s_c.seek_hit)
+                                   : lv_obj_get_width(s_c.seek_knob);
+    const int32_t d = lv_obj_get_width(s_c.seek_knob);
+    const int32_t x = (w - d) * permille / 1000;
+    lv_obj_set_x(s_c.seek_knob, x);
+}
+
 void music_view_player_set_progress(int32_t permille, uint32_t dur_ms)
 {
     if (s_c.seek && dur_ms > 0) {
         lv_bar_set_value(s_c.seek, permille, LV_ANIM_OFF);
     }
+    /* 时长未知时（dur_ms == 0）也照样摆圆点：拖动时拇指要跟手 */
+    seek_knob_place(permille);
 }
 
 void music_view_player_reset_progress(void)
@@ -408,6 +557,7 @@ void music_view_player_reset_progress(void)
     if (s_c.seek) {
         lv_bar_set_value(s_c.seek, 0, LV_ANIM_OFF);
     }
+    seek_knob_place(0);
 }
 
 void music_view_player_set_lyric_mode(bool on)
@@ -547,16 +697,26 @@ static void cover_set_src(void *user, const void *dsc)
     }
 }
 
+/*
+ * 真封面的显隐；占位装饰圆跟着反向显隐。
+ * 占位层本身（渐变底）不需要开关 —— 真封面是 100%x100% 贴满的，会把底色完全盖住。
+ */
 static void cover_set_visible(void *user, bool visible)
 {
     (void)user;
-    if (!s_c.cover_img) {
-        return;
+    if (s_c.cover_img) {
+        if (visible) {
+            lv_obj_remove_flag(s_c.cover_img, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_c.cover_img, LV_OBJ_FLAG_HIDDEN);
+        }
     }
-    if (visible) {
-        lv_obj_remove_flag(s_c.cover_img, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(s_c.cover_img, LV_OBJ_FLAG_HIDDEN);
+    if (s_c.cover_ph) {
+        if (visible) {
+            lv_obj_add_flag(s_c.cover_ph, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(s_c.cover_ph, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 }
 
@@ -631,12 +791,21 @@ static void on_seek_press(lv_event_t *e)
     }
     s_c.seeking = true;
     const int32_t permille = seek_pointer_permille();
+    /*
+     * ★ 拇指必须跟着手指走（2026-11 用户："歌曲播放进度条在拖动的时候，小圆点没有跟着
+     *   触摸焦点移动"）。
+     *   原来这里只写了 lv_bar_set_value()，而圆点是**独立的对象**、位置只在
+     *   music_view_player_set_progress() 里摆；拖动期间 tick 又被 s_c.seeking 整段跳过
+     *   —— 于是拖动时条在走、圆点钉在原地，松手才跳过去。现在按下/移动都自己摆一次。
+     */
     if (st->dur_ms == 0) {
         /* 时长未知：没法换算时间，但拇指照样跟手（纯视觉反馈） */
         lv_bar_set_value(s_c.seek, permille, LV_ANIM_OFF);
+        seek_knob_place(permille);
         return;
     }
     lv_bar_set_value(s_c.seek, permille, LV_ANIM_OFF);
+    seek_knob_place(permille);
     if (s_c.cur) {
         char buf[16];
         music_fmt_time(music_seek_target_ms(permille, st->dur_ms), buf, sizeof(buf));
@@ -783,9 +952,14 @@ void music_view_player_like_apply(void)
         } else {
             lv_obj_remove_flag(s_c.like_img, LV_OBJ_FLAG_HIDDEN);
             lv_image_set_src(s_c.like_img, liked ? &heart_on : &heart_off);
+            /* 设计稿是一枚 65% 白的空心红心；点亮时用红（语义色，不跟封面主题色走） */
             lv_obj_set_style_image_recolor(s_c.like_img,
-                                           liked ? lv_color_hex(0xFF3E4C) : UI_COLOR_FG_DIM,
+                                           liked ? lv_color_hex(0xFF3E4C)
+                                                 : lv_color_hex(0xFFFFFF),
                                            LV_PART_MAIN);
+            lv_obj_set_style_image_recolor_opa(s_c.like_img,
+                                               liked ? LV_OPA_COVER : LV_OPA_60,
+                                               LV_PART_MAIN);
         }
     }
 }
@@ -824,31 +998,31 @@ void music_view_player_bind_mode_badge(lv_obj_t *badge)
     s_c.mode_badge = badge;
 }
 
-void music_view_player_bind_cover(lv_obj_t *box, lv_obj_t *img)
+void music_view_player_bind_cover(lv_obj_t *box, lv_obj_t *img, lv_obj_t *placeholder)
 {
     s_c.cover_box = box;
     s_c.cover_img = img;
+    s_c.cover_ph  = placeholder;
 }
 
 void music_view_player_bind_src_badge(lv_obj_t *badge)
 {
     s_c.src_badge = badge;
     s_c.src_badge_state = -1;       /* 页面刚建：强制重画一次 */
-    music_view_player_apply_src_badge();
+    if (badge) {
+        lv_obj_add_flag(badge, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(badge, on_src_badge_click, LV_EVENT_CLICKED, NULL);
+    }
+    music_view_player_apply_src_badge();   /* 内部会把显隐也贴一次 */
 }
 
-void music_view_player_bind_provider_badge(lv_obj_t *badge)
+void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek,
+                                  lv_obj_t *knob)
 {
-    s_c.provider_badge = badge;
-    s_c.provider_badge_state = -1;  /* 页面刚建：强制重画一次 */
-    apply_provider_badge();
-}
-
-void music_view_player_bind_times(lv_obj_t *cur, lv_obj_t *tot, lv_obj_t *seek)
-{
-    s_c.cur  = cur;
-    s_c.tot  = tot;
-    s_c.seek = seek;
+    s_c.cur       = cur;
+    s_c.tot       = tot;
+    s_c.seek      = seek;
+    s_c.seek_knob = knob;
 }
 
 /*

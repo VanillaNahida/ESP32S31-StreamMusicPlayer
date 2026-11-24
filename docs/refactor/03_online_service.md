@@ -408,6 +408,11 @@ https 同路径，IDF 的自动跳转实测会**丢查询串** → 服务器回 
   历史遗留的 `/sdcard/online/cover/`、`/sdcard/online/lrc/`、`audio/*.lrc` 在 init 里清掉
   （1841–1862 调 `wipe_dir` 1843/1844）。
 
+  > **2026-11 更新**：init 不再无条件创建 `/sdcard/online/audio`、也不再清扫 `audio/*.lrc`
+  > （正常播放是纯流式，不落盘）；该目录改成"兜底下载真要写文件时"在
+  > `online_song_prepare()` 里按需 `os_mkdir_if_needed()`。
+  > `cover/`、`lrc/` 的 wipe 保留 —— 那是给从老固件升上来的 SD 卡擦屁股用的。
+
 ---
 
 ## D. 附加必答 4：封面 / 歌词 PSRAM 缓存的所有权与生命周期

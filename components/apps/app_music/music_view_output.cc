@@ -17,11 +17,12 @@
 #include "bt_service.h"     /* 输出设备弹窗要显示蓝牙连接/推流状态 */
 #include "ui_ba.h"          /* 碧蓝档案风格弹窗工具箱 */
 #include "ui_core.h"
+#include "ui_icons.h"       /* out_device：用户指定的输出设备图标（位图） */
 #include "ui_metrics.h"
 #include "usb_audio_service.h"   /* USB 声卡是否插着（决定这一行要不要出现） */
 
 #include "music_view_internal.h"
-#include "music_view_player.h"   /* music_view_make_round_btn_ex：与其它控制键同一套圆按钮 */
+#include "music_view_player.h"   /* music_view_make_icon_btn：与其它控制键同一套图标键 */
 
 /* 本文件只画控件、不打日志（未使用的 TAG 会触发 -Wunused-variable；
  * 要加日志时补 `static const char *TAG = "app_music";`）。 */
@@ -39,13 +40,24 @@ void music_view_output_on_volume(lv_event_t *e)
     ui_volume_show();
 }
 
-static const char *out_icon_of(audio_out_t o)
+/*
+ * 输出设备按钮的图标配色（2026-11 用户：按钮图标改用指定的 SVG）。
+ *
+ * 图标本身固定是 assets/icons/out_device.svg（烘成 ui_icons.h 的 out_device，
+ * 白色位图），**当前是哪路输出靠颜色区分** —— 既满足"图标用这个 SVG"，
+ * 又不丢"一眼看出走的是扬声器 / 蓝牙 / USB / 静音"的信息：
+ *   板载扬声器 白（默认态）
+ *   蓝牙       状态栏那支蓝（UI_COLOR_STATUS_BT_LINK 同一档）
+ *   USB 声卡   绿（与输出弹窗里 USB 那行的色块一致）
+ *   静音       红（"关功放"是要注意的状态）
+ */
+static uint32_t out_color_of(audio_out_t o)
 {
     switch (o) {
-    case AUDIO_OUT_BLUETOOTH: return LV_SYMBOL_BLUETOOTH;
-    case AUDIO_OUT_USB:       return LV_SYMBOL_USB;   /* 0xF287，UI 字体里有这个字形 */
-    case AUDIO_OUT_NONE:      return LV_SYMBOL_MUTE;
-    default:                  return LV_SYMBOL_VOLUME_MAX;
+    case AUDIO_OUT_BLUETOOTH: return 0x64B5F6;
+    case AUDIO_OUT_USB:       return 0x2E9E6B;
+    case AUDIO_OUT_NONE:      return 0xE5535B;
+    default:                  return 0xFFFFFF;
     }
 }
 
@@ -266,13 +278,18 @@ static void on_output_long(lv_event_t *e)
 lv_obj_t *music_view_output_make_btn(lv_obj_t *parent)
 {
     /* 短按必须挂 LV_EVENT_SHORT_CLICKED：见 music_view_output.h 的说明。
-     * 按钮本体用播放器页那套圆形按钮工厂（图标 label 的样式与其它控制键一致）。 */
-    lv_obj_t *out_btn = music_view_make_round_btn_ex(parent, out_icon_of(audio_service_get_output()),
-                                                     on_output_click, LV_EVENT_SHORT_CLICKED,
-                                                     UI_COLOR_PILL, UI_COLOR_FG);
+     * 图标用**位图版**的图标键工厂：用户指定的 out_device SVG（字形里没有那个图形），
+     * 尺寸/命中区/按下反馈与其它控制键完全一致。 */
+    const audio_out_t cur = audio_service_get_output();
+    /* fg_opa 取 70%：与相邻几个 60%~90% 白的字形图标同一档亮度（设计稿里这个图标是
+     * fill-opacity 0.72），不然它会显得比旁边"更亮更粗"。 */
+    lv_obj_t *out_btn = music_view_make_icon_btn_image(parent, &out_device,
+                                                       on_output_click, LV_EVENT_SHORT_CLICKED,
+                                                       lv_color_hex(out_color_of(cur)),
+                                                       LV_OPA_70);
     lv_obj_add_event_cb(out_btn, on_output_long, LV_EVENT_LONG_PRESSED, NULL);
-    s_out_btn_icon = lv_obj_get_child(out_btn, 0);
-    s_out_shown    = audio_service_get_output();
+    s_out_btn_icon = lv_obj_get_child(out_btn, 0);   /* = 那个 lv_image */
+    s_out_shown    = cur;
     return out_btn;
 }
 
@@ -285,7 +302,8 @@ void music_view_output_sync(void)
     const audio_out_t cur = audio_service_get_output();
     if (cur != s_out_shown) {
         s_out_shown = cur;
-        lv_label_set_text(s_out_btn_icon, out_icon_of(cur));
+        lv_obj_set_style_image_recolor(s_out_btn_icon, lv_color_hex(out_color_of(cur)),
+                                       LV_PART_MAIN);
     }
 }
 
