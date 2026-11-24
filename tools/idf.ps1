@@ -66,6 +66,12 @@ if ($IdfArgs.Count -gt 0 -and $IdfArgs[0] -eq 'cmakebuild') {
 
 # idf.py 走一段 python 前导：先把 MSYSTEM 从 os.environ 里 pop 掉（PowerShell 侧删不掉，
 # 见上面那段注释），再按原样 runpy 执行 idf.py —— 参数、工作目录、退出码都不变。
+# ⚠ PowerShell 7.4 的 Env: 提供程序在脚本作用域里**第一次读**可能还是空缓存
+#   （profile 用 Set-Item 刚写进去的值要第二次读才可见）。本机实测：直接
+#   $idfPy = Join-Path $env:IDF_PATH ... 得到空串 → 子进程 KeyError。
+#   先空读一次把缓存刷新，再取。
+$null = $env:IDF_PATH
+$null = $env:IDF_PYTHON_ENV_PATH
 $idfPy = Join-Path $env:IDF_PATH 'tools\idf.py'
 $env:_IDF_LAUNCH_TARGET = $idfPy
 $prelude = "import os,runpy,sys;" +

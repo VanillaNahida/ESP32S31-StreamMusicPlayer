@@ -25,13 +25,13 @@ gen_subset.py —— 把 DreamHanSansSC-W17.ttf 子集化为"项目够用"的几
 
 为什么要分三个、而不是合成一个大字体
 ------------------------------------
-app 分区只剩 ~335 KB。合并成一个 4 bpp 大字体需要 +384 KB（放不下）；
-而降成 2 bpp 又会让**整套中文和拉丁字母**一起变糙。
+fonts 分区只有 2.75 MB，五份字体合计已经 2.73 MB。合并成一个 4 bpp
+大字体需要 +384 KB（放不下）；而降成 2 bpp 又会让**整套中文和拉丁字母**一起变糙。
 分成"主字体 + 日文补充"后：
   * 中文/UI 文字保持原来的 4 bpp 质量（一点没动）；
   * 日文**常用**字也是 4 bpp，和旁边的中文字形观感一致；
   * 只有日文**生僻**字降到 2 bpp（本来就极少见，且找不到同排的 4 bpp 邻居对比）。
-三条按 `fallback` 串起来（见 components/ui_font/ui_font.c）。
+五份按 `fallback` 串起来（见 components/ui_font/ui_font.c）。
 
 用法（务必用本工程 tools/font/venv，禁止全局 pip）：
     tools\\font\\venv\\Scripts\\python.exe tools\\font\\gen_subset.py
@@ -66,7 +66,7 @@ DST_JP2 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-jp2.ttf"
 DST_DICT = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-dict.ttf"
 # ★ 22 px 大标题字体（播放器歌名 / 歌词当前行 / 歌单名 / 账号昵称）用的子集。
 #   只收 **GB2312 第一级汉字（3755 字）+ 区 1~9 的符号标点 + ASCII**：
-#   4 bpp 全量 GB2312 在 22 px 下要 1.7 MB（app 槽放不下），而第一级已经覆盖
+#   4 bpp 全量 GB2312 在 22 px 下要 1.7 MB（fonts 分区放不下），而第一级已经覆盖
 #   ~99.7% 的日常文本；剩下的生僻字由 fallback 落到 16 px 主字体 ——
 #   同一个字**只是小一号**，不会变方框（这是这份"不完整"字体安全的前提）。
 DST_LV1 = ROOT / "assets" / "fonts" / "DreamHanSansSC-W17-lv1.ttf"

@@ -150,16 +150,20 @@
 /*
  * 字体：
  *
- * UI 文本用 components/ui_font 里的位图字体（由 tools/font/gen_lvgl_font.py 生成，
- * 16 px 梦源黑体），一共三份、按 fallback 链串起来（见 ui_font.h）：
+ * UI 文本用 components/ui_font 的位图字体（由 tools/font/gen_lvgl_font.py 生成，
+ * 16 px 梦源黑体）。字体数据**不在 app 里**：它们打进独立的 fonts 分区，
+ * 由 ui_font_init() 用 esp_partition_mmap() 映射后直接使用
+ * （见 docs/font-partition.md）。一共五份，按 fallback 链串起来（见 ui_font.h）：
  *
- *   ui_font_sc16   GB2312 全集 + ASCII + LVGL 图标  4 bpp ← 中文/UI 主字体
- *   ui_font_jp1_16 JIS X 0208 第 1 水準 + 日文记号   4 bpp ← 常用日文汉字
- *   ui_font_jp2_16 JIS X 0208 第 2 水準              2 bpp ← 生僻日文汉字
+ *   sc16    GB2312 全集 + ASCII + LVGL 图标  4 bpp ← 中文/UI 主字体
+ *   jp1     JIS X 0208 第 1 水準 + 日文记号   4 bpp ← 常用日文汉字
+ *   jp2     JIS X 0208 第 2 水準              2 bpp ← 生僻日文汉字
+ *   dict16  词典生僻字 + extra_chars         2 bpp ← 链尾补充
+ *   sc22    GB2312 第一级 + 符号 + ASCII     4 bpp ← 22 px 大标题
  *
- * 为什么要有日文那两份：GB2312 是简体中文字符集，"鎖""転"这类**日文汉字**的码位
+ * 为什么要有日文那几份：GB2312 是简体中文字符集，"鎖""転"这类**日文汉字**的码位
  * 不在里面（中文是 锁/转，码位不同），日文曲名会缺字成方框。
- * UI 代码只管用下面的宏 —— 指向的是 ui_font.c 里那个带 fallback 链的可写包装
+ * UI 代码只管用下面的宏 —— 指向的是 ui_font.c 从 fonts 分区加载出来的可写包装
  * `ui_font_text`，**但必须先 ui_font_init()**（ui_core_init 的第一件事）才能用。
  *
  * 为什么不用 LVGL 内置的 lv_font_source_han_sans_sc_16_cjk：
@@ -184,10 +188,10 @@
  * 22 px 大标题：UI 重构稿（assets/UIDesign 里的那几张 svg）22~23 px 那一档
  * （播放器歌名、歌词当前行、歌单名、账号昵称）。
  *
- * 这是**项目自带的中文 22 px 位图字体**（components/ui_font 的 ui_font_sc22），
+ * 这是**项目自带的中文 22 px 位图字体**（fonts 分区里的 sc22），
  * 收 GB2312 第一级 + 符号 + ASCII；第一级之外的字自动 fallback 到 16 px 主字体
  * （同一个字、小一号，不会缺字）。字体本身的取舍见 tools/font/gen_subset.py 与
- * docs/ui-refactor-2026-11.md，改分区前先读那份文档。
+ * docs/ui-refactor-2026-11.md，分区/加载见 docs/font-partition.md。
  */
 #define UI_FONT_TITLE_22 (&ui_font_title22)
 

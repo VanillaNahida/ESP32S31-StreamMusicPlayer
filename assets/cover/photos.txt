@@ -9,7 +9,7 @@
 #     argb8888  只有在需要更高色彩还原时才用（比 rgb565a8 多 33% 体积）。
 #   * 产物在 assets/cover/<输出名>_<宽>x<高>.bin，由各组件的 CMakeLists 用
 #     target_add_binary_data(..., BINARY, RENAME_TO ...) 烘进 flash。
-#   * ⚠ flash 很紧（app 槽 12.31 MB，见 partitions.csv），加图之前先看余量。
+#   * ⚠ flash 很紧（app 槽 9.56 MB，见 partitions.csv；字体已搬到 fonts 分区），加图之前先看余量。
 #   * ⚠ rgb565a8 是**平面分离**布局（先 w*h*2 的 RGB565，再 w*h 的 A8），
 #     不是逐像素交错 —— 后者在真机上整块花屏（2026-11-24 修过）。
 #

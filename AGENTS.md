@@ -13,7 +13,7 @@ ESP32-S31 单芯片触摸音乐播放器：4.3" 800×480 屏 + LVGL 9，支持�
 | 解码 | vendored 组件 `libs/espaudiocore`（不是 ESP-GMF / esp_audio_simple_player） |
 | 重采样 | `espressif/esp_asrc`（S31 硬件 ASRC） |
 | 拼音 | `lvgl_pinyin_ime` + `libgooglepinyin`，词库放独立 `dict` 分区 |
-| 存储 | 16 MB Flash + 16 MB PSRAM；单 app 槽 **12.31 MB**（2026-11 为 22px 字体与内置封面位图扩过，见 partitions.csv），无 OTA A/B |
+| 存储 | 16 MB Flash + 16 MB PSRAM；单 app 槽 **9.56 MB** + 独立 `fonts` 分区 **2.75 MB**（2026-11 把 2.73 MB 位图字体搬出 app，见 partitions.csv 与 docs/font-partition.md），无 OTA A/B |
 | 音频硬件 | ES8389（I2S TDM，48 kHz/16 bit）+ 扬声器 / BT A2DP / USB UAC |
 
 ## 2. 目录结构
@@ -40,7 +40,7 @@ components/
     usb_audio_service/   USB 声卡（UAC 1.0）输出
     voice_service/       讯飞 IAT 语音输入
     play_state/          音量 / 曲目 / 进度的 NVS 记忆（防抖落盘）
-  ui_font/               内嵌位图字体（GB2312 + 日文，fallback 链）
+  ui_font/               UI 位图字体加载器：从 fonts 分区 mmap（GB2312 + 日文，fallback 链）
 libs/espaudiocore/       解码库（vendored）
 docs/                    详细设计与踩坑记录（见第 7 节）
 tools/                   idf.ps1、字体/图标生成、代码检查
@@ -85,8 +85,11 @@ tools/                   idf.ps1、字体/图标生成、代码检查
 - 首次克隆 / 换板先跑 `idf.py bmgr -b esp32_s31_korvo_1` 生成 `components/gen_bmgr_codes/`。
 - 烧录波特率用环境变量 `ESPBAUD`（本机 921600），不要用命令行 `-b`
   （会连带把 monitor 也改到 921600，而 console 是 115200，刷完是乱码）。
-- 改了 `partitions.csv` 必须 `idf.py fullclean` 后重编；`dict` 分区需单独烧一次，
-  否则拼音输入法起不来。
+- 改了 `partitions.csv` 必须 `idf.py fullclean` 后重编；`idf.py flash` 会写分区表、
+  app 和 `fonts` 分区（fonts.bin 由构建自动生成）。
+- `dict` 分区仍要**单独烧一次**，否则拼音输入法起不来。
+- 换了字体/改了 `components/ui_font/*.c` 后，构建会自动重打 `build/fonts.bin` 并烧
+  `fonts` 分区；只想重打可跑 `python tools/font/pack_fonts.py --verify`。
 
 ## 6. 硬性约定
 
@@ -99,6 +102,8 @@ tools/                   idf.ps1、字体/图标生成、代码检查
   `lv_color_to_u32(...) & 0xFFFFFF`（高字节恒 `0xFF`）。
 - 图标用矢量/位图，不用 emoji；中文最小 14 px；中文用 `components/ui_font` 的位图字体，
   不要用 LVGL 内置 CJK 字体。
+- **不要再把字体 .c 加回 `ui_font` 的 SRCS**：字体数据只进 `fonts` 分区，app 里只留
+  `ui_font.c` 加载器（否则 app 槽会被 2.73 MB 字形挤爆）。
 - 本板无电池、无背光控制：状态栏不要画电池，息屏只停 LVGL 刷新。
 
 ## 7. 详细文档
@@ -109,5 +114,6 @@ tools/                   idf.ps1、字体/图标生成、代码检查
 - 串口诊断命令：[docs/serial-commands.md](docs/serial-commands.md)
 - USB 声卡：[docs/uac-audio.md](docs/uac-audio.md)
 - 图库：[docs/gallery.md](docs/gallery.md)
+- 字体分区与 mmap：[docs/font-partition.md](docs/font-partition.md)
 - QQ 音乐：[docs/qq-music.md](docs/qq-music.md)
 - 开发指南：[docs/方屏流媒体音乐播放器 开发指南.md](docs/方屏流媒体音乐播放器%20开发指南.md)

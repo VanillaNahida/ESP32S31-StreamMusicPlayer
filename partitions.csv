@@ -1,8 +1,34 @@
 # ESP32-S31-Korvo-1 流媒体音乐播放器 分区表（16 MB Flash）
+#
+# 约束
+#   - app 分区起点必须 64 KB(0x10000) 对齐；data 分区 4 KB 对齐即可。
+#   - 改完必须 `idf.py fullclean` 后重编，并重烧分区表（`idf.py flash` 会写）。
+#
+# 2026-11 字体搬出 app
+# --------------------
+# 五个预渲染位图字体（sc16 / sc22 / jp1 / jp2 / dict16）原来以 .c 数组编进 app，
+# 合计 2.73 MB，app 槽只剩几十 KB。现在单独开 fonts 分区（data 0x41）：
+#   - app 槽从 12.31 MB(0xC50000) 缩到 9.56 MB(0x990000)，固件实测 9.31 MB，余 261 KB；
+#   - fonts 分区 2.75 MB(0x2C0000)，镜像实测 2.73 MB，余 17 KB；
+#   - 运行时 esp_partition_mmap() 直接读，不复制到 RAM（见 components/ui_font）。
+# fonts.bin 由 tools/font/pack_fonts.py 生成，`idf.py flash` 会自动写 fonts 分区。
+# dict 分区仍是拼音词库（lvgl_pinyin_ime），需要单独烧一次。
+#
+# 空间账（16 MB = 0x1000000）：
+#   0x22000 之前：bootloader/分区表/nvs/otadata/phy_init/coredump
+#   dict     0x38E000 = 3.72 MB（词库 3.71 MB，余 12 KB）
+#   fonts    0x2C0000 = 2.75 MB（字体镜像 2.73 MB，余 17 KB）
+#   mainapp  0x990000 = 9.56 MB（固件 9,759,488 B = 9.31 MB，余 261 KB / 2.7%）
+#
 # Name,     Type, SubType, Offset,   Size,     Flags
-nvs,        data, nvs,     0x9000,   0x6000,
-otadata,    data, ota,     0xf000,   0x2000,
-phy_init,   data, phy,     0x11000,  0x1000,
-coredump,   data, coredump,0x12000,  0x10000,
-dict,       data, 0x40,    0x22000,  0x38E000,
-mainapp,    app,  app, 0x3B0000, 0xC50000,
+nvs,        data, nvs,      0x9000,   0x6000,
+otadata,    data, ota,      0xf000,   0x2000,
+phy_init,   data, phy,      0x11000,  0x1000,
+coredump,   data, coredump, 0x12000,  0x10000,
+# dict：拼音系统词库原始 blob（不是 FAT；挂载由 ime_dict_vfs 做）
+dict,       data, 0x40,     0x22000,  0x38E000,
+# fonts：UI 位图字体的只读 blob（UIFP 格式），esp_partition_mmap() 直接映射
+fonts,      data, 0x41,     0x3B0000, 0x2C0000,
+# 单 app 槽：0x1000000 - 0x670000 = 0x990000 = 9.56 MB（无 OTA A/B）
+# ⚠ app 分区的 SubType 只能是 factory/test/ota_N；写 "app" 会被 gen_esp32part 拒绝
+mainapp,    app,  factory,  0x670000, 0x990000,

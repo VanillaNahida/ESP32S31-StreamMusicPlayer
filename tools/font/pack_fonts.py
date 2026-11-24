@@ -5,7 +5,7 @@ pack_fonts.py —— 把 lv_font_conv 生成的 LVGL 字体 .c 打包成 fonts �
 为什么不再把字体编进 app
 ------------------------
 五个位图字体合计约 2.73 MB 常量数据，全塞在 app 里会把 12.31 MB 的 app 槽
-挤到只剩几十 KB。位图字体是**只读、按字形随机访问**的数据，天生适合放进
+挤到只剩几十 KB（搬走后 app 实测 9.31 MB）。位图字体是**只读、按字形随机访问**的数据，天生适合放进
 独立的 flash 分区，用 esp_partition_mmap() 映射成只读指针 ——
 
   * app 槽里不再有字形位图（app 从 ~12.2 MB 降到 ~9.5 MB）；
@@ -35,11 +35,12 @@ box/ofs 16 位），=n 时是 8 字节紧凑布局。blob 头里记了 glyph_dsc
 固件启动时会和 sizeof() 比对，不一致直接报错（不会画成乱码）。
 
 用法（纯标准库，不需要 venv；在工程根目录）：
-    python tools/font/pack_fonts.py            # 生成 assets/fonts/fonts.bin
+    python tools/font/pack_fonts.py            # 生成 build/fonts.bin
     python tools/font/pack_fonts.py --verify   # 生成后再自检一遍
     python tools/font/pack_fonts.py --large    # 手工指定 LARGE 布局（默认读 sdkconfig）
 
-产物：assets/fonts/fonts.bin（烧到 fonts 分区，见 partitions.csv）
+产物：build/fonts.bin（烧到 fonts 分区，见 partitions.csv）。
+CMake 在构建时自动调用本脚本，并把它注册到 `idf.py flash`（components/ui_font/CMakeLists.txt）。
 """
 
 import argparse
@@ -51,7 +52,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SRC_DIR = ROOT / "components" / "ui_font"
-OUT_BIN = ROOT / "assets" / "fonts" / "fonts.bin"
+# 产物放 build/：它是生成物（不签入仓库），也避开某些机器上 assets/ 的写权限限制。
+# CMake 会把它作为自定义命令的 OUTPUT 自动生成（见 components/ui_font/CMakeLists.txt）。
+OUT_BIN = ROOT / "build" / "fonts.bin"
 
 # 字体在 blob 里的顺序/名字。名字是运行期查找用的稳定标识，改名字要同步改 ui_font.c。
 SPECS = [
@@ -249,10 +252,14 @@ def parse_font_c(path, large):
             if n != c["list_length"]:
                 raise FontError("%s: %s 长度 %d != list_length %d"
                                 % (path.name, gf, n, c["list_length"]))
-        if c["type"] in (0, 2) and c["list_length"] != 0:
-            raise FontError("%s: FORMAT0 cmap 的 list_length 应为 0" % path.name)
+        if c["type"] == 2 and c["list_length"] != 0:
+            raise FontError("%s: FORMAT0_TINY cmap 的 list_length 应为 0" % path.name)
         if c["type"] == 0 and c["list_length"] != c["range_length"]:
             raise FontError("%s: FORMAT0_FULL 的 list_length 应等于 range_length" % path.name)
+        if c["type"] in (0, 2) and c["unicode_list"] is not None:
+            raise FontError("%s: FORMAT0 cmap 不应有 unicode_list" % path.name)
+        if c["type"] in (1, 3) and c["unicode_list"] is None:
+            raise FontError("%s: SPARSE cmap 缺少 unicode_list" % path.name)
 
     # ---- 校验字形位图跨度 ----
     # lv_font_conv 的明文位图是逐字形连续打包（无行对齐），每个字形占
@@ -497,10 +504,15 @@ def main():
         fonts.append(font)
 
     blob = build_blob(fonts, large)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_bytes(blob)
+    out_path = args.out if args.out.is_absolute() else (Path.cwd() / args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(blob)
+    try:
+        shown = out_path.resolve().relative_to(ROOT)
+    except ValueError:
+        shown = out_path
     print("\n输出     : %s  %.2f MB (%d B)"
-          % (args.out.relative_to(ROOT), len(blob) / 1048576, len(blob)))
+          % (shown, len(blob) / 1048576, len(blob)))
 
     if args.verify:
         print("\n自检     :")

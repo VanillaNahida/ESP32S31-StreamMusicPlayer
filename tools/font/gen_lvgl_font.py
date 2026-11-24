@@ -20,9 +20,9 @@ LVGL 9 的 `lv_font_t.fallback` 支持"本字体找不到字形就去备用字�
       └─ ui_font_jp1_16 (JIS 第 1 水準 + 日文记号,  4 bpp)  ← 常用日文汉字
            └─ ui_font_jp2_16 (JIS 第 2 水準,        2 bpp)  ← 生僻日文汉字
 
-为什么 jp2 用 2 bpp：app 分区只剩 ~335 KB，日文补充合计要压进这个额度。
-4 bpp 的 jp2 会超（见 gen_subset.py 的说明）；生僻字降到 2 bpp 肉眼几乎无感，
-而中文主字体与常用日文汉字仍是 4 bpp。
+为什么 jp2 用 2 bpp：fonts 分区只有 2.75 MB，五份字体（sc16/sc22/jp1/jp2/
+dict16）要一起塞进去。4 bpp 的 jp2 会把镜像顶出分区（见 gen_subset.py 的说明）；
+生僻字降到 2 bpp 肉眼几乎无感，而中文主字体与常用日文汉字仍是 4 bpp。
 
 为什么不压缩（--no-compress）
 -----------------------------
@@ -36,8 +36,13 @@ LV_FONT_FMT_TXT_PLAIN 分支），3 bpp 只有压缩路径才有 —— 所以�
 产物
 ----
 components/ui_font/ui_font_sc16.c    中文主字体（约 950 KB 常量数据）
+components/ui_font/ui_font_sc22.c    22 px 大标题（GB2312 第一级）
 components/ui_font/ui_font_jp1_16.c  日文常用补充
 components/ui_font/ui_font_jp2_16.c  日文生僻补充
+components/ui_font/ui_font_dict16.c  词典生僻字 + extra_chars
+
+这些 .c **不再编进 app**：它们是 tools/font/pack_fonts.py 的输入，打包成
+build/fonts.bin 后烧到独立的 fonts 分区（见 docs/font-partition.md）。
 
 用法（需已安装 lv_font_conv：npm i -g lv_font_conv；不依赖 Python 第三方库）
     python tools/font/gen_lvgl_font.py
@@ -165,13 +170,9 @@ def main() -> int:
         total += build_one(conv, ttf, out_name, font_name, size, bpp, with_icons, syms)
 
     print(f"\n合计     : {total} 个字形")
-    # ★ 别用"数 0xNN 字面量"来估 flash —— 字形位图里还有大批十进制描述符，
-    #   那样会少算约 40%（实测 559 KB vs 真实 976 KB）。真实占用一律这样量：
-    #     riscv32-esp-elf-size build/esp-idf/ui_font/libui_font.a
-    print("          真实 flash 占用用 riscv32-esp-elf-size 量 "
-          "build/esp-idf/ui_font/libui_font.a")
-    print("下一步   : idf.py build；UI 字体在 ui_core/include/ui_metrics.h 指向")
-    print("           components/ui_font/ui_font.c 里的 fallback 包装字体")
+    print("下一步   : python tools/font/pack_fonts.py --verify")
+    print("           打包成 build/fonts.bin（构建时 CMake 也会自动跑）")
+    print("           idf.py build 会把它随 flash 写进 fonts 分区")
     return 0
 
 

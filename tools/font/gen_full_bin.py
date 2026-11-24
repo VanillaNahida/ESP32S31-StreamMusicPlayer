@@ -2,6 +2,11 @@
 """
 gen_full_bin.py —— 生成**全量** UI 字体的 LVGL 二进制字体（.bin）
 
+⚠ 已废弃（2026-11）：全量 4bpp 16px 字体约 5.4 MB，放不进 2.75 MB 的 fonts
+  分区；而且 LVGL 的 lv_binfont 加载器会把整份字体复制到堆，和 mmap 直接用
+  的目标相反。现在走 tools/font/gen_lvgl_font.py + pack_fonts.py，见
+  docs/font-partition.md。
+
 与 gen_lvgl_font.py 的区别（那条是"GB2312 子集 + 图标"编进 app 的老路）：
   - 字体源用**完整**的 DreamHanSansSC-W17.ttf（实测 cmap 覆盖 44812 个码点，
     含假名、日文汉字、韩文谚文、符号），范围直接给 0x20-0xFFFF，字体里没有的

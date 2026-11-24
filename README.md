@@ -114,7 +114,7 @@ components/
   ui_core/               状态栏、路由、手势、控制中心、APP 注册表
   apps/                  app_music / app_online / app_settings / app_gallery / app_momotalk
   services/              audio / online / media_meta / storage / wifi / bt / usb_audio / voice / play_state
-  ui_font/               内嵌位图字体
+  ui_font/               位图字体加载器（从 fonts 分区 mmap，见 docs/font-partition.md）
 libs/espaudiocore/       解码库（vendored，不进版本库）
 assets/                  字体、图标、背景图、启动图
 docs/                    设计文档与踩坑记录
@@ -128,6 +128,7 @@ tools/                   idf.ps1、字体与图标生成、自查脚本
 - [docs/serial-commands.md](docs/serial-commands.md)：串口诊断命令
 - [docs/uac-audio.md](docs/uac-audio.md)：USB 声卡实现
 - [docs/gallery.md](docs/gallery.md)：图库实现
+- [docs/font-partition.md](docs/font-partition.md)：字体分区与 mmap 加载
 - [AGENTS.md](AGENTS.md)：工程约束速查
 
 ## 致谢
